@@ -1,0 +1,33 @@
+# ═══════════════ CreativeEnginePro - 统一依赖 ═══════════════
+# 融合: 图片/视频处理 + 图片轮播 + 热点雷达 + TTS语音配音 + 视频译制 + AI脚本
+
+# ── GUI 框架 ──
+PyQt6>=6.5.0
+PyQt6-multimedia>=6.5.0
+
+# ── TTS 语音引擎 ──
+edge-tts>=6.1.0
+requests>=2.31.0
+
+# ── AI / ASR ──
+openai>=1.30.0
+openai-whisper>=20231117
+
+# ── 翻译 ──
+deep-translator>=1.11.0
+
+# ── 音频处理 ──
+pydub>=0.25.1
+librosa>=0.10.0
+soundfile>=0.12.0
+numpy>=1.24.0
+
+# ── 视频处理 ──
+moviepy>=1.0.3
+opencv-python>=4.8.0
+
+# ── 音频分离 (按需安装，较重) ──
+# torch>=2.0.0
+# onnxruntime>=1.15.0
+# spleeter>=2.4.0
+# demucs>=4.0.0

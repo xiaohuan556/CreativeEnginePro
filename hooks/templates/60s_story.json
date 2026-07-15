@@ -1,0 +1,13 @@
+{
+  "name": "60秒故事",
+  "duration": 60,
+  "structure": [
+    {"phase": "hook", "start": 0, "end": 4, "instruction": "4秒Hook，制造悬念或反差"},
+    {"phase": "setup", "start": 4, "end": 15, "instruction": "11秒背景铺陈，日常生活场景"},
+    {"phase": "conflict", "start": 15, "end": 25, "instruction": "10秒冲突/痛点爆发"},
+    {"phase": "turning_point", "start": 25, "end": 35, "instruction": "10秒转折点，发现产品"},
+    {"phase": "solution", "start": 35, "end": 48, "instruction": "13秒产品体验，前后对比"},
+    {"phase": "social_proof", "start": 48, "end": 54, "instruction": "6秒口碑印证"},
+    {"phase": "cta", "start": 54, "end": 60, "instruction": "6秒CTA，限时优惠+行动指令"}
+  ]
+}

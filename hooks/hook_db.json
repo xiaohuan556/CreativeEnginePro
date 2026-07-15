@@ -1,0 +1,88 @@
+{
+  "hooks": {
+    "curiosity": [
+      "Stop scrolling! This changed everything.",
+      "I can't believe nobody told me this sooner.",
+      "You've been doing it wrong the whole time.",
+      "Wait... is this even legal?",
+      "POV: You just discovered the cheat code.",
+      "3 秒后你会感谢我。",
+      "这个秘密他们不想让你知道。",
+      "别划走！这个真的能改变一切。",
+      "等等……这居然是真的？",
+      "刷到就是缘分，看完你会回来谢我。"
+    ],
+    "pain": [
+      "Still struggling with {pain_point}?",
+      "Tired of wasting money on {pain_point}?",
+      "{pain_point}? Not anymore.",
+      "If you're still dealing with {pain_point}, watch this.",
+      "Nobody should have to deal with {pain_point}.",
+      "还在为{pain_point}头疼？",
+      "受够了{pain_point}？",
+      "如果你还在忍受{pain_point}，一定要看这个。",
+      "{pain_point}？到此为止。",
+      "别再被{pain_point}折磨了！"
+    ],
+    "social_proof": [
+      "Over 10,000 people already switched.",
+      "My friend told me about this and I didn't believe it... until I tried it.",
+      "5-star reviews don't lie.",
+      "This is the #1 seller for a reason.",
+      "Everyone in my group chat is obsessed with this.",
+      "万人验证，好评如潮。",
+      "闺蜜推荐的，真香。",
+      "销量第一不是没有原因的。",
+      "群里全在安利，我也试了，绝了。",
+      "5 星好评说明一切。"
+    ],
+    "urgency": [
+      "Limited time offer — link in bio!",
+      "This deal won't last. Act now!",
+      "Only 47 left in stock.",
+      "Sale ends tonight. Don't wait.",
+      "They're selling out faster than they can restock.",
+      "限时特惠，手慢无！",
+      "最后 50 件，卖完即止！",
+      "今晚截止，别犹豫！",
+      "库存告急，抢到就是赚到！",
+      "这个价不会再有第二次！"
+    ],
+    "transformation": [
+      "Before this: {before}. After: {after}.",
+      "Day 1 vs Day 30. The results speak.",
+      "From {before} to {after} in just {time}.",
+      "I wish I started using this sooner.",
+      "The glow-up is real.",
+      "用前：{before}。用后：{after}。",
+      "30 天从{before}到{after}。",
+      "第 1 天 vs 第 30 天，效果说话。",
+      "真希望我早点用上这个。",
+      "逆袭是真的。"
+    ],
+    "contrarian": [
+      "Unpopular opinion: most {category} are a waste of money.",
+      "Everyone's doing it wrong. Here's the right way.",
+      "I returned 5 of these before finding THE one.",
+      "Don't buy another {category} until you watch this.",
+      "The industry doesn't want you to know this.",
+      "说句得罪人的话：大部分{category}都是智商税。",
+      "都在做错，正确做法在这里。",
+      "我退了 5 个才找到这个神器。",
+      "别再买{category}了，先看这个。",
+      "行业内幕，他们不想让你知道。"
+    ]
+  },
+  "ctas": [
+    "Link in bio — get yours now!",
+    "Tap the link before it's gone.",
+    "Comment YES and I'll DM you the link.",
+    "Swipe up to grab yours!",
+    "Click the cart — limited stock!",
+    "点击链接，立即拥有！",
+    "评论区扣1，私信发你链接！",
+    "小黄车，手慢无！",
+    "左下角链接，限时抢！",
+    "关注+评论，抽奖送！"
+  ]
+}

@@ -1,0 +1,2393 @@
+"""
+edit_engine.py — 剪辑Tab核心数据模型 & 导出引擎
+支持：视频轨 / 字幕轨 / 音频轨
+导出：FFmpeg快速拼接 + MoviePy高质量渲染
+"""
+from __future__ import annotations
+import os
+import json
+import uuid
+import copy
+import logging
+import subprocess
+import tempfile
+import dataclasses
+from dataclasses import dataclass, field
+from typing import List, Optional, Tuple
+from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from PyQt6.QtGui import QImage, QColor, QPainter
+
+
+# ═══════════════════════════════════════════════════════════
+#  数据类
+# ═══════════════════════════════════════════════════════════
+
+@dataclass
+class VideoClip:
+    """视频轨片段"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    source_path: str = ""          # 源文件绝对路径
+    source_duration: float = 0.0   # 源文件总时长(秒)
+    trim_start: float = 0.0        # 从源文件哪里开始(秒)
+    trim_end: float = 0.0          # 到源文件哪里结束(秒)
+    timeline_start: float = 0.0    # 在时间线上的起始位置(秒)
+    speed: float = 1.0             # 播放速度
+    volume: float = 1.0            # 原始音频音量 0~2
+    mute: bool = False             # 是否静音
+    thumbnail: Optional[object] = None  # QPixmap 缩略图，运行时赋值
+    # 变换属性（预览/导出时使用，基准：画布中心为原点）
+    pos_x: float = 0.0             # X 偏移（像素，相对画布中心）
+    pos_y: float = 0.0             # Y 偏移（像素，相对画布中心）
+    scale: float = 1.0             # 缩放比例（1.0 = 100%）
+    rotation: float = 0.0          # 旋转角度（度）
+    blur_radius: float = 0.0       # 高斯模糊半径（0~50 像素）
+    # 关键帧：{"scale": [...], "pos_x": [...], "pos_y": [...], "rotation": [...], "blur_radius": [...]}
+    # t = 相对片段起始的时间（0.0 ~ duration），v = 属性值
+    keyframes: dict = field(default_factory=dict)
+    visible: bool = True            # 是否在时间线/预览中可见
+    # 透明度
+    has_alpha: bool = False         # 源视频是否含 alpha 通道（MOV PNG/Qt Animation 等）
+    opacity: float = 1.0            # 整体不透明度（0.0=完全透明，1.0=完全不透明）
+    # 绿幕抠像（Chroma Key）
+    chroma_key_enabled: bool = False      # 是否启用绿幕抠像
+    chroma_key_color: tuple = (0, 255, 0) # 键色 RGB（0~255，默认纯绿）
+    chroma_key_similarity: float = 0.40   # 0~1 颜色接近判定阈值（越大抠得越多）
+    chroma_key_smoothness: float = 0.10  # 0~1 边缘羽化过渡宽度（越大边缘越柔）
+    chroma_key_spill: float = 0.10        # 0~1 溢色抑制强度（去除边缘残留键色）
+    # 转场：本片段「淡出到下一片段」的配置（None 或 {"type": "fade", "duration": 0.5}）
+    # type 取值见 core.slideshow_engine.TRANSITIONS 的 value（如 fade/wipe_left/...）
+    out_transition: Optional[dict] = None
+
+    def __deepcopy__(self, memo):
+        cls = self.__class__
+        result = cls.__new__(cls)
+        memo[id(self)] = result
+        for f in dataclasses.fields(self):
+            v = getattr(self, f.name)
+            # 缩略图(单张)是 QPixmap，隐式共享，按引用保留（不 deepcopy、不置 None）。
+            # 缩略图属于派生显示缓存，不是可撤销的编辑内容。
+            if f.name == "thumbnail":
+                object.__setattr__(result, f.name, v)
+            else:
+                object.__setattr__(result, f.name, copy.deepcopy(v, memo))
+        # 非 dataclass 字段的派生显示缓存（QPixmap 列表等）按引用保留：
+        # 否则 undo/redo 后缩略图丢失 → 时间线空白/闪白。QPixmap 隐式共享，安全。
+        for extra in ("thumbnails", "_scaled_thumbs_cache", "_scaled_single_thumb"):
+            if hasattr(self, extra):
+                object.__setattr__(result, extra, getattr(self, extra))
+        return result
+
+    @property
+    def duration(self) -> float:
+        """在时间线上的实际时长"""
+        return (self.trim_end - self.trim_start) / self.speed
+
+    @property
+    def timeline_end(self) -> float:
+        return self.timeline_start + self.duration
+
+    def to_dict(self) -> dict:
+        """序列化为纯 dict（跳过 thumbnail，keyframes 中 tuple→list）"""
+        kf = {}
+        for k, v in self.keyframes.items():
+            kf[k] = [[t, val] for t, val in v]
+        return {
+            "id": self.id, "source_path": self.source_path,
+            "source_duration": self.source_duration,
+            "trim_start": self.trim_start, "trim_end": self.trim_end,
+            "timeline_start": self.timeline_start,
+            "speed": self.speed, "volume": self.volume, "mute": self.mute,
+            "pos_x": self.pos_x, "pos_y": self.pos_y,
+            "scale": self.scale, "rotation": self.rotation,
+            "blur_radius": self.blur_radius,
+            "keyframes": kf, "visible": self.visible,
+            "has_alpha": self.has_alpha, "opacity": self.opacity,
+            "chroma_key_enabled": self.chroma_key_enabled,
+            "chroma_key_color": list(self.chroma_key_color),
+            "chroma_key_similarity": self.chroma_key_similarity,
+            "chroma_key_smoothness": self.chroma_key_smoothness,
+            "chroma_key_spill": self.chroma_key_spill,
+            "out_transition": self.out_transition,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "VideoClip":
+        kf = {}
+        for k, v in d.get("keyframes", {}).items():
+            kf[k] = [(t, val) for t, val in v]
+        return VideoClip(
+            id=d.get("id", ""), source_path=d.get("source_path", ""),
+            source_duration=d.get("source_duration", 0.0),
+            trim_start=d.get("trim_start", 0.0), trim_end=d.get("trim_end", 0.0),
+            timeline_start=d.get("timeline_start", 0.0),
+            speed=d.get("speed", 1.0), volume=d.get("volume", 1.0),
+            mute=d.get("mute", False),
+            pos_x=d.get("pos_x", 0.0), pos_y=d.get("pos_y", 0.0),
+            scale=d.get("scale", 1.0), rotation=d.get("rotation", 0.0),
+            blur_radius=d.get("blur_radius", 0.0),
+            keyframes=kf, visible=d.get("visible", True),
+            has_alpha=d.get("has_alpha", False), opacity=d.get("opacity", 1.0),
+            chroma_key_enabled=d.get("chroma_key_enabled", False),
+            chroma_key_color=tuple(d.get("chroma_key_color", (0, 255, 0))),
+            chroma_key_similarity=d.get("chroma_key_similarity", 0.40),
+            chroma_key_smoothness=d.get("chroma_key_smoothness", 0.10),
+            chroma_key_spill=d.get("chroma_key_spill", 0.10),
+            out_transition=d.get("out_transition", None),
+        )
+
+
+@dataclass
+class AudioClip:
+    """音频轨片段"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    source_path: str = ""
+    source_duration: float = 0.0
+    trim_start: float = 0.0
+    trim_end: float = 0.0
+    timeline_start: float = 0.0
+    volume: float = 1.0
+    fade_in: float = 0.0           # 淡入时长(秒)
+    fade_out: float = 0.0          # 淡出时长(秒)
+    mute: bool = False
+    label: str = ""                # 自定义显示名称（如"人声"/"背景音"）
+    # 关键帧：{"volume": [(t,v),...]}
+    keyframes: dict = field(default_factory=dict)
+    visible: bool = True            # 是否在时间线/预览中可见
+
+    @property
+    def duration(self) -> float:
+        return self.trim_end - self.trim_start
+
+    @property
+    def timeline_end(self) -> float:
+        return self.timeline_start + self.duration
+
+    def to_dict(self) -> dict:
+        kf = {}
+        for k, v in self.keyframes.items():
+            kf[k] = [[t, val] for t, val in v]
+        return {
+            "id": self.id, "source_path": self.source_path,
+            "source_duration": self.source_duration,
+            "trim_start": self.trim_start, "trim_end": self.trim_end,
+            "timeline_start": self.timeline_start,
+            "volume": self.volume, "fade_in": self.fade_in,
+            "fade_out": self.fade_out, "mute": self.mute,
+            "label": self.label, "keyframes": kf, "visible": self.visible,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "AudioClip":
+        kf = {}
+        for k, v in d.get("keyframes", {}).items():
+            kf[k] = [(t, val) for t, val in v]
+        return AudioClip(
+            id=d.get("id", ""), source_path=d.get("source_path", ""),
+            source_duration=d.get("source_duration", 0.0),
+            trim_start=d.get("trim_start", 0.0), trim_end=d.get("trim_end", 0.0),
+            timeline_start=d.get("timeline_start", 0.0),
+            volume=d.get("volume", 1.0), fade_in=d.get("fade_in", 0.0),
+            fade_out=d.get("fade_out", 0.0), mute=d.get("mute", False),
+            label=d.get("label", ""), keyframes=kf, visible=d.get("visible", True),
+        )
+
+
+@dataclass
+class SubtitleBlock:
+    """字幕轨片段"""
+    id: str = field(default_factory=lambda: str(uuid.uuid4())[:8])
+    text: str = "字幕文本"
+    timeline_start: float = 0.0
+    timeline_end: float = 3.0
+    # 样式属性
+    font_family: str = "Microsoft YaHei"
+    font_size: int = 15
+    font_bold: bool = False
+    font_italic: bool = False
+    font_underline: bool = False    # 下划线
+    color: str = "#FFFFFF"          # 文字颜色 HEX
+    outline_color: str = "#000000"  # 描边颜色
+    outline_width: int = 0
+    background_color: str = ""      # 背景色
+    fill_enabled: bool = False      # 是否启用背景填充
+    border_radius: int = 0          # 背景填充圆角（像素）
+    position: str = "bottom"        # top / center / bottom
+    margin_v: int = 60              # 垂直边距(像素，基于1080p)
+    align: str = "center"           # left / center / right
+    letter_spacing: int = 0         # 字间距（像素）
+    line_spacing: int = 0           # 行间距（像素）
+    # 画布位置（-1.0~1.0 归一化坐标，0=中心；None = 用 position+margin_v）
+    pos_x: Optional[float] = None
+    pos_y: Optional[float] = None
+    # 变换属性（同视频片段）
+    scale: float = 1.0
+    rotation: float = 0.0
+    # 自定义边框尺寸（像素，0=自动跟随文字）
+    custom_width: int = 0
+    custom_height: int = 0
+    # 关键帧：{"scale": [(t,v),...], "pos_x": [...], "pos_y": [...], "rotation": [...]}
+    keyframes: dict = field(default_factory=dict)
+    # 逐词动画
+    word_animation: bool = False       # 是否启用逐词放大弹入
+    word_anim_duration: float = 0.15   # 每个字的弹出持续时间（秒）
+    from_asr: bool = False              # 标记此字幕来自语音识别，仅ASR字幕支持逐词动画
+    word_timings: list = field(default_factory=list)  # 每个词相对 timeline_start 的起始时间（秒），空则等分
+    visible: bool = True            # 是否在时间线/预览中可见
+    # 透明度
+    opacity: float = 1.0            # 整体不透明度（0.0=完全透明，1.0=完全不透明）
+
+    @property
+    def duration(self) -> float:
+        return self.timeline_end - self.timeline_start
+
+    def to_dict(self) -> dict:
+        kf = {}
+        for k, v in self.keyframes.items():
+            kf[k] = [[t, val] for t, val in v]
+        return {
+            "id": self.id, "text": self.text,
+            "timeline_start": self.timeline_start,
+            "timeline_end": self.timeline_end,
+            "font_family": self.font_family, "font_size": self.font_size,
+            "font_bold": self.font_bold, "font_italic": self.font_italic,
+            "font_underline": self.font_underline,
+            "color": self.color, "outline_color": self.outline_color,
+            "outline_width": self.outline_width,
+            "background_color": self.background_color,
+            "fill_enabled": self.fill_enabled,
+            "border_radius": self.border_radius,
+            "position": self.position, "margin_v": self.margin_v,
+            "align": self.align,
+            "letter_spacing": self.letter_spacing,
+            "line_spacing": self.line_spacing,
+            "pos_x": self.pos_x, "pos_y": self.pos_y,
+            "scale": self.scale, "rotation": self.rotation,
+            "custom_width": self.custom_width,
+            "custom_height": self.custom_height,
+            "keyframes": kf,
+            "word_animation": self.word_animation,
+            "word_anim_duration": self.word_anim_duration,
+            "from_asr": self.from_asr,
+            "word_timings": self.word_timings,
+            "visible": self.visible,
+            "opacity": self.opacity,
+        }
+
+    @staticmethod
+    def from_dict(d: dict) -> "SubtitleBlock":
+        kf = {}
+        for k, v in d.get("keyframes", {}).items():
+            kf[k] = [(t, val) for t, val in v]
+        return SubtitleBlock(
+            id=d.get("id", ""), text=d.get("text", "字幕文本"),
+            timeline_start=d.get("timeline_start", 0.0),
+            timeline_end=d.get("timeline_end", 3.0),
+            font_family=d.get("font_family", "Microsoft YaHei"),
+            font_size=d.get("font_size", 15),
+            font_bold=d.get("font_bold", False),
+            font_italic=d.get("font_italic", False),
+            font_underline=d.get("font_underline", False),
+            color=d.get("color", "#FFFFFF"),
+            outline_color=d.get("outline_color", "#000000"),
+            outline_width=d.get("outline_width", 0),
+            background_color=d.get("background_color", ""),
+            fill_enabled=d.get("fill_enabled", False),
+            border_radius=d.get("border_radius", 0),
+            position=d.get("position", "bottom"),
+            margin_v=d.get("margin_v", 60),
+            align=d.get("align", "center"),
+            letter_spacing=d.get("letter_spacing", 0),
+            line_spacing=d.get("line_spacing", 0),
+            pos_x=d.get("pos_x"), pos_y=d.get("pos_y"),
+            scale=d.get("scale", 1.0), rotation=d.get("rotation", 0.0),
+            custom_width=d.get("custom_width", 0),
+            custom_height=d.get("custom_height", 0),
+            keyframes=kf,
+            word_animation=d.get("word_animation", False),
+            word_anim_duration=d.get("word_anim_duration", 0.15),
+            from_asr=d.get("from_asr", False),
+            word_timings=d.get("word_timings", []),
+            visible=d.get("visible", True),
+            opacity=d.get("opacity", 1.0),
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+#  关键帧插值工具
+# ═══════════════════════════════════════════════════════════
+
+def interpolate_keyframes(cls, keyframes: dict, rel_time: float, base_val: dict):
+    """根据相对时间 rel_time（0~duration）和关键帧数据，返回插值后的属性值。
+    base_val: 默认值字典，键=属性名。keyframes: {"scale": [(t,v),...], ...}
+    返回: 与 base_val 同结构的字典。
+    """
+    result = dict(base_val)
+    if not keyframes:
+        return result
+    for prop, kfs in keyframes.items():
+        if not kfs or prop not in base_val:
+            continue
+        # 按时间排序
+        kfs_sorted = sorted(kfs, key=lambda kv: kv[0])
+        # 找前后包围的关键帧
+        prev_kf = next_kf = None
+        for kf in kfs_sorted:
+            if kf[0] <= rel_time:
+                prev_kf = kf
+            else:
+                next_kf = kf
+                break
+        if prev_kf is None:
+            # 使用第一个
+            result[prop] = kfs_sorted[0][1]
+        elif next_kf is None:
+            # 使用最后一个
+            result[prop] = kfs_sorted[-1][1]
+        elif prev_kf[0] == next_kf[0]:
+            result[prop] = prev_kf[1]
+        else:
+            # 线性插值
+            t = (rel_time - prev_kf[0]) / (next_kf[0] - prev_kf[0])
+            result[prop] = prev_kf[1] + (next_kf[1] - prev_kf[1]) * t
+    return result
+
+
+def rebase_clip_keyframes(clip, old_trim_start: float, old_trim_end: float):
+    """After clip.trim_start / trim_end have been changed, adjust keyframes so they
+    stay attached to the same source-time positions.
+
+    * Shifts keyframe offsets when trim_start changes
+    * Removes keyframes that fall outside the new [trim_start, trim_end] range
+    * Inserts an interpolated boundary keyframe when the cut happens between two existing kfs,
+      so the animation continues smoothly from the cut point.
+
+    clip: VideoClip or AudioClip (must have keyframes, trim_start, trim_end, speed attrs)
+    old_trim_start / old_trim_end: values BEFORE the trim operation.
+    """
+    if not getattr(clip, 'keyframes', None):
+        return
+    new_start = clip.trim_start
+    new_end = clip.trim_end
+    speed = max(getattr(clip, 'speed', 1.0) or 1.0, 0.001)
+    new_dur = (new_end - new_start) / speed
+    delta_start = new_start - old_trim_start  # positive = trimmed from left
+
+    # source-time helpers  (preserve for the "rebase-latter" use-case where old_trim is from parent clip)
+    def _to_src(t: float) -> float:
+        return old_trim_start + t * speed
+
+    for prop in list(clip.keyframes.keys()):
+        kfs = clip.keyframes[prop]
+        if not kfs:
+            del clip.keyframes[prop]
+            continue
+
+        # snapshot sorted by time
+        old_kfs = sorted(kfs, key=lambda kv: kv[0])
+        # remove strict duplicates at the same time
+        deduped: list = []
+        for kv in old_kfs:
+            if deduped and abs(kv[0] - deduped[-1][0]) < 0.0001:
+                deduped[-1] = kv  # keep latest
+            else:
+                deduped.append(kv)
+        old_kfs = deduped
+
+        # 1. shift & filter
+        new_kfs: list = []
+        for t, v in old_kfs:
+            new_t = t - delta_start / speed
+            if -0.001 <= new_t <= new_dur + 0.001:
+                new_t = max(0.0, min(new_t, new_dur))
+                new_kfs.append((new_t, v))
+
+        # 2. interpolate boundary at t=0 (left trim cut between two original kfs)
+        if delta_start > 0:
+            cut_src = new_start
+            prev_kf = next_kf = None
+            for kv in old_kfs:
+                if _to_src(kv[0]) <= cut_src + 0.0001:
+                    prev_kf = kv
+                elif next_kf is None:
+                    next_kf = kv
+            if prev_kf is not None and next_kf is not None:
+                denom = _to_src(next_kf[0]) - _to_src(prev_kf[0])
+                if abs(denom) > 0.0001:
+                    frac = (cut_src - _to_src(prev_kf[0])) / denom
+                    interp_val = prev_kf[1] + (next_kf[1] - prev_kf[1]) * frac
+                    new_kfs.insert(0, (0.0, interp_val))
+
+        # 3. interpolate boundary at t=new_dur (right trim cut between two original kfs)
+        if old_trim_end != new_end and abs(old_trim_end - new_end) > 0.0001:
+            cut_src = new_end
+            prev_kf = next_kf = None
+            for kv in old_kfs:
+                if _to_src(kv[0]) <= cut_src + 0.0001:
+                    prev_kf = kv
+                elif next_kf is None:
+                    next_kf = kv
+            if prev_kf is not None and next_kf is not None:
+                denom = _to_src(next_kf[0]) - _to_src(prev_kf[0])
+                if abs(denom) > 0.0001:
+                    frac = (cut_src - _to_src(prev_kf[0])) / denom
+                    interp_val = prev_kf[1] + (next_kf[1] - prev_kf[1]) * frac
+                    new_kfs.append((new_dur, interp_val))
+
+        if new_kfs:
+            clip.keyframes[prop] = new_kfs
+        else:
+            del clip.keyframes[prop]
+
+
+# ═══════════════════════════════════════════════════════════
+#  时间线数据模型
+# ═══════════════════════════════════════════════════════════
+
+class TrackInfo:
+    """轨道元信息（锁定/静音）"""
+    def __init__(self, name: str = ""):
+        self.name = name
+        self.muted: bool = False
+        self.locked: bool = False
+
+    def to_dict(self) -> dict:
+        return {"name": self.name, "muted": self.muted, "locked": self.locked}
+
+    @staticmethod
+    def from_dict(d: dict) -> "TrackInfo":
+        ti = TrackInfo(d.get("name", ""))
+        ti.muted = d.get("muted", False)
+        ti.locked = d.get("locked", False)
+        return ti
+
+
+class EditTimeline(QObject):
+    """管理所有轨道的编辑状态（支持多视频轨/多音频轨）"""
+    changed = pyqtSignal()  # 任何修改后发出
+    overlays_changed = pyqtSignal()  # 仅叠加层变化（字幕样式/位置等），不需清帧缓存
+    auto_align_changed = pyqtSignal(bool)
+
+    # 默认视频轨数量 / 音频轨数量
+    DEFAULT_VIDEO_TRACKS = 1   # 只有 1 条主轨，叠加轨按需自动创建
+    DEFAULT_AUDIO_TRACKS = 1   # 只有 1 条音频轨，多余的按需创建
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.name: str = ""  # 用户可自定义的时间线名称
+        # 多轨道：每条轨道是一个 List[Clip]
+        self.video_tracks: List[List[VideoClip]] = [[] for _ in range(self.DEFAULT_VIDEO_TRACKS)]
+        self.audio_tracks: List[List[AudioClip]] = [[] for _ in range(self.DEFAULT_AUDIO_TRACKS)]
+        self.subtitle_tracks: List[List[SubtitleBlock]] = []  # 字幕轨默认隐藏，有字幕才出现
+        self.auto_align: bool = True  # 自动对齐（磁力吸附），默认开启
+        # 轨道元信息
+        # idx=0 → 主轨道；idx>=1 → 叠加 1/2/3...
+        self.video_track_info: List[TrackInfo] = [TrackInfo("主轨道")]
+        self.audio_track_info: List[TrackInfo] = [TrackInfo("音频")]
+        self.subtitle_track_info: List[TrackInfo] = []  # 有字幕轨时才添加
+
+        self._history: List[dict] = []  # 用于 undo
+        self._undo_index: int = -1
+        # 撤回状态机标志：是否正处于「已撤回、尚未新操作」的浏览态。
+        # 用于首次数撤回时把当前实时状态补入历史，使 redo 能回到最新状态。
+        self._undo_active: bool = False
+
+    # ─── 向后兼容属性 ───
+    @property
+    def video_clips(self) -> List[VideoClip]:
+        """返回第0条视频轨的片段（向后兼容）"""
+        return self.video_tracks[0]
+
+    @property
+    def audio_clips(self) -> List[AudioClip]:
+        """返回第0条音频轨的片段（向后兼容）"""
+        return self.audio_tracks[0]
+
+    @property
+    def subtitle_blocks(self) -> List[SubtitleBlock]:
+        """向后兼容：返回第一条字幕轨的片段"""
+        return self.subtitle_tracks[0] if self.subtitle_tracks else []
+
+    # ─── 轨道管理 ───
+    def add_video_track(self) -> int:
+        self._save_history()
+        self.video_tracks.append([])
+        # idx=0 是主轨道，idx>=1 是叠加轨
+        overlay_num = len(self.video_tracks) - 1  # 叠加轨序号（从1开始）
+        self.video_track_info.append(TrackInfo(f"视频{overlay_num}"))
+        self.changed.emit()
+        return len(self.video_tracks) - 1
+
+    def add_audio_track(self) -> int:
+        self._save_history()
+        self.audio_tracks.append([])
+        self.audio_track_info.append(TrackInfo(f"音频{len(self.audio_tracks)}"))
+        self.changed.emit()
+        return len(self.audio_tracks) - 1
+
+    # ─── 总时长 ───
+    @property
+    def total_duration(self) -> float:
+        ends = []
+        for track in self.video_tracks:
+            if track:
+                ends.append(max(c.timeline_end for c in track))
+        for track in self.audio_tracks:
+            if track:
+                ends.append(max(c.timeline_end for c in track))
+        if self.subtitle_tracks:
+            for track in self.subtitle_tracks:
+                if track:
+                    ends.append(max(b.timeline_end for b in track))
+        return max(ends) if ends else 0.0
+
+    # ─── 同轨道防重叠 ───
+    @staticmethod
+    def _avoid_overlap(track: list, clip, duration: float) -> float:
+        """计算 clip 在该轨道中的不重叠起始时间。
+        逐次检查已有片段，若重叠则将新片段推到重叠片段之后，
+        直到不再与任何已有片段重叠为止。
+        返回调整后的 timeline_start。
+        """
+        start = clip.timeline_start
+        end = start + duration
+        adjusted = True
+        while adjusted:
+            adjusted = False
+            for existing in track:
+                if existing is clip:
+                    continue
+                if start < existing.timeline_end and end > existing.timeline_start:
+                    start = existing.timeline_end
+                    end = start + duration
+                    adjusted = True
+                    break
+        return start
+
+    # ─── 添加（带轨道索引）───
+    def add_video_clip(self, clip: VideoClip, track_idx: int = 0,
+                       skip_overlap: bool = False):
+        """添加视频片段。同轨防重叠：从 track_idx 向上寻找不重叠轨道，
+        若全部冲突则在顶部新建叠加轨。skip_overlap=True 强制放置在指定轨。"""
+        self._save_history()
+        if skip_overlap:
+            while track_idx >= len(self.video_tracks):
+                self.add_video_track()
+            self.video_tracks[track_idx].append(clip)
+            self.changed.emit()
+            return
+        c_end = clip.timeline_start + clip.duration
+        chosen = -1
+        for i in range(track_idx, len(self.video_tracks)):
+            conflict = any(
+                c.timeline_start < c_end and (c.timeline_start + c.duration) > clip.timeline_start
+                for c in self.video_tracks[i]
+            )
+            if not conflict:
+                chosen = i
+                break
+        if chosen >= 0:
+            self.video_tracks[chosen].append(clip)
+        else:
+            new_idx = self.add_video_track()
+            self.video_tracks[new_idx].append(clip)
+        self.changed.emit()
+
+    def add_audio_clip(self, clip: AudioClip, track_idx: int = 0,
+                       skip_overlap: bool = False):
+        """添加音频片段。同轨防重叠：从 track_idx 向上寻找不重叠轨道，
+        若全部冲突则在顶部新建轨道。skip_overlap=True 强制放置在指定轨。"""
+        self._save_history()
+        if skip_overlap:
+            while track_idx >= len(self.audio_tracks):
+                self.add_audio_track()
+            self.audio_tracks[track_idx].append(clip)
+            self.changed.emit()
+            return
+        c_end = clip.timeline_start + clip.duration
+        chosen = -1
+        for i in range(track_idx, len(self.audio_tracks)):
+            conflict = any(
+                c.timeline_start < c_end and (c.timeline_start + c.duration) > clip.timeline_start
+                for c in self.audio_tracks[i]
+            )
+            if not conflict:
+                chosen = i
+                break
+        if chosen >= 0:
+            self.audio_tracks[chosen].append(clip)
+        else:
+            new_idx = self.add_audio_track()
+            self.audio_tracks[new_idx].append(clip)
+        self.changed.emit()
+
+    def add_subtitle(self, block: SubtitleBlock, track_idx: int = -1):
+        """添加字幕块。track_idx=-1 时自动选择不重叠的轨道；
+        若所有轨道均有重叠，自动在顶部创建新轨道。
+        同轨道内不推时间，同时间字幕自动堆叠到上层轨道。"""
+        self._save_history()
+        dur = block.duration
+        start = block.timeline_start
+        end = block.timeline_end
+
+        if track_idx >= 0:
+            # 指定轨道：确保轨道存在
+            while track_idx >= len(self.subtitle_tracks):
+                self.subtitle_tracks.append([])
+                self.subtitle_track_info.append(TrackInfo(f"字幕{len(self.subtitle_tracks)}"))
+            # 指定轨同轨防重叠（向后推移）
+            block.timeline_start = self._avoid_overlap(
+                self.subtitle_tracks[track_idx], block, dur)
+            block.timeline_end = block.timeline_start + dur
+            self.subtitle_tracks[track_idx].append(block)
+        else:
+            # 自动轨：找第一条无重叠的轨道，否则创建新轨道在顶部
+            chosen = -1
+            for i, track in enumerate(self.subtitle_tracks):
+                conflict = False
+                for existing in track:
+                    if existing is block:
+                        continue
+                    if start < existing.timeline_end and end > existing.timeline_start:
+                        conflict = True
+                        break
+                if not conflict:
+                    chosen = i
+                    break
+            if chosen >= 0:
+                self.subtitle_tracks[chosen].append(block)
+            else:
+                # 所有轨道都有重叠 → 在顶部新建轨道
+                self.subtitle_tracks.insert(0, [block])
+                self.subtitle_track_info.insert(0, TrackInfo(f"字幕{len(self.subtitle_tracks)}"))
+                # 重命名现有字幕轨保持编号连贯
+                for i in range(1, len(self.subtitle_tracks)):
+                    info = self.subtitle_track_info[i]
+                    if info and (not info.name or info.name.startswith("字幕")):
+                        info.name = f"字幕{i+1}"
+                # 新轨在最顶部是字幕1
+                if self.subtitle_track_info[0]:
+                    self.subtitle_track_info[0].name = "字幕1"
+
+        self.changed.emit()
+
+    def add_subtitle_track(self, name: str = "", insert_top: bool = True) -> int:
+        """新建字幕轨，返回轨道索引。
+        insert_top=True 时插入到最上方（index 0），现有轨道下移；
+        insert_top=False 时追加到末尾。"""
+        self._save_history()  # 撤回
+        if insert_top:
+            self.subtitle_tracks.insert(0, [])
+            self.subtitle_track_info.insert(0, TrackInfo(name or "字幕1"))
+            # 重命名所有字幕轨
+            for i, info in enumerate(self.subtitle_track_info):
+                if not info.name.startswith("字幕"):
+                    continue
+                info.name = f"字幕{i+1}"
+            self.changed.emit()
+            return 0
+        else:
+            self.subtitle_tracks.append([])
+            n = len(self.subtitle_tracks)
+            self.subtitle_track_info.append(TrackInfo(name or f"字幕{n}"))
+            self.changed.emit()
+            return n - 1
+
+    def close_main_track_gaps(self, save_history: bool = True):
+        """手动压实主视频轨空隙（仅 auto_align=ON 时生效）。
+        将主轨所有片段左移到首尾相接，首个片段从0秒开始。
+        save_history=False 用于组合操作（如分割/删除），避免重复入栈撤回历史。"""
+        if not self.auto_align or not self.video_tracks:
+            return
+        track = self.video_tracks[0]
+        if not track:
+            return
+        if save_history:
+            self._save_history()  # 撤回
+        track.sort(key=lambda c: c.timeline_start)
+        # 首个片段归零
+        if track[0].timeline_start > 0.01:
+            track[0].timeline_start = 0.0
+        # 后续片段紧跟前一个片段末尾
+        for i in range(1, len(track)):
+            prev_end = track[i-1].timeline_end
+            if track[i].timeline_start > prev_end + 0.01:
+                track[i].timeline_start = prev_end
+        self.changed.emit()
+
+    # ─── 删除 ───
+    def remove_video_clip(self, clip_id: str):
+        self._save_history()
+        removed_start = 0.0
+        removed_end = 0.0
+        found_track = -1
+        for track_idx, track in enumerate(self.video_tracks):
+            for c in track:
+                if c.id == clip_id:
+                    removed_start = c.timeline_start
+                    removed_end = c.timeline_end
+                    track.remove(c)
+                    found_track = track_idx
+                    break
+            if found_track >= 0:
+                break
+        if found_track >= 0:
+            self._close_gap_on_track("video", found_track, removed_start, removed_end)
+        # 清理空叠加轨（idx>0 且无片段）；主轨道 idx=0 永远保留
+        self._prune_empty_video_tracks()
+        self.changed.emit()
+
+    def _prune_empty_video_tracks(self):
+        """删除末尾所有空叠加轨（保留主轨 idx=0 + 所有有内容的轨道）"""
+        # 从尾部往前找，遇到空的就删，遇到有内容的停止（避免删掉中间有内容的轨道上方的空轨）
+        while len(self.video_tracks) > 1 and len(self.video_tracks[-1]) == 0:
+            self.video_tracks.pop()
+            if self.video_track_info:
+                self.video_track_info.pop()
+        # 同时清理中间的空轨（保持 idx 连续）：重建为 [有内容的轨道] + 主轨道（不能删主轨）
+        new_tracks = []
+        new_infos = []
+        for i, (track, info) in enumerate(zip(self.video_tracks, self.video_track_info)):
+            if i == 0 or len(track) > 0:
+                new_tracks.append(track)
+                new_infos.append(info)
+        # 重命名叠加轨
+        for i, info in enumerate(new_infos):
+            if i == 0:
+                info.name = "主轨道"
+            else:
+                info.name = f"视频{i}"
+        self.video_tracks = new_tracks
+        self.video_track_info = new_infos
+
+    def remove_audio_clip(self, clip_id: str):
+        self._save_history()
+        removed_start = 0.0
+        removed_end = 0.0
+        found_track = -1
+        for track_idx, track in enumerate(self.audio_tracks):
+            for c in track:
+                if c.id == clip_id:
+                    removed_start = c.timeline_start
+                    removed_end = c.timeline_end
+                    track.remove(c)
+                    found_track = track_idx
+                    break
+            if found_track >= 0:
+                break
+        if found_track >= 0:
+            self._close_gap_on_track("audio", found_track, removed_start, removed_end)
+        self.changed.emit()
+
+    def remove_subtitle(self, block_id: str):
+        self._save_history()
+        for track in self.subtitle_tracks:
+            if any(b.id == block_id for b in track):
+                track[:] = [b for b in track if b.id != block_id]
+                break
+        # 清理空轨并重新编号
+        self._clean_subtitle_tracks()
+        self.changed.emit()
+
+    def _clean_subtitle_tracks(self):
+        """删除空字幕轨并重新编号剩余轨道"""
+        # 移除所有空轨（反向遍历避免索引错乱）
+        empty_indices = []
+        for i in reversed(range(len(self.subtitle_tracks))):
+            if len(self.subtitle_tracks[i]) == 0:
+                empty_indices.append(i)
+                del self.subtitle_tracks[i]
+                if i < len(self.subtitle_track_info):
+                    del self.subtitle_track_info[i]
+        # 重新编号剩余轨道
+        for i, info in enumerate(self.subtitle_track_info):
+            if not info.name or info.name.startswith("字幕"):
+                info.name = f"字幕{i+1}"
+
+    # ─── 查找片段所在轨道 ───
+    def find_video_track(self, clip_id: str) -> int:
+        for i, track in enumerate(self.video_tracks):
+            for c in track:
+                if c.id == clip_id:
+                    return i
+        return -1
+
+    def find_audio_track(self, clip_id: str) -> int:
+        for i, track in enumerate(self.audio_tracks):
+            for c in track:
+                if c.id == clip_id:
+                    return i
+        return -1
+
+    # ─── 自动对齐开关 ───
+    def set_auto_align(self, enable: bool):
+        self.auto_align = enable
+        self.auto_align_changed.emit(enable)
+
+    # ─── 重叠检测 ───
+    @staticmethod
+    def _overlap_idx(clips: list, start: float, end: float, exclude_id: str = "") -> int:
+        """返回 [start,end) 区间内重叠片段的索引（-1=无重叠）"""
+        for i, c in enumerate(clips):
+            if exclude_id and getattr(c, "id", "") == exclude_id:
+                continue
+            c_end = c.timeline_end if hasattr(c, "timeline_end") else (c.timeline_start + c.duration)
+            if c.timeline_start < end and c_end > start:
+                return i
+        return -1
+
+    def clip_overlaps(self, track_kind: str, track_idx: int,
+                      start: float, end: float, exclude_id: str = "") -> bool:
+        """检查某条轨道上是否有片段与 [start,end) 重叠"""
+        clips = self._get_track_clips(track_kind, track_idx)
+        return self._overlap_idx(clips, start, end, exclude_id) >= 0
+
+    def _get_track_clips(self, kind: str, idx: int) -> list:
+        if kind == "video" and idx < len(self.video_tracks):
+            return self.video_tracks[idx]
+        if kind == "audio" and idx < len(self.audio_tracks):
+            return self.audio_tracks[idx]
+        if kind == "subtitle":
+            idx = max(0, min(idx, len(self.subtitle_tracks) - 1)) if self.subtitle_tracks else 0
+            return self.subtitle_tracks[idx] if idx < len(self.subtitle_tracks) else []
+        return []
+
+    # ─── 关闭间隙 / 腾出空间 ───
+    def _shift_clips_after(self, kind: str, idx: int,
+                           anchor_time: float, delta: float):
+        """将轨道上 anchor_time 之后的所有片段平移 delta 秒（可为负）"""
+        clips = self._get_track_clips(kind, idx)
+        for c in clips:
+            if c.timeline_start >= anchor_time - 0.001:
+                c.timeline_start += delta
+
+    def _gap_at(self, kind: str, idx: int, start: float) -> float:
+        """返回指定轨道上 start 位置之后最近的可用空隙起始时间，若无间隙则返回下一个空闲位置"""
+        clips = self._get_track_clips(kind, idx)
+        clips_sorted = sorted(clips, key=lambda c: c.timeline_start)
+        cursor = start
+        for c in clips_sorted:
+            c_end = c.timeline_end if hasattr(c, "timeline_end") else (c.timeline_start + c.duration)
+            if cursor + 0.05 >= c.timeline_start and cursor < c_end:
+                # 重叠，跳到片段后面
+                cursor = c_end
+            elif cursor < c.timeline_start:
+                break  # 前面有空隙
+        return cursor
+
+    # ─── 关闭删除后空隙 ───
+    def _close_gap_on_track(self, kind: str, track_idx: int,
+                            removed_start: float, removed_end: float):
+        """删除片段后收缩轨道：removed_start 之后的所有片段左移"""
+        if not self.auto_align:
+            return
+        gap = removed_end - removed_start
+        if gap <= 0.001:
+            return
+        self._shift_clips_after(kind, track_idx, removed_end - 0.001, -gap)
+
+    # ─── 插入时腾空间 ───
+    def _make_room_on_track(self, kind: str, track_idx: int,
+                            start: float, duration: float) -> float:
+        """
+        在指定轨道的 start 位置插入一段时长 duration 的片段。
+        - 如果该位置无重叠 → 直接返回 start
+        - 如果 auto_align=ON → 将后段右移 duration，返回 start
+        - 如果 auto_align=OFF → 返回 start 后的第一个可用空隙
+        返回实际可用的 timeline_start
+        """
+        clips = self._get_track_clips(kind, track_idx)
+        if not self._overlap_idx(clips, start, start + duration):
+            return start  # 空闲，直接用
+        if self.auto_align:
+            self._shift_clips_after(kind, track_idx, start, duration)
+            return start
+        # 自动对齐关 → 找空隙
+        return self._gap_at(kind, track_idx, start)
+
+    # ─── 分割视频片段 ───
+    def split_video_clip(self, clip_id: str, split_pos: float) -> bool:
+        for track in self.video_tracks:
+            for i, clip in enumerate(track):
+                if clip.id == clip_id and clip.timeline_start < split_pos < clip.timeline_end:
+                    ratio = (split_pos - clip.timeline_start) / clip.duration
+                    src_split = clip.trim_start + ratio * (clip.trim_end - clip.trim_start)
+                    # 左右片段至少 0.15 秒，避免生成几乎看不见的蓝色碎屑
+                    MIN_FRAG = 0.15
+                    right_dur = (clip.trim_end - src_split) / max(clip.speed, 0.01)
+                    left_dur = (src_split - clip.trim_start) / max(clip.speed, 0.01)
+                    if right_dur < MIN_FRAG or left_dur < MIN_FRAG:
+                        return False
+                    self._save_history()
+                    right = VideoClip(
+                        source_path=clip.source_path,
+                        source_duration=clip.source_duration,
+                        trim_start=src_split,
+                        trim_end=clip.trim_end,
+                        timeline_start=split_pos,
+                        speed=clip.speed,
+                        volume=clip.volume,
+                        mute=clip.mute,
+                        pos_x=clip.pos_x,
+                        pos_y=clip.pos_y,
+                        scale=clip.scale,
+                        rotation=clip.rotation,
+                        has_alpha=getattr(clip, 'has_alpha', False),
+                        opacity=getattr(clip, 'opacity', 1.0),
+                    )
+                    clip.trim_end = src_split
+                    # 继承关键帧：右半段 keyframe 时间需要减去左半段的偏移
+                    kfs_src = getattr(clip, "keyframes", None)
+                    if kfs_src:
+                        import copy
+                        right_kfs = {}
+                        offset = src_split - clip.trim_start  # 右半段相对于原始 clip 的时间偏移
+                        for prop, kf_list in kfs_src.items():
+                            right_list = [(t - offset, v) for t, v in kf_list if t > offset + 0.001]
+                            if right_list:
+                                right_kfs[prop] = right_list
+                        if right_kfs:
+                            right.keyframes = right_kfs
+                        # 左半段关键帧裁剪到新范围
+                        for prop in list(kfs_src.keys()):
+                            kfs_src[prop] = [(t, v) for t, v in kfs_src[prop]
+                                             if t <= offset]
+                            if not kfs_src[prop]:
+                                del kfs_src[prop]
+                    # 分割缩略图条
+                    thumbnails = getattr(clip, 'thumbnails', None)
+                    if thumbnails:
+                        # 缩略图覆盖整个 source_duration，按比例分割
+                        ratio_idx = src_split / clip.source_duration if clip.source_duration > 0 else 0.5
+                        split_idx = int(ratio_idx * len(thumbnails))
+                        right.thumbnails = thumbnails[split_idx:]
+                        clip.thumbnails = thumbnails[:split_idx]
+                    track.insert(i + 1, right)
+                    self.changed.emit()
+                    return True
+        return False
+
+    # ─── 分割音频片段 ───
+    def split_audio_clip(self, clip_id: str, split_pos: float) -> bool:
+        for track in self.audio_tracks:
+            for i, clip in enumerate(track):
+                if clip.id == clip_id and clip.timeline_start < split_pos < clip.timeline_end:
+                    ratio = (split_pos - clip.timeline_start) / clip.duration
+                    src_split = clip.trim_start + ratio * (clip.trim_end - clip.trim_start)
+                    # 左右片段至少 0.15 秒
+                    MIN_FRAG = 0.15
+                    left_dur = src_split - clip.trim_start
+                    right_dur = clip.trim_end - src_split
+                    if right_dur < MIN_FRAG or left_dur < MIN_FRAG:
+                        return False
+                    self._save_history()
+                    right = AudioClip(
+                        source_path=clip.source_path,
+                        source_duration=clip.source_duration,
+                        trim_start=src_split,
+                        trim_end=clip.trim_end,
+                        timeline_start=split_pos,
+                        volume=clip.volume,
+                        fade_in=clip.fade_in,
+                        fade_out=clip.fade_out,
+                        mute=clip.mute,
+                    )
+                    clip.trim_end = src_split
+                    # 继承关键帧（audio 只有 volume 关键帧）
+                    kfs_src = getattr(clip, "keyframes", None)
+                    if kfs_src:
+                        import copy
+                        right_kfs = {}
+                        offset = src_split - clip.trim_start
+                        for prop, kf_list in kfs_src.items():
+                            right_list = [(t - offset, v) for t, v in kf_list
+                                          if t > offset + 0.001]
+                            if right_list:
+                                right_kfs[prop] = right_list
+                        if right_kfs:
+                            right.keyframes = right_kfs
+                        for prop in list(kfs_src.keys()):
+                            kfs_src[prop] = [(t, v) for t, v in kfs_src[prop]
+                                             if t <= offset]
+                            if not kfs_src[prop]:
+                                del kfs_src[prop]
+                    track.insert(i + 1, right)
+                    self.changed.emit()
+                    return True
+        return False
+
+    # ─── 分割字幕块 ───
+    def split_subtitle(self, block_id: str, split_pos: float) -> bool:
+        for track_idx, track in enumerate(self.subtitle_tracks):
+            for i, b in enumerate(track):
+                if b.id == block_id and b.timeline_start < split_pos < b.timeline_end:
+                    self._save_history()
+                    right = SubtitleBlock(
+                        text=b.text,
+                        timeline_start=split_pos,
+                        timeline_end=b.timeline_end,
+                        font_family=b.font_family,
+                        font_size=b.font_size,
+                        font_bold=b.font_bold,
+                        font_italic=b.font_italic,
+                        font_underline=b.font_underline,
+                        color=b.color,
+                        outline_color=b.outline_color,
+                        outline_width=b.outline_width,
+                        background_color=b.background_color,
+                        position=b.position,
+                        margin_v=b.margin_v,
+                        align=b.align,
+                        letter_spacing=b.letter_spacing,
+                        line_spacing=b.line_spacing,
+                        pos_x=b.pos_x,
+                        pos_y=b.pos_y,
+                    )
+                    b.timeline_end = split_pos
+                    track.insert(i + 1, right)
+                    self.changed.emit()
+                    return True
+        return False
+
+    # ─── 排序 ───
+    def sort_all(self):
+        for track in self.video_tracks:
+            track.sort(key=lambda c: c.timeline_start)
+        for track in self.audio_tracks:
+            track.sort(key=lambda c: c.timeline_start)
+        for track in self.subtitle_tracks:
+            track.sort(key=lambda b: b.timeline_start)
+
+    # ─── 历史 ───
+    # 历史模型：每个条目保存的是「该次操作之前」的状态（pre-state）。
+    # 因为所有 _save_history() 调用点都在变更「之前」快照当前状态，
+    # 所以 history[index] 即「第 index 次操作前的状态」= 第 index-1 次操作后的状态。
+    # 这样：
+    #   - undo  → 恢复到 history[index]（即上一步操作后的状态），index 减 1
+    #   - redo  → 恢复到 history[index+1]（即下一步操作后的状态），index 加 1
+    # 首次 undo 时把「当前实时状态（最后一次操作后的状态）」补入历史，
+    # 保证后续 redo 能一路回到最新状态。
+    def _save_history(self):
+        state = self._snapshot()
+        self._history = self._history[:self._undo_index + 1]
+        self._history.append(state)
+        self._undo_index = len(self._history) - 1
+        self._undo_active = False  # 新操作 → 退出撤回浏览态
+        if len(self._history) > 50:
+            self._history.pop(0)
+            self._undo_index -= 1
+
+    def undo(self):
+        if self._undo_index < 0:
+            return
+        # 首次进入撤回：把当前实时状态补入历史末端，供 redo 返回
+        if not self._undo_active:
+            self._history = self._history[:self._undo_index + 1]
+            self._history.append(self._snapshot())
+            self._undo_index = len(self._history) - 1
+            self._undo_active = True
+        if self._undo_index > 0:
+            self._undo_index -= 1
+            self._restore(self._history[self._undo_index])
+            self.changed.emit()
+        else:
+            # 已是最初状态，保持并刷新预览
+            self._undo_index = 0
+            self._restore(self._history[0])
+            self.changed.emit()
+
+    def redo(self):
+        if self._undo_index < len(self._history) - 1:
+            self._undo_active = False  # 前进 → 退出撤回浏览态
+            self._undo_index += 1
+            self._restore(self._history[self._undo_index])
+            self.changed.emit()
+
+    def _snapshot(self) -> dict:
+        """快照当前状态（用于 undo/redo）。
+        使用 copy.deepcopy 深拷贝每个 Clip，
+        VideoClip.__deepcopy__ 会跳过 QPixmap 等不可序列化的 Qt 对象。
+        """
+        import copy
+
+        return {
+            "video_tracks": [[copy.deepcopy(c) for c in track]
+                             for track in self.video_tracks],
+            "audio_tracks": [[copy.deepcopy(c) for c in track]
+                             for track in self.audio_tracks],
+            "subtitle":     [[copy.deepcopy(b) for b in track]
+                              for track in self.subtitle_tracks],
+        }
+
+    def _restore(self, state: dict):
+        # 向后兼容旧快照格式
+        if "video_tracks" in state:
+            self.video_tracks = state["video_tracks"]
+            self.audio_tracks = state["audio_tracks"]
+        else:
+            self.video_tracks = [state.get("video", [])]
+            self.audio_tracks = [state.get("audio", [])]
+        sub = state.get("subtitle", None)
+        if sub is None:
+            # 旧快照，单列表 → 放入第一条轨
+            self.subtitle_tracks = [state.get("subtitles", [])]
+        elif not sub:
+            # 空列表 → 无字幕轨
+            self.subtitle_tracks = []
+        elif isinstance(sub[0], list):
+            # 新格式：列表的列表
+            self.subtitle_tracks = sub
+        else:
+            # 旧格式：单列表
+            self.subtitle_tracks = [sub]
+
+    # ─── 生成 SRT ───
+    def export_srt(self, path: str):
+        self.sort_all()
+        lines = []
+        n = 0
+        for track in self.subtitle_tracks:
+            for b in track:
+                n += 1
+                def ts(s):
+                    h = int(s // 3600)
+                    m = int((s % 3600) // 60)
+                    sec = s % 60
+                    return f"{h:02d}:{m:02d}:{sec:06.3f}".replace(".", ",")
+                lines.append(str(n))
+                lines.append(f"{ts(b.timeline_start)} --> {ts(b.timeline_end)}")
+                lines.append(b.text)
+                lines.append("")
+        try:
+            with open(path, "w", encoding="utf-8-sig") as f:
+                f.write("\n".join(lines))
+        except OSError as e:
+            logging.error("导出 SRT 失败: %s → %s", path, e)
+
+    # ─── 项目序列化 ───
+    def to_dict(self) -> dict:
+        """序列化整条时间线为纯 dict（用于项目保存）"""
+        def _clips_to_dict(tracks):
+            return [[c.to_dict() for c in track] for track in tracks]
+
+        return {
+            "name": self.name,
+            "auto_align": self.auto_align,
+            "video_tracks": _clips_to_dict(self.video_tracks),
+            "audio_tracks": _clips_to_dict(self.audio_tracks),
+            "subtitle_tracks": _clips_to_dict(self.subtitle_tracks),
+            "video_track_info": [ti.to_dict() for ti in self.video_track_info],
+            "audio_track_info": [ti.to_dict() for ti in self.audio_track_info],
+            "subtitle_track_info": [ti.to_dict() for ti in self.subtitle_track_info],
+        }
+
+    @staticmethod
+    def from_dict(d: dict, parent=None) -> "EditTimeline":
+        """从 dict 恢复时间线"""
+        tl = EditTimeline(parent)
+        tl.name = d.get("name", "")
+        tl.auto_align = d.get("auto_align", True)
+
+        # 恢复轨道信息
+        tl.video_track_info = [TrackInfo.from_dict(x) for x in d.get("video_track_info", [])]
+        tl.audio_track_info = [TrackInfo.from_dict(x) for x in d.get("audio_track_info", [])]
+        tl.subtitle_track_info = [TrackInfo.from_dict(x) for x in d.get("subtitle_track_info", [])]
+
+        # 恢复视频轨
+        tl.video_tracks = []
+        for track_data in d.get("video_tracks", []):
+            tl.video_tracks.append([VideoClip.from_dict(c) for c in track_data])
+
+        # 恢复音频轨
+        tl.audio_tracks = []
+        for track_data in d.get("audio_tracks", []):
+            tl.audio_tracks.append([AudioClip.from_dict(c) for c in track_data])
+
+        # 恢复字幕轨
+        tl.subtitle_tracks = []
+        for track_data in d.get("subtitle_tracks", []):
+            tl.subtitle_tracks.append([SubtitleBlock.from_dict(b) for b in track_data])
+
+        # 确保轨道数量与 track_info 一致
+        while len(tl.video_tracks) < len(tl.video_track_info):
+            tl.video_tracks.append([])
+        while len(tl.audio_tracks) < len(tl.audio_track_info):
+            tl.audio_tracks.append([])
+        while len(tl.subtitle_tracks) < len(tl.subtitle_track_info):
+            tl.subtitle_tracks.append([])
+
+        # 至少保证有默认轨道
+        if not tl.video_tracks:
+            tl.video_tracks = [[]]
+            tl.video_track_info = [TrackInfo("主轨道")]
+        if not tl.audio_tracks:
+            tl.audio_tracks = [[]]
+            tl.audio_track_info = [TrackInfo("音频")]
+
+        return tl
+
+
+# ═══════════════════════════════════════════════════════════
+#  FFmpeg 快速导出引擎
+# ═══════════════════════════════════════════════════════════
+
+from utils.ffmpeg_utils import get_ffmpeg_path as _get_ffmpeg
+
+
+class FFmpegExportWorker(QThread):
+    """
+    FFmpeg 快速导出线程
+    策略：每个视频片段独立 trim → concat → 混音 → 烧录字幕
+    """
+    progress = pyqtSignal(int, str)    # (百分比, 状态文字)
+    finished = pyqtSignal(bool, str)   # (成功?, 输出路径/错误信息)
+
+    def __init__(self, timeline: EditTimeline, output_path: str,
+                 resolution: Tuple[int, int] = (1920, 1080),
+                 fps: int = 30, parent=None):
+        super().__init__(parent)
+        self.timeline = timeline
+        self.output_path = output_path
+        self.resolution = resolution
+        self.fps = fps
+        self._ffmpeg = _get_ffmpeg()
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            self._do_export()
+        except Exception as e:
+            import traceback
+            self.finished.emit(False, f"导出失败：{e}\n{traceback.format_exc()}")
+
+    def _run_cmd(self, cmd, step_name=""):
+        if self._cancelled:
+            raise RuntimeError("用户取消")
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"{step_name} 失败:\n{proc.stderr[-2000:]}")
+        return proc
+
+    def _do_export(self):
+        tl = self.timeline
+        # 不调用 sort_all() —— 避免后台线程迭代时原地排序造成竞态
+        # 导出时用 sorted() 生成副本安全迭代
+        tmp = tempfile.mkdtemp(prefix="cep_export_")
+        W, H = self.resolution
+        ff = self._ffmpeg
+        import shutil as _shutil
+        try:
+            # ── Step 1: 裁剪各视频片段 ──
+            self.progress.emit(5, "裁剪视频片段...")
+            trimmed = []
+            sorted_clips = sorted(tl.video_clips, key=lambda c: c.timeline_start)
+            for i, clip in enumerate(sorted_clips):
+                out = os.path.join(tmp, f"v{i:03d}.mp4")
+                speed_filter = f"setpts={1/clip.speed:.4f}*PTS"
+                audio_speed = f"atempo={clip.speed:.2f}" if not clip.mute else "anull"
+
+                cmd = [ff, "-y",
+                       "-ss", str(clip.trim_start),
+                       "-t", str(clip.trim_end - clip.trim_start),
+                       "-i", clip.source_path,
+                       "-vf", f"scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                              f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,{speed_filter}",
+                       "-af", audio_speed,
+                       "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                       "-c:a", "aac", "-ar", "44100",
+                       "-r", str(self.fps),
+                       out]
+                self._run_cmd(cmd, f"裁剪片段{i}")
+                trimmed.append(out)
+                pct = 5 + int(30 * (i + 1) / max(len(tl.video_clips), 1))
+                self.progress.emit(pct, f"裁剪 {i+1}/{len(tl.video_clips)}")
+
+            if not trimmed:
+                raise RuntimeError("时间线上没有视频片段")
+
+            # ── Step 2: 拼接视频 ──
+            self.progress.emit(40, "拼接视频...")
+            concat_list = os.path.join(tmp, "concat.txt")
+            with open(concat_list, "w", encoding="utf-8") as f:
+                for p in trimmed:
+                    f.write(f"file '{p.replace(chr(92), '/')}'\n")
+
+            merged_video = os.path.join(tmp, "merged.mp4")
+            self._run_cmd([ff, "-y", "-f", "concat", "-safe", "0",
+                           "-i", concat_list,
+                           "-c", "copy", merged_video], "拼接")
+
+            # ── Step 3: 混入背景音频 ──
+            self.progress.emit(55, "混合音频...")
+            base_for_subtitle = merged_video
+            if tl.audio_clips:
+                audio_inputs = ["-i", merged_video]
+                filter_parts = ["[0:a]aformat=sample_rates=44100[va]"]
+                for ai, ac in enumerate(tl.audio_clips):
+                    audio_inputs += ["-i", ac.source_path]
+                    idx = ai + 1
+                    fade_filters = f"atrim=start={ac.trim_start}:end={ac.trim_end}," \
+                                   f"adelay={int(ac.timeline_start*1000)}|{int(ac.timeline_start*1000)}," \
+                                   f"volume={ac.volume}"
+                    if ac.fade_in > 0:
+                        fade_filters += f",afade=t=in:st={ac.timeline_start}:d={ac.fade_in}"
+                    if ac.fade_out > 0:
+                        fade_filters += f",afade=t=out:st={ac.timeline_end - ac.fade_out}:d={ac.fade_out}"
+                    filter_parts.append(f"[{idx}:a]{fade_filters}[a{idx}]")
+
+                mix_inputs = "[va]" + "".join(f"[a{i+1}]" for i in range(len(tl.audio_clips)))
+                filter_parts.append(f"{mix_inputs}amix=inputs={1 + len(tl.audio_clips)}:duration=first[amix]")
+
+                mixed = os.path.join(tmp, "mixed.mp4")
+                cmd = [ff, "-y"] + audio_inputs
+                cmd += ["-filter_complex", ";".join(filter_parts)]
+                cmd += ["-map", "0:v", "-map", "[amix]",
+                        "-c:v", "copy", "-c:a", "aac", "-ar", "44100", mixed]
+                self._run_cmd(cmd, "混音")
+                base_for_subtitle = mixed
+
+            # ── Step 4: 烧录字幕 ──
+            self.progress.emit(70, "烧录字幕...")
+            if any(tl.subtitle_tracks):
+                srt_path = os.path.join(tmp, "subs.srt")
+                tl.export_srt(srt_path)
+                subtitled = os.path.join(tmp, "subtitled.mp4")
+                # 构建样式：取第一个字幕块的样式作为全局基准
+                # 逐字幕块精细样式通过 ASS 实现
+                ass_path = os.path.join(tmp, "subs.ass")
+                all_subtitles = [b for track in tl.subtitle_tracks for b in track]
+                self._write_ass(all_subtitles, ass_path, W, H)
+                srt_esc = ass_path.replace("\\", "/").replace(":", "\\:")
+                cmd = [ff, "-y", "-i", base_for_subtitle,
+                       "-vf", f"ass='{srt_esc}'",
+                       "-c:v", "libx264", "-preset", "fast", "-crf", "18",
+                       "-c:a", "copy", subtitled]
+                self._run_cmd(cmd, "烧录字幕")
+                base_for_subtitle = subtitled
+
+            # ── Step 5: 最终输出 ──
+            self.progress.emit(90, "最终封装...")
+            _shutil.copy2(base_for_subtitle, self.output_path)
+            self.progress.emit(100, "完成！")
+            self.finished.emit(True, self.output_path)
+        finally:
+            _shutil.rmtree(tmp, ignore_errors=True)
+
+    def _write_ass(self, blocks: list, path: str, W: int, H: int):
+        """生成 ASS 字幕文件（支持逐块样式）"""
+        header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {W}
+PlayResY: {H}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+"""
+        # 收集所有用到的样式（去重）
+        style_map = {}
+        for b in blocks:
+            key = (b.font_family, b.font_size, b.color, b.outline_color,
+                   b.outline_width, b.font_bold, b.font_italic,
+                   b.position, b.margin_v, b.background_color, b.align)
+            if key not in style_map:
+                style_name = f"S{len(style_map)}"
+                style_map[key] = style_name
+
+        def hex_to_ass(c: str) -> str:
+            c = c.lstrip("#")
+            if len(c) == 6:
+                r, g, bl = c[0:2], c[2:4], c[4:6]
+                return f"&H00{bl}{g}{r}&"
+            return "&H00FFFFFF&"
+
+        pos_align = {"top": 8, "center": 5, "bottom": 2}
+        align_h = {"left": -1, "center": 0, "right": 1}  # 用于MarginL/R调整
+
+        lines = [header]
+        for key, sname in style_map.items():
+            fn, fs, col, oc, ow, bold, italic, pos, mv, bg, align = key
+            aln = pos_align.get(pos, 2)
+            bc = hex_to_ass(bg) if bg else "&H00000000&"
+            bs = 1 if bg else 0
+            lines.append(
+                f"Style: {sname},{fn},{fs},{hex_to_ass(col)}&H000000FF&,"
+                f"{hex_to_ass(oc)},{bc},{1 if bold else 0},{1 if italic else 0},"
+                f"0,0,100,100,0,0,{bs},{ow},0,{aln},10,10,{mv},1"
+            )
+
+        lines.append("\n[Events]")
+        lines.append("Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text")
+
+        def ts(s):
+            h = int(s // 3600)
+            m = int((s % 3600) // 60)
+            sec = s % 60
+            return f"{h}:{m:02d}:{sec:05.2f}"
+
+        for b in blocks:
+            key = (b.font_family, b.font_size, b.color, b.outline_color,
+                   b.outline_width, b.font_bold, b.font_italic,
+                   b.position, b.margin_v, b.background_color, b.align)
+            sname = style_map[key]
+            text = b.text.replace("\n", "\\N")
+            lines.append(
+                f"Dialogue: 0,{ts(b.timeline_start)},{ts(b.timeline_end)},"
+                f"{sname},,0,0,0,,{text}"
+            )
+
+        with open(path, "w", encoding="utf-8-sig") as f:
+            f.write("\n".join(lines))
+
+
+# ═══════════════════════════════════════════════════════════
+#  MoviePy 高质量导出引擎
+# ═══════════════════════════════════════════════════════════
+
+class MoviePyExportWorker(QThread):
+    """MoviePy 高质量渲染线程（逐帧合成，支持完整字幕样式）"""
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, timeline: EditTimeline, output_path: str,
+                 resolution: Tuple[int, int] = (1920, 1080),
+                 fps: int = 30, parent=None):
+        super().__init__(parent)
+        self.timeline = timeline
+        self.output_path = output_path
+        self.resolution = resolution
+        self.fps = fps
+        self._cancelled = False
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            self._do_export()
+        except Exception as e:
+            import traceback
+            self.finished.emit(False, f"MoviePy 导出失败：{e}\n{traceback.format_exc()}")
+
+    def _do_export(self):
+        from moviepy.editor import (VideoFileClip, AudioFileClip,
+                                    CompositeVideoClip, CompositeAudioClip,
+                                    concatenate_videoclips, TextClip, ColorClip)
+        tl = self.timeline
+        # 不调用 sort_all() —— 避免后台线程迭代时原地排序造成竞态
+        W, H = self.resolution
+        ff = _get_ffmpeg()
+
+        self.progress.emit(10, "加载视频片段...")
+        video_clips_mp = []
+        sorted_clips = sorted(tl.video_clips, key=lambda c: c.timeline_start)
+        for i, clip in enumerate(sorted_clips):
+            vc = VideoFileClip(clip.source_path, audio=not clip.mute)
+            vc = vc.subclip(clip.trim_start, clip.trim_end)
+            if clip.speed != 1.0:
+                vc = vc.fx(__import__("moviepy.video.fx.all", fromlist=["speedx"]).speedx, clip.speed)
+            vc = vc.resize((W, H))
+            if not clip.mute:
+                vc = vc.volumex(clip.volume)
+            vc = vc.set_start(clip.timeline_start)
+            video_clips_mp.append(vc)
+            self.progress.emit(10 + int(20 * (i+1) / max(len(tl.video_clips), 1)),
+                               f"加载视频 {i+1}/{len(tl.video_clips)}")
+
+        if not video_clips_mp:
+            raise RuntimeError("没有视频片段")
+
+        base = CompositeVideoClip(video_clips_mp, size=(W, H))
+
+        # 字幕层
+        self.progress.emit(40, "生成字幕层...")
+        if self._cancelled:
+            raise RuntimeError("用户取消")
+        subtitle_clips = []
+        pos_map = {"top": ("center", 0.05), "center": ("center", "center"), "bottom": ("center", 0.88)}
+        for track in tl.subtitle_tracks:
+            for b in track:
+                try:
+                    tc = TextClip(
+                        b.text, font=b.font_family, fontsize=b.font_size,
+                        color=b.color, stroke_color=b.outline_color if b.outline_width > 0 else None,
+                        stroke_width=b.outline_width,
+                        method="caption", size=(W - 100, None), align=b.align,
+                    )
+                    pos = pos_map.get(b.position, ("center", 0.88))
+                    tc = tc.set_position(pos).set_start(b.timeline_start).set_end(b.timeline_end)
+                    subtitle_clips.append(tc)
+                except Exception:
+                    logging.debug("字幕 TextClip 生成失败", exc_info=True)
+
+        final_video = CompositeVideoClip([base] + subtitle_clips, size=(W, H))
+
+        # 音频轨
+        self.progress.emit(60, "混合音频...")
+        if self._cancelled:
+            raise RuntimeError("用户取消")
+        audio_tracks = []
+        if base.audio:
+            audio_tracks.append(base.audio)
+        for ac in tl.audio_clips:
+            aclip = AudioFileClip(ac.source_path)
+            aclip = aclip.subclip(ac.trim_start, ac.trim_end)
+            if ac.fade_in > 0:
+                aclip = aclip.audio_fadein(ac.fade_in)
+            if ac.fade_out > 0:
+                aclip = aclip.audio_fadeout(ac.fade_out)
+            aclip = aclip.volumex(ac.volume)
+            aclip = aclip.set_start(ac.timeline_start)
+            audio_tracks.append(aclip)
+
+        if audio_tracks:
+            final_audio = CompositeAudioClip(audio_tracks)
+            final_video = final_video.set_audio(final_audio)
+
+        self.progress.emit(75, "渲染输出（这可能需要几分钟）...")
+        if self._cancelled:
+            raise RuntimeError("用户取消")
+        final_video.write_videofile(
+            self.output_path,
+            fps=self.fps, codec="libx264", audio_codec="aac",
+            ffmpeg_params=["-crf", "16"],
+            verbose=False, logger=None,
+        )
+        self.progress.emit(100, "完成！")
+        self.finished.emit(True, self.output_path)
+
+
+# ═══════════════════════════════════════════
+# 直接 FFmpeg filter_complex 合成导出（无需逐帧渲染）
+# ═══════════════════════════════════════════
+
+_IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+class FFmpegDirectExportWorker(QThread):
+    """直接 FFmpeg filter_complex 合成导出 — 无需逐帧渲染，速度快不卡死"""
+
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(bool, str)
+
+    def __init__(self, timeline, output: str, resolution: Tuple[int, int],
+                 fps: float = 30.0, crf: int = 18, parent=None):
+        super().__init__(parent)
+        self.tl = timeline
+        self.output = output
+        self.W, self.H = resolution
+        self.fps = fps
+        self.crf = crf
+        self._cancelled = False
+        self._proc = None
+
+    def cancel(self):
+        self._cancelled = True
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+    def _check_cancel(self):
+        if self._cancelled:
+            raise RuntimeError("用户取消")
+
+    def run(self):
+        try:
+            self._do_export()
+        except RuntimeError:
+            self.finished.emit(False, "用户取消")
+        except Exception as e:
+            import traceback
+            self.finished.emit(False, f"导出失败：{e}\n{traceback.format_exc()}")
+
+    # ── 辅助：FFmpeg 文本转义 ──────────────────────
+
+    @staticmethod
+    def _escape_drawtext(text: str) -> str:
+        """转义 drawtext 中的特殊字符"""
+        # 冒号是 drawtext 参数分隔符，必须转义
+        t = text.replace("\\", "\\\\")
+        t = t.replace(":", "\\:")
+        t = t.replace("'", "\\'")
+        t = t.replace("%", "\\%")
+        return t
+
+    def _find_font(self, family: str) -> str:
+        """查找系统字体路径"""
+        import platform
+        if platform.system() == "Windows":
+            font_map = {
+                "microsoft yahei": "C:/Windows/Fonts/msyh.ttc",
+                "simhei": "C:/Windows/Fonts/simhei.ttf",
+                "simsun": "C:/Windows/Fonts/simsun.ttc",
+                "arial": "C:/Windows/Fonts/arial.ttf",
+            }
+            key = family.lower()
+            for k, v in font_map.items():
+                if k in key:
+                    if os.path.exists(v):
+                        return v
+            # 回退：尝试 msyh
+            if os.path.exists("C:/Windows/Fonts/msyh.ttc"):
+                return "C:/Windows/Fonts/msyh.ttc"
+        return ""  # FFmpeg 会尝试默认字体
+
+    # ── 收集素材 ──────────────────────────────────
+
+    def _collect(self):
+        """收集所有视频/音频/字幕片段，返回 (input_files, video_clips, audio_clips, subtitles, total_dur)"""
+        src_to_idx = {}     # path → input index
+        input_files = []    # 有序文件路径列表
+
+        video_clips = []    # [{track, clip, input_idx, is_image}]
+        audio_clips = []    # [{track, clip, input_idx, from_video?}]
+        subtitles = []      # SubtitleBlock 列表
+
+        total_dur = 0.0
+
+        # ── 视频轨 ──
+        for ti, track in enumerate(self.tl.video_tracks):
+            info = self.tl.video_track_info[ti] if ti < len(getattr(self.tl, 'video_track_info', [])) else None
+            if info and info.muted:
+                continue
+            for c in track:
+                if not getattr(c, 'visible', True):
+                    continue
+                path = c.source_path
+                if not path or not os.path.exists(path):
+                    continue
+                ext = os.path.splitext(path)[1].lower()
+                is_img = ext in _IMG_EXTS
+                # 输入去重
+                if path not in src_to_idx:
+                    src_to_idx[path] = len(input_files)
+                    input_files.append(path)
+                idx = src_to_idx[path]
+                dur_playback = (c.trim_end - c.trim_start) / max(c.speed, 0.01)
+                video_clips.append({
+                    "track": ti, "clip": c, "input_idx": idx,
+                    "is_image": is_img,
+                    "playback_dur": dur_playback,
+                })
+                total_dur = max(total_dur, c.timeline_start + dur_playback)
+                # 视频轨音频也在内（如未静音）
+                if not c.mute:
+                    audio_clips.append({
+                        "track": ti, "clip": c, "input_idx": idx,
+                        "from_video": True,
+                        "playback_dur": dur_playback,
+                    })
+
+        # ── 音频轨 ──
+        for ti, track in enumerate(self.tl.audio_tracks):
+            info = self.tl.audio_track_info[ti] if ti < len(getattr(self.tl, 'audio_track_info', [])) else None
+            if info and info.muted:
+                continue
+            for c in track:
+                if not getattr(c, 'visible', True) or c.mute:
+                    continue
+                path = c.source_path
+                if not path or not os.path.exists(path):
+                    continue
+                if path not in src_to_idx:
+                    src_to_idx[path] = len(input_files)
+                    input_files.append(path)
+                idx = src_to_idx[path]
+                dur = c.trim_end - c.trim_start
+                audio_clips.append({
+                    "track": ti, "clip": c, "input_idx": idx,
+                    "from_video": False,
+                    "playback_dur": dur,
+                })
+                total_dur = max(total_dur, c.timeline_start + dur)
+
+        # ── 字幕轨 ──
+        for track in self.tl.subtitle_tracks:
+            for b in track:
+                if getattr(b, 'visible', True) and getattr(b, 'text', '').strip():
+                    subtitles.append(b)
+                    total_dur = max(total_dur, b.timeline_end)
+
+        return input_files, video_clips, audio_clips, subtitles, total_dur
+
+    # ── 构建 filter_complex ──────────────────────
+
+    def _build_video_graph(self, video_clips, total_dur):
+        """构建视频滤镜图。返回 filter_complex 字符串片段列表和最终输出标签。"""
+        parts = []
+        W, H = self.W, self.H
+
+        if not video_clips:
+            # 无视频 → 生成黑底
+            parts.append(
+                f"color=c=black:s={W}x{H}:d={total_dur:.3f}:r={self.fps},"
+                f"format=yuv420p[vout]"
+            )
+            return parts, "vout"
+
+        # 背景轨（track 0）统计：是否多段 + 是否含 alpha（决定 xfade 链是否统一 rgba）
+        _bg_idx = [i for i, vc in enumerate(video_clips) if vc["track"] == 0]
+        _bg_count = len(_bg_idx)
+        _any_alpha_bg = any(self._input_alpha[video_clips[i]["input_idx"]]
+                            for i in _bg_idx) if _bg_idx else False
+        _force_rgba_bg = (_bg_count >= 2) and _any_alpha_bg
+
+        # 收集每个视频片段的滤镜处理
+        processed = []  # [(label, track, timeline_start, timeline_end)]
+
+        for i, vc in enumerate(video_clips):
+            c = vc["clip"]
+            idx = vc["input_idx"]
+            t_start = c.timeline_start
+            t_end = t_start + vc["playback_dur"]
+            label = f"v{i}"
+            is_img = vc["is_image"]
+            speed = max(c.speed, 0.01)
+
+            # 源时间范围
+            src_start = c.trim_start
+            src_dur = c.trim_end - c.trim_start
+
+            # trim + setpts（变速）
+            if is_img:
+                # 图片：loop 由输入参数处理，这里只需 trim 时长
+                chain = f"[{idx}:v]trim=duration={src_dur:.4f},setpts=PTS-STARTPTS"
+            else:
+                if abs(speed - 1.0) < 0.001:
+                    chain = f"[{idx}:v]trim=start={src_start:.4f}:duration={src_dur:.4f},setpts=PTS-STARTPTS"
+                else:
+                    chain = (
+                        f"[{idx}:v]trim=start={src_start:.4f}:duration={src_dur:.4f},"
+                        f"setpts=PTS-STARTPTS,setpts={1/speed:.4f}*PTS"
+                    )
+
+            # alpha 视频保持 rgba 格式（保留透明度，OpenCV/默认解码会丢弃）
+            _ia = getattr(self, '_input_alpha', [])
+            is_alpha = _ia[idx] if idx < len(_ia) else False
+            if is_alpha:
+                chain += ",format=rgba"
+            # 背景轨（track 0）若含 alpha 视频，统一转 rgba，保证 xfade/concat 链格式一致
+            elif vc["track"] == 0 and _force_rgba_bg:
+                chain += ",format=rgba"
+
+            # 缩放 & 定位
+            s = getattr(c, 'scale', 1.0) or 1.0
+            px = getattr(c, 'pos_x', 0.0) or 0.0
+            py = getattr(c, 'pos_y', 0.0) or 0.0
+
+            # 计算实际画布上的目标区域
+            # 先按画布比例适配 → 再乘 scale → 再位移
+            # overlay 的 x/y 直接就是 px 像素偏移（从画布中心算）
+            # pad 用透明色（对非 alpha 视频等同黑色，alpha 视频保留透明度）
+            chain += (
+                f",scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1"
+            )
+
+            # 如果 scale != 1.0，额外缩放后再 pad
+            if abs(s - 1.0) > 0.001:
+                sw = max(1, int(W * s))
+                sh = max(1, int(H * s))
+                chain += f",scale={sw}:{sh},pad={W}:{H}:(ow-iw)/2+{int(px)}:(oh-ih)/2+{int(py)}:color=0x00000000,setsar=1"
+            elif abs(px) > 0.5 or abs(py) > 0.5:
+                # 纯位移
+                chain += f",pad={W}:{H}:(ow-iw)/2+{int(px)}:(oh-ih)/2+{int(py)}:color=0x00000000,setsar=1"
+
+            # 旋转
+            rot = getattr(c, 'rotation', 0.0) or 0.0
+            if abs(rot) > 0.1:
+                chain += f",rotate={rot}*PI/180:ow=rotow(\\,{rot}*PI/180\\,):oh=rotoh(\\,{rot}*PI/180\\,)"
+                # 旋转后 pad 回画布尺寸
+                chain += f",pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1"
+
+            # 模糊
+            blur = getattr(c, 'blur_radius', 0.0) or 0.0
+            if blur > 0.5:
+                chain += f",boxblur={int(blur)}"
+
+            chain += f"[{label}]"
+            parts.append(chain)
+            processed.append((label, vc["track"], t_start, t_end, c))
+
+        # ── 排序：track 0 先，同 track 按时间 ──
+        processed.sort(key=lambda x: (x[1], x[2]))
+
+        # ── 背景轨（track 0）转场：连续多段走 xfade/concat 链，PiP 再叠上去 ──
+        bg = [p for p in processed if p[1] == 0]
+        pip = [p for p in processed if p[1] != 0]
+        bg_sorted = sorted(bg, key=lambda x: x[2])
+
+        # 仅当背景轨片段连续（无缝隙）时才走 xfade 链；否则回退原 overlay（硬切）
+        contiguous = True
+        for i in range(1, len(bg_sorted)):
+            if bg_sorted[i][2] - bg_sorted[i - 1][3] > 0.05:
+                contiguous = False
+                break
+
+        if len(bg_sorted) >= 2 and contiguous:
+            bg_label = self._build_bg_xfade_chain(parts, bg_sorted)
+            v_label = self._overlay_pip(parts, bg_label, pip)
+            return parts, v_label
+
+        # 其余情况（单背景 / 有间隙 / 无背景）：沿用原 overlay 模型（硬切，无转场）
+        return self._build_overlay_all(parts, processed)
+
+    # ── 转场（xfade）辅助 ──────────────────────
+
+    @staticmethod
+    def _xfade_mode(out_transition):
+        """把 out_transition 的 type 映射到 ffmpeg xfade 的 transition 名。
+        自定义型（zoom_push/spin_push/glitch/curtain 等）无对应 xfade 模式，
+        返回 None → 导出时按硬切兜底。"""
+        _MAP = {
+            "fade": "fade",
+            "wipe_left": "wipeleft",
+            "wipe_right": "wiperight",
+            "wipe_up": "wipeup",
+            "wipe_down": "wipedown",
+            "zoom_dissolve": "dissolve",
+            "flash_white": "fadewhite",
+            "radial": "radial",
+            "slide_push": "slideleft",
+            "pixelate": "pixelize",
+            "circle_open": "circleopen",
+        }
+        if not out_transition:
+            return None
+        return _MAP.get(out_transition.get("type"))
+
+    def _build_bg_xfade_chain(self, parts, bg_sorted):
+        """背景轨连续多段：常见型转场用 xfade 混合，自定义型/时长不足/无转场用 concat 硬切。
+        返回最终背景流标签。bg_sorted 元素为 (label, track, t_start, t_end, clip)。"""
+        cur = bg_sorted[0][0]
+        cur_dur = bg_sorted[0][3] - bg_sorted[0][2]  # 当前背景流已累积时长
+        for i in range(1, len(bg_sorted)):
+            prev = bg_sorted[i - 1]
+            nxt = bg_sorted[i]
+            label = nxt[0]
+            nxt_dur = nxt[3] - nxt[2]
+            ot = getattr(prev[4], "out_transition", None) or {}
+            mode = self._xfade_mode(ot) if ot.get("type") else None
+            D = float(ot.get("duration", 0.5)) if mode else 0.0
+            out = f"bgxf{i}"
+            if mode and D > 0.001 and cur_dur >= D and nxt_dur >= D:
+                offset = cur_dur - D
+                parts.append(
+                    f"[{cur}][{label}]xfade=transition={mode}:"
+                    f"duration={D:.3f}:offset={offset:.3f}[{out}]"
+                )
+                cur_dur = cur_dur + nxt_dur - D
+            else:
+                # 硬切（自定义型 / 无转场 / 时长不足）：直接拼接，拼接处为硬切
+                parts.append(
+                    f"[{cur}][{label}]concat=n=2:v=1:a=0[{out}]"
+                )
+                cur_dur = cur_dur + nxt_dur
+            cur = out
+        return cur
+
+    def _overlay_pip(self, parts, bg_label, pip):
+        """把 PiP/叠加轨片段（track>0）按时间窗叠到背景流上。返回最终标签。"""
+        if not pip:
+            return bg_label
+        pip_sorted = sorted(pip, key=lambda x: (x[1], x[2]))
+        prev = bg_label
+        for j, (label, track, ts, te, _c) in enumerate(pip_sorted):
+            nxt = f"pip{j + 1}"
+            parts.append(
+                f"[{prev}][{label}]overlay=0:0:enable='between(t,{ts:.3f},{te:.3f})':"
+                f"eof_action=pass:format=auto[{nxt}]"
+            )
+            prev = nxt
+        return prev
+
+    @staticmethod
+    def _build_overlay_all(parts, processed):
+        """原 overlay 模型：所有片段按 track/时间叠放（背景轨内部为硬切）。
+        无转场 / 背景轨有间隙时回退使用，行为保持不变。"""
+        if len(processed) == 1:
+            parts.append(f"[{processed[0][0]}]null[vout]")
+            return parts, "vout"
+        parts.append(f"[{processed[0][0]}]null[tmp0]")
+        for j in range(1, len(processed)):
+            prev_label = f"tmp{j - 1}"
+            curr_label = processed[j][0]
+            ts = processed[j][2]
+            te = processed[j][3]
+            next_label = f"tmp{j}"
+            parts.append(
+                f"[{prev_label}][{curr_label}]overlay=0:0:enable='between(t,{ts:.3f},{te:.3f})':"
+                f"eof_action=pass:format=auto[{next_label}]"
+            )
+        parts.append(f"[tmp{len(processed) - 1}]null[vout]")
+        return parts, "vout"
+
+    def _build_subtitle_filters(self, subtitles, video_label="vout"):
+        """构建字幕 drawtext 滤镜链。返回 filter_complex 片段和最终标签。"""
+        parts = []
+        W, H = self.W, self.H
+        prev_label = video_label
+
+        for i, b in enumerate(subtitles):
+            text = b.text or ""
+            pos = getattr(b, 'position', 'bottom') or 'bottom'
+            fs = getattr(b, 'font_size', 15) or 15
+            fc = getattr(b, 'color', '#ffffff') or '#ffffff'
+            family = getattr(b, 'font_family', 'Microsoft YaHei') or 'Microsoft YaHei'
+            bold = getattr(b, 'font_bold', False)
+            italic = getattr(b, 'font_italic', False)
+
+            # 位置
+            pos_map = {'top': H * 0.075, 'center': H * 0.5, 'bottom': H * 0.925}
+            py_px = int(pos_map.get(pos, H * 0.925))
+
+            # drawtext 参数
+            escaped = self._escape_drawtext(text)
+
+            fontfile = self._find_font(family)
+            font_opts = f":fontfile='{fontfile}'" if fontfile else ""
+
+            style = ""
+            if bold:
+                style += ":bold=1"
+            if italic:
+                style += ":italic=1"
+
+            # 描边（用 shadow 模拟）
+            ow = getattr(b, 'outline_width', 0) or 0
+            oc = getattr(b, 'outline_color', '#000000') or '#000000'
+            shadow = ""
+            if ow > 0:
+                shadow = f":shadowcolor={oc}:shadowx=1:shadowy=1"
+
+            # 背景填充
+            has_fill = getattr(b, 'fill_enabled', False)
+            bg_color = getattr(b, 'background_color', '#000000') or '#000000'
+            box = ""
+            if has_fill:
+                box = f":box=1:boxcolor={bg_color}@0.6:boxborderw=4"
+
+            ts = b.timeline_start
+            te = b.timeline_end
+            label = f"sub{i}"
+            next_label = f"vsub{i}"
+
+            dt = (
+                f"drawtext=text='{escaped}':fontsize={fs}:fontcolor={fc}"
+                f"{font_opts}{style}{shadow}{box}"
+                f":x=(w-text_w)/2:y={py_px}-th/2"
+                f":enable='between(t,{ts:.3f},{te:.3f})'"
+            )
+
+            parts.append(f"[{prev_label}]{dt}[{next_label}]")
+            prev_label = next_label
+
+        if not parts:
+            return [], video_label
+        return parts, prev_label
+
+    def _build_audio_graph(self, audio_clips, total_dur):
+        """构建音频滤镜图。返回 filter_complex 片段和最终标签。
+
+        转场音频处理：背景轨相邻且有 outgoing 转场的两段 (A→B)，
+        对 A 尾音加 afade out、对 B 头音加 afade in，并把 B 音频起点前移 d
+        秒实现重叠，从而与视频 xfade 重叠窗口一致（音频交叉淡入淡出，
+        不再在截断处硬切 / 错位）。无转场时行为完全不变。"""
+        parts = []
+
+        # ── 1) 扫描背景轨（track 0）转场对 ──
+        a_to_b = {}   # id(A) -> (B_clip, d, A_end)
+        b_to_a = {}   # id(B) -> (A_clip, d, A_end)
+        bg_overlap = 0.0
+        tracks = getattr(self.tl, 'video_tracks', []) or []
+        if tracks:
+            track0 = tracks[0]
+            for i, A in enumerate(track0[:-1]):
+                ot = getattr(A, 'out_transition', None)
+                if not (ot and ot.get('type')):
+                    continue
+                B = track0[i + 1]
+                A_dur = (A.trim_end - A.trim_start) / max(A.speed, 0.01)
+                A_end = A.timeline_start + A_dur
+                if B.timeline_start > A_end + 1e-3:
+                    continue  # 间隔过大，无重叠
+                B_dur = (B.trim_end - B.trim_start) / max(B.speed, 0.01)
+                d = max(0.0, float(ot.get('duration', 0.5)))
+                d = min(d, A_dur, B_dur)
+                if d <= 0:
+                    continue
+                a_to_b[id(A)] = (B, d, A_end)
+                b_to_a[id(B)] = (A, d, A_end)
+                bg_overlap += d
+
+        # ── 2) 去重：同一素材同一区间不要重复处理 ──
+        seen = set()
+        unique = []
+        for ac in audio_clips:
+            key = (ac["input_idx"], ac["clip"].trim_start, ac["clip"].trim_end)
+            if key not in seen:
+                seen.add(key)
+                unique.append(ac)
+
+        if not unique:
+            return [], ""
+
+        for i, ac in enumerate(unique):
+            c = ac["clip"]
+            idx = ac["input_idx"]
+            src_start = c.trim_start
+            src_dur = c.trim_end - c.trim_start
+            ts = c.timeline_start
+            speed = getattr(c, 'speed', 1.0) or 1.0
+            delay_ms = int(ts * 1000)
+            vol = getattr(c, 'volume', 1.0) or 1.0
+            playback_dur = src_dur / max(speed, 0.01)
+
+            cid = id(c)
+            fade_out_d = a_to_b.get(cid, (None, 0.0, 0.0))[1]   # A：尾音淡出量
+            b_info = b_to_a.get(cid)                            # B：(A, d, A_end)
+
+            stream = f"[{idx}:a]"
+            filters = []
+
+            # trim
+            filters.append(f"atrim=start={src_start:.4f}:duration={src_dur:.4f}")
+            filters.append("asetpts=PTS-STARTPTS")
+
+            # 变速
+            if abs(speed - 1.0) > 0.001:
+                # atempo 范围 0.5~2.0，超出需级联
+                remaining = speed
+                while remaining > 2.0:
+                    filters.append("atempo=2.0")
+                    remaining /= 2.0
+                while remaining < 0.5:
+                    filters.append("atempo=0.5")
+                    remaining /= 0.5
+                if abs(remaining - 1.0) > 0.001:
+                    filters.append(f"atempo={remaining:.4f}")
+
+            # 音量
+            if abs(vol - 1.0) > 0.01:
+                filters.append(f"volume={vol:.4f}")
+
+            # 转场：B 头音淡入，且起点前移 d 与 A 尾音重叠（交叉淡入淡出）
+            if b_info is not None:
+                _A, _d, _A_end = b_info
+                delay_ms = int((_A_end - _d) * 1000)
+                filters.append(f"afade=t=in:st=0:d={_d:.4f}")
+            # 转场：A 尾音淡出（在自身音频末尾 d 秒内）
+            if fade_out_d > 0:
+                _st = max(0.0, playback_dur - fade_out_d)
+                filters.append(f"afade=t=out:st={_st:.4f}:d={fade_out_d:.4f}")
+
+            # 延迟
+            filters.append(f"adelay={delay_ms}|{delay_ms}")
+
+            label = f"a{i}"
+            parts.append(f"{stream}{','.join(filters)}[{label}]")
+
+        if not parts:
+            return [], ""
+
+        # 音频总时长按背景轨转场重叠量缩短，与视频 xfade 输出长度对齐
+        audio_total = max(0.01, total_dur - bg_overlap)
+
+        if len(parts) == 1:
+            # 单音频：加 apad 保证与视频等长
+            n_inputs = 1
+            parts.append(f"[a0]apad=whole_dur={audio_total:.3f}[aout]")
+        else:
+            n_inputs = len(parts)
+            mix_labels = "".join(f"[a{i}]" for i in range(n_inputs))
+            parts.append(
+                f"{mix_labels}amix=inputs={n_inputs}:duration=longest:dropout_transition=3,"
+                f"apad=whole_dur={audio_total:.3f}[aout]"
+            )
+
+        return parts, "aout"
+
+    # ── 主导出 ──────────────────────────────────
+
+    @staticmethod
+    def _bg_has_transition(video_clips):
+        """背景轨（track 0）是否存在任意转场（含 15 种全部类型）"""
+        for vc in video_clips:
+            if vc["track"] == 0:
+                ot = getattr(vc["clip"], "out_transition", None)
+                if ot and ot.get("type"):
+                    return True
+        return False
+
+    def _export_via_compositor(self, ff, input_files, audio_clips, total_dur):
+        """背景轨含转场时，视频经 compositor 逐帧渲染（与预览同源，15 种转场像素级一致），
+        原始 RGBA 帧通过 stdin 喂给 ffmpeg；音频仍走 filter_complex（含转场交叉淡入淡出）。
+        字幕由 compositor 在帧内烧录，无需单独 drawtext。"""
+        import sys
+
+        # 计算视频实际时长 = natural total_dur − 背景轨转场重叠总量（与音频 _build_audio_graph 对齐）
+        bg_overlap = 0.0
+        tracks = getattr(self.tl, 'video_tracks', []) or []
+        if tracks:
+            track0 = tracks[0]
+            for i, A in enumerate(track0[:-1]):
+                ot = getattr(A, 'out_transition', None)
+                if not (ot and ot.get('type')):
+                    continue
+                B = track0[i + 1]
+                A_dur = (A.trim_end - A.trim_start) / max(A.speed, 0.01)
+                A_end = A.timeline_start + A_dur
+                if B.timeline_start > A_end + 1e-3:
+                    continue
+                B_dur = (B.trim_end - B.trim_start) / max(B.speed, 0.01)
+                d = max(0.0, float(ot.get('duration', 0.5)))
+                d = min(d, A_dur, B_dur)
+                if d > 0:
+                    bg_overlap += d
+        video_dur = max(0.01, total_dur - bg_overlap)
+
+        self.progress.emit(12, "初始化渲染器…")
+        try:
+            from core.compositor import VideoCompositor
+            comp = VideoCompositor(self.tl, (self.W, self.H), self.fps)
+        except Exception as e:
+            self.finished.emit(False, f"渲染器初始化失败：{e}")
+            return
+
+        # 音频仍走 filter_complex（file 输入索引 0..n-1，与下方输入顺序一致）
+        a_parts, a_label = self._build_audio_graph(audio_clips, total_dur)
+
+        # 输入：文件（音频源）在前，原始视频管道（stdin）作为最后一个输入
+        input_args = []
+        for path in input_files:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _IMG_EXTS:
+                input_args.extend(["-loop", "1"])
+            input_args.extend(["-i", path])
+        pipe_idx = len(input_files)  # 视频管道对应的输入索引
+
+        cmd = [ff, "-y"] + input_args + [
+            "-f", "rawvideo", "-pix_fmt", "rgba",
+            "-s", f"{self.W}x{self.H}", "-r", str(self.fps), "-i", "-",
+            "-map", f"{pipe_idx}:v",
+        ]
+        if a_label:
+            cmd += ["-filter_complex", ";".join(a_parts),
+                    "-map", f"[{a_label}]", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd += ["-an"]
+        cmd += ["-c:v", "libx264", "-preset", "fast",
+                "-crf", str(self.crf), "-pix_fmt", "yuv420p",
+                "-r", str(self.fps), self.output]
+
+        self._check_cancel()
+        self.progress.emit(15, "开始渲染导出…")
+
+        n_frames = max(1, int(round(video_dur * self.fps)))
+        frame_bytes = self.W * self.H * 4
+
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            # stderr → DEVNULL：逐帧渲染时进度由帧计数提供，
+            # 不使用后台线程（避免 Qt 信号跨 threading.Thread 崩溃）
+            proc = subprocess.Popen(
+                cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                text=False, creationflags=creationflags,
+            )
+        except Exception as e:
+            self.finished.emit(False, f"无法启动 FFmpeg：{e}")
+            return
+
+        try:
+            black = b"\x00" * frame_bytes
+            for f in range(n_frames):
+                self._check_cancel()
+                sec = f / self.fps
+                qimg = comp.render_frame(sec)
+                if qimg is None or qimg.isNull():
+                    proc.stdin.write(black)
+                else:
+                    rgba = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+                    data = bytes(rgba.constBits().asarray(rgba.sizeInBytes()))
+                    if len(data) != frame_bytes:
+                        # 行对齐兜底：按 scanLine 逐行拼接
+                        row = rgba.bytesPerLine()
+                        buf = bytearray(frame_bytes)
+                        for y in range(self.H):
+                            buf[y * self.W * 4:(y + 1) * self.W * 4] = \
+                                bytes(rgba.scanLine(y).asarray(row)[:self.W * 4])
+                        data = bytes(buf)
+                    proc.stdin.write(data)
+                if (f & 7) == 0:
+                    pct = 15 + int(80 * (f + 1) / n_frames)
+                    self.progress.emit(min(99, pct), f"渲染中… {f + 1}/{n_frames}")
+            proc.stdin.flush()
+            proc.stdin.close()
+        except Exception as e:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+            self.finished.emit(False, f"渲染失败：{e}")
+            return
+
+        try:
+            proc.wait(timeout=600)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            self.finished.emit(False, "导出超时（超过10分钟）")
+            return
+
+        if proc.returncode == 0:
+            self.progress.emit(100, "导出完成 ✓")
+            self.finished.emit(True, self.output)
+        elif self._cancelled:
+            self.finished.emit(False, "用户取消")
+        else:
+            self.finished.emit(False, "导出失败，请检查素材文件")
+
+    def _do_export(self):
+        import sys
+
+        ff = _get_ffmpeg()
+        self.progress.emit(5, "分析时间线…")
+
+        input_files, video_clips, audio_clips, subtitles, total_dur = self._collect()
+
+        if total_dur <= 0:
+            self.finished.emit(False, "时间线上没有可导出的内容")
+            return
+
+        # 检测每个输入文件是否含 alpha 通道（MOV 透明背景等）
+        self._input_alpha = []
+        try:
+            from utils.alpha_video import probe_has_alpha
+            for f in input_files:
+                ext = os.path.splitext(f)[1].lower()
+                if ext in _IMG_EXTS:
+                    self._input_alpha.append(False)
+                else:
+                    self._input_alpha.append(probe_has_alpha(f))
+        except Exception:
+            self._input_alpha = [False] * len(input_files)
+
+        self._check_cancel()
+        self.progress.emit(10, "构建导出命令…")
+
+        # ── 背景轨含转场 → 走 compositor 逐帧渲染（保证 15 种转场 导出=预览）──
+        if self._bg_has_transition(video_clips):
+            self._export_via_compositor(ff, input_files, audio_clips, total_dur)
+            return
+
+        # ── 构建 FFmpeg 输入参数 ──
+        input_args = []
+        for path in input_files:
+            ext = os.path.splitext(path)[1].lower()
+            if ext in _IMG_EXTS:
+                # 图片需要 loop
+                input_args.extend(["-loop", "1"])
+            input_args.extend(["-i", path])
+
+        # ── 构建 filter_complex ──
+        v_parts, v_label = self._build_video_graph(video_clips, total_dur)
+        s_parts, s_label = self._build_subtitle_filters(subtitles, v_label)
+        a_parts, a_label = self._build_audio_graph(audio_clips, total_dur)
+
+        all_parts = v_parts + s_parts + a_parts
+        filter_complex = ";".join(all_parts)
+
+        # ── 构建完整命令 ──
+        cmd = [ff, "-y"] + input_args + [
+            "-filter_complex", filter_complex,
+            "-map", f"[{s_label}]",
+            "-c:v", "libx264", "-preset", "fast",
+            "-crf", str(self.crf), "-pix_fmt", "yuv420p",
+            "-r", str(self.fps),
+        ]
+
+        if a_label:
+            cmd += ["-map", f"[{a_label}]", "-c:a", "aac", "-b:a", "192k"]
+        else:
+            cmd += ["-an"]
+
+        cmd.append(self.output)
+
+        self._check_cancel()
+        self.progress.emit(15, "开始合成导出…")
+
+        # ── 执行 FFmpeg ──
+        try:
+            creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=creationflags,
+            )
+
+            # 读取 stderr 获取进度
+            import re
+            dur_pat = re.compile(r"Duration: (\d+):(\d+):(\d+\.\d+)")
+            time_pat = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+
+            stderr = self._proc.stderr
+            reported_dur = total_dur
+
+            for line in stderr:
+                self._check_cancel()
+
+                # 尝试获取 duration
+                m = dur_pat.search(line)
+                if m:
+                    reported_dur = (int(m.group(1)) * 3600 +
+                                    int(m.group(2)) * 60 +
+                                    float(m.group(3)))
+
+                # 尝试获取当前时间
+                m = time_pat.search(line)
+                if m:
+                    t = (int(m.group(1)) * 3600 +
+                         int(m.group(2)) * 60 +
+                         float(m.group(3)))
+                    if reported_dur > 0:
+                        pct = 15 + int(80 * t / reported_dur)
+                    else:
+                        pct = 15 + int(80 * t / max(total_dur, 0.01))
+                    pct = min(99, max(15, pct))
+                    self.progress.emit(pct, f"导出中… {int(t)}s / {int(reported_dur)}s")
+
+            try:
+                self._proc.wait(timeout=600)
+            except subprocess.TimeoutExpired:
+                self._proc.terminate()
+                try:
+                    self._proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self._proc.kill()
+                self.finished.emit(False, "导出超时（超过10分钟）")
+                return
+
+            if self._proc.returncode == 0:
+                self.progress.emit(100, "导出完成 ✓")
+                self.finished.emit(True, self.output)
+            elif self._cancelled:
+                self.finished.emit(False, "用户取消")
+            else:
+                self.finished.emit(False, "导出失败，请检查 FFmpeg 和素材文件")
+
+        except RuntimeError:
+            if self._proc:
+                self._proc.terminate()
+            self.finished.emit(False, "用户取消")
+        except Exception as e:
+            self.finished.emit(False, f"导出失败：{e}")
+        finally:
+            self._proc = None

@@ -1,0 +1,10 @@
+{
+  "name": "15秒闪击",
+  "duration": 15,
+  "structure": [
+    {"phase": "hook", "start": 0, "end": 3, "instruction": "3秒Hook抓注意力，必须让观众停下来"},
+    {"phase": "pain", "start": 3, "end": 7, "instruction": "4秒痛点刺激，让观众点头认同"},
+    {"phase": "solution", "start": 7, "end": 12, "instruction": "5秒解决方案，产品展示+效果"},
+    {"phase": "cta", "start": 12, "end": 15, "instruction": "3秒CTA催转化，限时/限量/链接"}
+  ]
+}

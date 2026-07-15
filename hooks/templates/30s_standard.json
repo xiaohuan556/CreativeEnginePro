@@ -1,0 +1,11 @@
+{
+  "name": "30秒标准",
+  "duration": 30,
+  "structure": [
+    {"phase": "hook", "start": 0, "end": 3, "instruction": "3秒Hook，停止滑动"},
+    {"phase": "pain", "start": 3, "end": 10, "instruction": "7秒痛点展开，引发共鸣"},
+    {"phase": "solution", "start": 10, "end": 18, "instruction": "8秒产品介绍，展示核心卖点"},
+    {"phase": "social_proof", "start": 18, "end": 25, "instruction": "7秒社交证明，用户评价/数据/对比"},
+    {"phase": "cta", "start": 25, "end": 30, "instruction": "5秒CTA，紧迫感催行动"}
+  ]
+}

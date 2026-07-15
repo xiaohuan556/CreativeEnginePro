@@ -1,0 +1,25 @@
+{
+  "imgs_per_video": 6,
+  "video_duration": 12,
+  "video_count": 50,
+  "fps": 30,
+  "resolution": "1080x1920",
+  "transition_frames": 10,
+  "video_quality": "minimal",
+  "bgm_paths": [
+    "G:/gh/资源/BGM/BGM/GG/DIA DELÍCIA-Nakama & Mc Staff & ΣP.m4a",
+    "G:/gh/资源/BGM/BGM/GG/LUNA BALA (Slowed)-Yb Wasg'ood & Ariis.m4a",
+    "G:/gh/资源/BGM/BGM/GG/Shaky-Sanju Rathod & G-Spark.m4a",
+    "G:/gh/资源/BGM/BGM/TT/MONTAGEM TOMADA（PHONK ）（Billion Waves Remix）-Billion Waves.m4a"
+  ],
+  "bgm_volume": 80,
+  "endpage_enabled": false,
+  "endpage_path": "",
+  "transition_type": "推进放大",
+  "random_transition": false,
+  "random_bgm": false,
+  "bgm_selected": 0,
+  "shuffle_mode": true,
+  "output_dir": "",
+  "file_prefix": "Themepack_ios_GG_MID009_DA003_20260709_"
+}

@@ -1,0 +1,14 @@
+__pycache__/
+*.pyc
+build/
+dist/
+Cache/
+work_temp/
+work_output/
+.workbuddy/
+*.spec
+ffmpeg.exe
+ffmpeg_temp.7z
+nul
+*.zip
+*.7z
