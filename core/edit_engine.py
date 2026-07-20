@@ -2126,6 +2126,24 @@ class FFmpegDirectExportWorker(QThread):
                     return True
         return False
 
+    @staticmethod
+    def _needs_compositor(video_clips, input_alpha):
+        """判断是否需要走 compositor 逐帧渲染（而非 FFmpeg filter_complex 直接导出）。
+
+        compositor 路径在以下情况必须启用：
+        1. 背景轨含转场（xfade 不支持自定义型）
+        2. 任意视频片段启用了绿幕抠像（chroma_key_enabled）
+        3. 任意输入文件含 alpha 通道（MOV ProRes 4444 / WebM VP9 alpha 等）
+        """
+        if FFmpegDirectExportWorker._bg_has_transition(video_clips):
+            return True
+        for vc in video_clips:
+            if getattr(vc["clip"], "chroma_key_enabled", False):
+                return True
+        if any(input_alpha):
+            return True
+        return False
+
     def _export_via_compositor(self, ff, input_files, audio_clips, total_dur):
         """背景轨含转场时，视频经 compositor 逐帧渲染（与预览同源，15 种转场像素级一致），
         原始 RGBA 帧通过 stdin 喂给 ffmpeg；音频仍走 filter_complex（含转场交叉淡入淡出）。
@@ -2215,14 +2233,22 @@ class FFmpegDirectExportWorker(QThread):
                     proc.stdin.write(black)
                 else:
                     rgba = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
-                    data = bytes(rgba.constBits().asarray(rgba.sizeInBytes()))
+                    # 兼容 PyQt5/6：constBits().asarray() 部分版本不提供
+                    try:
+                        data = bytes(rgba.constBits().asarray(rgba.sizeInBytes()))
+                    except AttributeError:
+                        data = bytes(rgba.constBits())
                     if len(data) != frame_bytes:
                         # 行对齐兜底：按 scanLine 逐行拼接
                         row = rgba.bytesPerLine()
                         buf = bytearray(frame_bytes)
                         for y in range(self.H):
-                            buf[y * self.W * 4:(y + 1) * self.W * 4] = \
-                                bytes(rgba.scanLine(y).asarray(row)[:self.W * 4])
+                            sl = rgba.scanLine(y)
+                            try:
+                                row_data = bytes(sl.asarray(row)[:self.W * 4])
+                            except AttributeError:
+                                row_data = bytes(sl)[:self.W * 4]
+                            buf[y * self.W * 4:(y + 1) * self.W * 4] = row_data
                         data = bytes(buf)
                     proc.stdin.write(data)
                 if (f & 7) == 0:
@@ -2231,6 +2257,10 @@ class FFmpegDirectExportWorker(QThread):
             proc.stdin.flush()
             proc.stdin.close()
         except Exception as e:
+            try:
+                comp.close()
+            except Exception:
+                pass
             try:
                 proc.terminate()
             except Exception:
@@ -2244,6 +2274,12 @@ class FFmpegDirectExportWorker(QThread):
             proc.kill()
             self.finished.emit(False, "导出超时（超过10分钟）")
             return
+        finally:
+            # 释放 compositor 解码器资源（VideoCapture / RingBuffer）
+            try:
+                comp.close()
+            except Exception:
+                pass
 
         if proc.returncode == 0:
             self.progress.emit(100, "导出完成 ✓")
@@ -2281,8 +2317,8 @@ class FFmpegDirectExportWorker(QThread):
         self._check_cancel()
         self.progress.emit(10, "构建导出命令…")
 
-        # ── 背景轨含转场 → 走 compositor 逐帧渲染（保证 15 种转场 导出=预览）──
-        if self._bg_has_transition(video_clips):
+        # ── 背景轨含转场 / 绿幕抠像 / alpha 视频 → 走 compositor 逐帧渲染 ──
+        if self._needs_compositor(video_clips, self._input_alpha):
             self._export_via_compositor(ff, input_files, audio_clips, total_dur)
             return
 
@@ -2325,24 +2361,33 @@ class FFmpegDirectExportWorker(QThread):
         # ── 执行 FFmpeg ──
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            # 不用 text=True：FFmpeg 在 Windows 上输出 UTF-8（含中文/特殊符号），
+            # 默认 GBK 解码会抛 UnicodeDecodeError 中断整个导出流程
             self._proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
-                text=True,
+                text=False,
                 creationflags=creationflags,
             )
 
-            # 读取 stderr 获取进度
+            # 读取 stderr 获取进度（bytes 模式，errors=replace 容错 GBK→UTF-8 不一致）
             import re
             dur_pat = re.compile(r"Duration: (\d+):(\d+):(\d+\.\d+)")
             time_pat = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
 
             stderr = self._proc.stderr
             reported_dur = total_dur
+            err_tail = []  # 保留最近 ~4KB stderr 用于失败时显示
 
-            for line in stderr:
+            for raw_line in stderr:
                 self._check_cancel()
+                line = raw_line.decode("utf-8", errors="replace")
+
+                # 保留尾部错误信息
+                if len(err_tail) > 200 or sum(len(x) for x in err_tail) > 4096:
+                    err_tail.pop(0)
+                err_tail.append(line)
 
                 # 尝试获取 duration
                 m = dur_pat.search(line)
@@ -2381,7 +2426,9 @@ class FFmpegDirectExportWorker(QThread):
             elif self._cancelled:
                 self.finished.emit(False, "用户取消")
             else:
-                self.finished.emit(False, "导出失败，请检查 FFmpeg 和素材文件")
+                # 把最近 stderr 尾部一并返回，便于定位真实错误
+                tail = "".join(err_tail)[-2000:]
+                self.finished.emit(False, f"导出失败（FFmpeg 返回码 {self._proc.returncode}）\n{tail}")
 
         except RuntimeError:
             if self._proc:

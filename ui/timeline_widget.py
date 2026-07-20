@@ -361,17 +361,18 @@ class TimelineCanvas(QWidget):
                 return clip, td
         return None, None
 
-    def _snap_sec(self, sec: float, exclude_clip=None, main_track_only: bool = False) -> float:
+    def _snap_sec(self, sec: float, exclude_clip=None, main_track_only: bool = False, max_threshold: float = 0.08) -> float:
         """通用吸附：吸附到所有轨道的片段边界 + 时间线刻度 + 0.0 起始点。
         
         - 边界吸附阈值：SNAP_PX / zoom（像素空间），优先级最高
         - 刻度吸附阈值：2x SNAP_PX / zoom，边界无匹配时生效
         - 所有轨道都参与吸附（不再限制主轨）
         - exclude_clip：拖拽中的片段，排除自身边界
+        - max_threshold：吸附距离上限（秒），拖拽中用较小值防过度吸附，释放时用较大值精准对齐
         """
         if sec <= 0.01:
             return 0.0
-        threshold = min(SNAP_PX / self.zoom, 0.15)  # 上限 0.15s，防止低 zoom 下过度吸附
+        threshold = min(SNAP_PX / self.zoom, max_threshold)  # 上限防止低 zoom 下过度吸附
         best = sec
         best_dist = threshold
         
@@ -1266,17 +1267,20 @@ class TimelineCanvas(QWidget):
                                 clip.trim_end = clip.trim_start + 0.1
             elif self._drag_mode == "move":
                 new_start_px = x - self._drag_pixel_offset
-                clip.timeline_start = max(0.0, self._x_to_sec(new_start_px))
-                # 通用吸附：所有轨道的所有片段都吸附到边界（视频/音频/字幕/图片）
-                snapped = self._snap_sec(clip.timeline_start, exclude_clip=clip)
-                if snapped != clip.timeline_start:
+                raw_sec = max(0.0, self._x_to_sec(new_start_px))
+                # 吸附到附近边界（视觉辅助，不锁定光标）
+                snapped = self._snap_sec(raw_sec, exclude_clip=clip)
+                if snapped != raw_sec:
                     clip.timeline_start = snapped
+                else:
+                    clip.timeline_start = raw_sec
                 if td.kind == "subtitle":
                     clip.timeline_end = clip.timeline_start + (self._drag_sub_dur0 if self._drag_sub_dur0 else (clip.timeline_end - clip.timeline_start))
                 # 字幕拖拽中推迟到右侧避免视觉重叠；视频/音频释放时自动堆叠
                 if td.kind == "subtitle":
                     self._snap_out_of_overlap(clip, td)
-                self._drag_pixel_offset = x - self._sec_to_x(clip.timeline_start)
+                # 基于原始（未吸附）位置更新偏移，避免吸附后偏移漂移 → 片段落后于光标
+                self._drag_pixel_offset = x - self._sec_to_x(raw_sec)
                 # 跨轨提示（提前切轨：用距离中心+扩展命中区，轨道主动接住素材）
                 self._drag_target_track = self._track_at_drag(y)
                 target_td = self._drag_target_track
@@ -1447,8 +1451,8 @@ class TimelineCanvas(QWidget):
             if self._drag_mode == "move" and self._drag_track_desc:
                 td = self._drag_track_desc
                 clip = self._drag_clip
-                # 释放时最终吸附：所有轨道的所有片段都吸附到边界
-                snapped = self._snap_sec(clip.timeline_start, exclude_clip=clip)
+                # 释放时最终吸附：所有轨道的所有片段都吸附到边界（大阈值，精准对齐）
+                snapped = self._snap_sec(clip.timeline_start, exclude_clip=clip, max_threshold=0.15)
                 if snapped != clip.timeline_start:
                     clip.timeline_start = snapped
                 # 主轨 auto_align 模式：关闭间隙
@@ -1680,6 +1684,10 @@ class TimelineCanvas(QWidget):
                 self._selected_track = None
                 self.selection_changed.emit(None, "", -1)
                 self.update()
+                # 强制刷新预览画面，清除被删除片段的残留帧
+                pt = getattr(self, 'parent_timeline', None)
+                if pt and pt._preview_player:
+                    pt._preview_player.seek(self.playhead, force=True)
 
     def _menu_add_keyframe(self, clip):
         try:
@@ -2134,6 +2142,10 @@ class TimelineWidget(QWidget):
             else:
                 # 非播放状态：只停止被删除片段的音频，不启动任何新音频
                 self._preview_player.stop_audio()
+        # 强制刷新预览画面，清除被删除片段的残留帧
+        if self._preview_player:
+            cur_sec = canvas.playhead if hasattr(canvas, 'playhead') else 0.0
+            self._preview_player.seek(cur_sec, force=True)
 
     def _do_toggle_visibility(self):
         """V 键：切换选中片段的可见性"""
@@ -2323,11 +2335,22 @@ class TimelineWidget(QWidget):
     def _check_audio_boundary(self, sec: float, delta: float):
         prev_sec = sec - delta
         need_resync = False
-        for track in self.tl.video_tracks[:1]:  # 只检查主轨（track 0），避免多轨重叠时非主轨边界频繁触发音频重同步→时钟跳
+        # 主轨（track 0）边界交叉 → 需要完整同步（音频时钟重对齐）
+        for track in self.tl.video_tracks[:1]:
             for c in track:
                 if prev_sec < c.timeline_start <= sec or prev_sec < c.timeline_end <= sec:
                     need_resync = True
                     break
+        # 叠加轨（track 1+）边界交叉 → 仅调 play_all_audio 启动/停止音频，
+        # 不设 _audio_synced（不干扰主轨时钟），避免频繁触发→时钟跳
+        overlay_boundary = False
+        for track in self.tl.video_tracks[1:]:
+            for c in track:
+                if prev_sec < c.timeline_start <= sec or prev_sec < c.timeline_end <= sec:
+                    overlay_boundary = True
+                    break
+            if overlay_boundary:
+                break
         if not need_resync:
             for track in self.tl.audio_tracks:
                 for c in track:
@@ -2336,3 +2359,5 @@ class TimelineWidget(QWidget):
                         break
         if need_resync:
             self._sync_audio(sec)
+        elif overlay_boundary and self._preview_player:
+            self._preview_player.play_overlay_audio(sec)

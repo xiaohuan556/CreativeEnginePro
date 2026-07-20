@@ -145,6 +145,32 @@ class ClipDecoder:
             self._seek_to(target)
         return self._ring.get(target)
 
+    # ── 独立取帧（叠加轨用）：不修改 _head / ring，不干扰主轨连续读状态 ──
+    def read_frame_at(self, target):
+        """直接 seek 到 target 帧并读取，不修改 _head 和 ring buffer。
+        用于叠加轨取帧，避免同一个 source_path 的主轨/叠加轨共用 decoder
+        时来回 seek 互相覆盖 _head，导致每帧都 seek（瓶颈 ~200ms）。
+        返回 (rgb_frame, w, h) 或 None。"""
+        if not self.open():
+            return None
+        if target < 0:
+            target = 0
+        if self.total_frames and target >= self.total_frames:
+            target = max(0, self.total_frames - 1)
+        # ring 可能命中（如果主轨刚好读过目标帧附近）→ 免 seek
+        if self._ring.has(target):
+            return self._ring.get(target)
+        ok, frame = self._seek_read(target)
+        if not ok or frame is None:
+            return None
+        # 仅转换不做 push，不干扰主轨状态机
+        if frame.shape[2] == 4:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
+        else:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        h, w = rgb.shape[:2]
+        return (rgb, w, h)
+
     # ── 内部：连续向前读 ──
     def _ensure_forward(self, target):
         if self._ring.has(target):
@@ -160,6 +186,15 @@ class ClipDecoder:
             # 播放起点 / 大跳：先 seek 一次，之后恢复连续 read
             self._seek_to(target)
             return
+        # 安全网：验证 cap 位置未被外部代码（如 read_frame_at）移动
+        # 若位置已被其他 seek 污染，先纠正再顺序读，避免读到错误帧
+        _expected = self._head + 1
+        try:
+            _actual = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+            if _actual != _expected:
+                self.cap.set(cv2.CAP_PROP_POS_FRAMES, _expected)
+        except Exception:
+            pass
         # 顺序向前 read（每帧 3~6ms，无 seek）
         while self._head < target:
             ok, frame = self._seq_read()

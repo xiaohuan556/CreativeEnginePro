@@ -509,6 +509,9 @@ class PreviewPlayer(QWidget):
         self._alpha_clip_cache: dict = {}
         # RLock：_get_alpha_frame 在锁内调用 _ensure_alpha_decoded
         self._alpha_clip_lock = threading.RLock()
+        # 持久文件句柄：缓存 alpha .rgba 文件的 open file object，
+        # 避免每帧 open/close 几百 MB 文件（叠加多轨时 I/O 开销累积导致卡顿）
+        self._alpha_file_handles: dict = {}  # source_path → file object
         self._alpha_cache_tl_id = -1                     # 时间线变化检测，用于清理缓存
         # 上一帧成功解码的画面缓存（播放时某帧解码失败兜底，避免整画面闪空 / 叠加轨闪黑）
         self._last_main_raw = None          # 主轨成功解码的帧 (np.ndarray)
@@ -529,6 +532,9 @@ class PreviewPlayer(QWidget):
         # ── 状态机解码器（替代内联 cv2 seek+read）──
         self._decoders = DecoderManager()    # clip.path -> ClipDecoder
         self._decode_state = "playing"       # playing/paused/scrubbing/seek
+        # 叠加轨独立解码器池：id(clip) -> ClipDecoder
+        # 同一文件多轨道重叠时，叠加轨用独立 VideoCapture，避免共享 cap seek 冲突导致卡顿
+        self._overlay_decoders: dict = {}
 
         # ── 第二段初始化：UI / 定时器 / 音频（原在 _set_seq_state 体内，现移至此）──
         # 素材库画布内预览模式
@@ -1109,6 +1115,44 @@ class PreviewPlayer(QWidget):
         """播放头跳转时同步所有音频（重新调用 play_all_audio）"""
         self.play_all_audio(sec)
 
+    def play_overlay_audio(self, sec: float):
+        """仅处理叠加轨（track 1+）音频：启动新进入的叠加轨片段音频，
+        停止已离开的叠加轨片段音频。不碰 slot 0（主轨），避免
+        setPosition 污染 _position_ms → audio_clock_sec 公式被破坏 → 时钟跳。"""
+        n_video = len(self.tl.video_tracks)
+        active_slots: dict = {}
+        for i in range(1, n_video):  # 跳过 track 0（主轨）
+            track = self.tl.video_tracks[i]
+            info = (self.tl.video_track_info[i]
+                    if hasattr(self.tl, "video_track_info") and i < len(self.tl.video_track_info)
+                    else None)
+            track_muted = info.muted if info else False
+            if track_muted:
+                continue
+            for c in track:
+                if not getattr(c, "visible", True):
+                    continue
+                if c.timeline_start <= sec < c.timeline_end and not c.mute:
+                    src_sec = c.trim_start + (sec - c.timeline_start) * c.speed
+                    if os.path.exists(c.source_path):
+                        dur = max(0.0, c.trim_end - src_sec)
+                        active_slots[i] = (
+                            c.source_path, src_sec, c.speed, c.volume, dur, 0.0, 0.0)
+                    break
+
+        for s in range(1, n_video):
+            if s in active_slots:
+                src, offset, rate, vol, dur, fi, fo = active_slots[s]
+                self.play_audio(src, offset, s, rate=rate,
+                                volume=vol, duration_sec=dur,
+                                fade_in=fi, fade_out=fo)
+            else:
+                self.stop_audio(s)
+
+        # 停止超出范围的叠加轨 slot
+        for s in range(n_video, len(self._audio_players)):
+            self.stop_audio(s)
+
     def set_playing(self, on: bool):
         """由 TimelineWidget 设置播放状态，播放中 seek() 跳过音频同步"""
         if on:
@@ -1149,6 +1193,12 @@ class PreviewPlayer(QWidget):
         self._last_frame_image = None  # 清除帧缓存，确保 seek 后显示正确画面
         self._last_raw_img = None       # 同步清除原始帧缓存
         self._last_raw_overlays = []
+        if force:
+            # 强制刷新时清除帧缓存环中当前位置的旧帧，
+            # 避免 _flush_frame 回退到过期帧（如删除片段后残留画面）
+            with self._frame_lock:
+                rk = self._ring_key(sec)
+                self._payload_ring.pop(rk, None)
         if self._preview_active:
             self.stop_preview()
         m = int(sec // 60)
@@ -1244,6 +1294,13 @@ class PreviewPlayer(QWidget):
             return
         oldest = next(iter(self._alpha_clip_cache))
         e = self._alpha_clip_cache.pop(oldest)
+        # 关闭对应的持久文件句柄
+        fh = self._alpha_file_handles.pop(oldest, None)
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
         info = e.get('info')
         if info and info.get('file') and os.path.exists(info['file']):
             try:
@@ -1256,16 +1313,34 @@ class PreviewPlayer(QWidget):
         with self._alpha_clip_lock:
             items = list(self._alpha_clip_cache.items())
             self._alpha_clip_cache.clear()
+            # 关闭所有持久文件句柄
+            for _cid, fh in self._alpha_file_handles.items():
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            self._alpha_file_handles.clear()
         # 切换时间线：清空上一帧兜底缓存，避免复用已失效片段的画面
         self._last_main_raw = None
         self._last_main_clip = None
         self._last_alpha_overlay = {}
+        # 清空绿幕帧缓存（避免复用已失效片段的抠像结果）
+        try:
+            from utils.chroma_key import clear_chroma_cache
+            clear_chroma_cache()
+        except Exception:
+            pass
         # 关闭叠加轨 alpha 视频的持久管道读取器（避免 ffmpeg 进程泄漏）
         if _HAS_ALPHA:
             try:
                 close_all_pipe_readers()
             except Exception:
                 pass
+        # 释放叠加轨独立解码器（时间线切换后 clip 对象失效，旧解码器需释放）
+        try:
+            self._release_overlay_decoders()
+        except Exception:
+            pass
         for _cid, e in items:
             info = e.get('info')
             if info and info.get('file') and os.path.exists(info['file']):
@@ -1273,6 +1348,37 @@ class PreviewPlayer(QWidget):
                     os.remove(info['file'])
                 except Exception:
                     pass
+
+    def _get_overlay_decoder(self, clip):
+        """为共享源的叠加轨创建/获取独立解码器（独立 VideoCapture）。
+        
+        同一视频文件在多个轨道时间错开时，主轨和叠加轨需要读取不同时间位置的帧。
+        共享同一个 VideoCapture 会导致 seek 冲突 → _head 跟踪混乱 → 严重卡顿。
+        此方法为每个叠加轨 clip 创建独立的 ClipDecoder，与主轨解码器完全隔离。
+        """
+        clid = id(clip)
+        if clid in self._overlay_decoders:
+            dec = self._overlay_decoders[clid]
+            if dec.is_open():
+                return dec
+            # 解码器已失效，重建
+            self._overlay_decoders.pop(clid, None)
+        from core.clip_decoder import ClipDecoder
+        dec = ClipDecoder(clip.source_path)
+        if dec.open():
+            dec.set_state(self._decode_state)
+            self._overlay_decoders[clid] = dec
+            return dec
+        return None
+
+    def _release_overlay_decoders(self):
+        """释放所有叠加轨独立解码器。"""
+        for dec in self._overlay_decoders.values():
+            try:
+                dec.release()
+            except Exception:
+                pass
+        self._overlay_decoders.clear()
 
     def _get_alpha_frame(self, clip, src_sec):
         """返回 clip 在 src_sec 处的 BGRA 帧（来自整段预解码缓存）。
@@ -1316,13 +1422,27 @@ class PreviewPlayer(QWidget):
             if fi >= nframes:
                 fi = nframes - 1
             off = fi * info['fb']
-            # 用 open+seek+read 代替 np.memmap。
-            # memmap 每帧创建新文件映射，Windows 上不主动释放句柄，
-            # 30fps 几十秒即耗尽系统句柄 → cv2 也无法打开主轨 MP4
-            # → 表现为"叠加 MOV 后两个视频都卡死，删掉 MOV 后 MP4 也不动"。
-            with open(info['file'], 'rb') as f:
-                f.seek(off)
-                data = f.read(info['fb'])
+            # 持久文件句柄：避免每帧 open/close 大文件（叠加多轨时 I/O 累积导致卡顿）。
+            # 不用 np.memmap（Windows 上每帧创建新映射耗尽句柄），而是缓存一个 open
+            # file object，只在 alpha cache evict 时关闭。
+            fh = self._alpha_file_handles.get(cid)
+            if fh is None:
+                try:
+                    fh = open(info['file'], 'rb')
+                    self._alpha_file_handles[cid] = fh
+                except Exception:
+                    return None
+            try:
+                fh.seek(off)
+                data = fh.read(info['fb'])
+            except Exception:
+                # 读取失败（文件被外部删除等）→ 关闭句柄，清除缓存，下一帧重新解码
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+                self._alpha_file_handles.pop(cid, None)
+                return None
             if len(data) < info['fb']:
                 return None
             return np.frombuffer(data, dtype=np.uint8).reshape(
@@ -1568,6 +1688,24 @@ class PreviewPlayer(QWidget):
                                 continue  # 无任何可用 alpha 帧：跳过，不画不透明黑框
                             else:
                                 o_rgb, w, h = _alpha_res
+                                # 绿幕抠像：后台线程 LUT + 帧缓存处理
+                                if getattr(oc, 'chroma_key_enabled', False):
+                                    try:
+                                        from utils.chroma_key import apply_chroma_key_cached
+                                        _ov_fps = 30.0
+                                        _ov_dec = self._decoders.get(oc)
+                                        if _ov_dec is not None:
+                                            _ov_fps = _ov_dec.fps
+                                        o_rgb = apply_chroma_key_cached(
+                                            oc.source_path, int(round(src_o * _ov_fps)), o_rgb,
+                                            getattr(oc, 'chroma_key_color', (0, 255, 0)),
+                                            getattr(oc, 'chroma_key_similarity', 0.40),
+                                            getattr(oc, 'chroma_key_smoothness', 0.10),
+                                            getattr(oc, 'chroma_key_spill', 0.10),
+                                        )
+                                        h, w = o_rgb.shape[:2]
+                                    except Exception:
+                                        logging.debug("chroma key ov alpha failed", exc_info=True)
                                 raw_ovs.append((oc, ("video", o_rgb), w, h))
                                 continue
                             # 状态机解码器路径（连续 read + 窗口缓存，根除每帧 seek）
@@ -1578,6 +1716,20 @@ class PreviewPlayer(QWidget):
                                 if res_o is not None:
                                     o_rgb, w, h = res_o
                                     self._cache_src_size(oc.source_path, (w, h))
+                                    # 绿幕抠像：后台线程 LUT + 帧缓存处理
+                                    if getattr(oc, 'chroma_key_enabled', False):
+                                        try:
+                                            from utils.chroma_key import apply_chroma_key_cached
+                                            o_rgb = apply_chroma_key_cached(
+                                                oc.source_path, int(round(src_o * dec_o.fps)), o_rgb,
+                                                getattr(oc, 'chroma_key_color', (0, 255, 0)),
+                                                getattr(oc, 'chroma_key_similarity', 0.40),
+                                                getattr(oc, 'chroma_key_smoothness', 0.10),
+                                                getattr(oc, 'chroma_key_spill', 0.10),
+                                            )
+                                            h, w = o_rgb.shape[:2]
+                                        except Exception:
+                                            logging.debug("chroma key ov failed", exc_info=True)
                                     raw_ovs.append((oc, ("video", o_rgb), w, h))
                     except Exception:
                         logging.debug("overlay fetch error", exc_info=True)
@@ -1677,6 +1829,25 @@ class PreviewPlayer(QWidget):
                 self._clip_src_w = w
                 self._clip_src_h = h
                 self._cache_src_size(clip.source_path, (w, h))
+
+                # 绿幕抠像：在后台线程用 LUT + 帧缓存处理，避免主线程阻塞
+                if getattr(clip, 'chroma_key_enabled', False):
+                    try:
+                        from utils.chroma_key import apply_chroma_key_cached
+                        _ck_fps = dec.fps if dec is not None else 30.0
+                        _ck_fidx = int(round(src_sec * _ck_fps))
+                        frame_rgb = apply_chroma_key_cached(
+                            clip.source_path, _ck_fidx, frame_rgb,
+                            getattr(clip, 'chroma_key_color', (0, 255, 0)),
+                            getattr(clip, 'chroma_key_similarity', 0.40),
+                            getattr(clip, 'chroma_key_smoothness', 0.10),
+                            getattr(clip, 'chroma_key_spill', 0.10),
+                        )
+                        # frame_rgb 现在是 RGBA 4 通道；尺寸不变
+                        h, w = frame_rgb.shape[:2]
+                    except Exception:
+                        logging.debug("chroma key bg thread main failed", exc_info=True)
+
                 _pending_raw_val = frame_rgb
                 _pending_raw_w_val = w
                 _pending_raw_h_val = h
@@ -1720,16 +1891,64 @@ class PreviewPlayer(QWidget):
                             continue  # 无任何可用 alpha 帧：跳过，不画不透明黑框
                         else:
                             o_rgb, w, h = _alpha_res
+                            # 绿幕抠像：后台线程 LUT + 帧缓存处理
+                            if getattr(oc, 'chroma_key_enabled', False):
+                                try:
+                                    from utils.chroma_key import apply_chroma_key_cached
+                                    _ov_fps = 30.0
+                                    _ov_dec = self._decoders.get(oc)
+                                    if _ov_dec is not None:
+                                        _ov_fps = _ov_dec.fps
+                                    o_rgb = apply_chroma_key_cached(
+                                        oc.source_path, int(round(src_o * _ov_fps)), o_rgb,
+                                        getattr(oc, 'chroma_key_color', (0, 255, 0)),
+                                        getattr(oc, 'chroma_key_similarity', 0.40),
+                                        getattr(oc, 'chroma_key_smoothness', 0.10),
+                                        getattr(oc, 'chroma_key_spill', 0.10),
+                                    )
+                                    h, w = o_rgb.shape[:2]
+                                except Exception:
+                                    logging.debug("chroma key bg thread ov alpha failed", exc_info=True)
                             raw_ovs.append((oc, ("video", o_rgb), w, h))
                             continue
-                        # cv2 路径（非 alpha 视频）：走状态机解码器，与主轨共用零 seek 策略
+                        # cv2 路径（非 alpha 视频）
                         dec_o = self._decoders.get(oc)
                         if dec_o is not None:
-                            _ov_ahead = 5 if (self._playing and write_pending) else 1
-                            res_o = dec_o.request(src_o, self._decode_state, ahead_frames=_ov_ahead)
+                            # 同一文件多轨道：使用独立解码器（独立 VideoCapture），
+                            # 避免共享 cap 的 seek 冲突导致主轨 _head 跟踪混乱→卡顿。
+                            _same_file = (main_clip is not None
+                                          and oc.source_path == main_clip.source_path)
+                            if _same_file:
+                                ov_dec = self._get_overlay_decoder(oc)
+                                if ov_dec is not None:
+                                    _ov_ahead = 1
+                                    res_o = ov_dec.request(src_o, self._decode_state, ahead_frames=_ov_ahead)
+                                else:
+                                    res_o = None
+                            else:
+                                _ov_ahead = 5 if (self._playing and write_pending) else 1
+                                res_o = dec_o.request(src_o, self._decode_state, ahead_frames=_ov_ahead)
                             if res_o is not None:
                                 o_rgb, w, h = res_o
                                 self._cache_src_size(oc.source_path, (w, h))
+                                # 绿幕抠像：后台线程 LUT + 帧缓存处理
+                                if getattr(oc, 'chroma_key_enabled', False):
+                                    try:
+                                        from utils.chroma_key import apply_chroma_key_cached
+                                        if _same_file:
+                                            _ck_fidx = int(round(src_o * (ov_dec.fps if ov_dec else dec_o.fps)))
+                                        else:
+                                            _ck_fidx = int(round(src_o * dec_o.fps))
+                                        o_rgb = apply_chroma_key_cached(
+                                            oc.source_path, _ck_fidx, o_rgb,
+                                            getattr(oc, 'chroma_key_color', (0, 255, 0)),
+                                            getattr(oc, 'chroma_key_similarity', 0.40),
+                                            getattr(oc, 'chroma_key_smoothness', 0.10),
+                                            getattr(oc, 'chroma_key_spill', 0.10),
+                                        )
+                                        h, w = o_rgb.shape[:2]
+                                    except Exception:
+                                        logging.debug("chroma key bg thread ov failed", exc_info=True)
                                 raw_ovs.append((oc, ("video", o_rgb), w, h))
                 except Exception:
                     logging.debug("bg frame fetch error", exc_info=True)
@@ -1815,9 +2034,9 @@ class PreviewPlayer(QWidget):
     def _alloc_canvas(self, cw: int, ch: int) -> QImage:
         """分配/复用画布 QImage，尺寸不变时复用避免内存分配
 
-        预览画布使用不透明格式（Format_RGB32）。
-        背景始终尊重用户设定的纯色背景（透明叠加轨的透明区域会透出此色）。
-        导出画布由 compositor 管理（使用 Format_ARGB32 保留 alpha）。
+        预览画布使用 ARGB32 格式以支持 chroma key 的 alpha 通道合成。
+        背景始终尊重用户设定的纯色背景（透明叠加轨的透明区域会透出下层视频）。
+        导出画布由 compositor 管理（同样使用 Format_ARGB32 保留 alpha）。
         """
         need_prepare = False
         _cached_bg = getattr(self, '_canvas_cache_bg_color', None)
@@ -1835,8 +2054,8 @@ class PreviewPlayer(QWidget):
             need_prepare = True  # 新建：需要准备画布
 
         if need_prepare:
-            # 纯色背景：填用户设定的背景色（透明叠加轨透明区透出此色）
-            self._canvas_cache = QImage(cw, ch, QImage.Format.Format_RGB32)
+            # 纯色背景：填用户设定的背景色（透明叠加轨透明区透出下层视频）
+            self._canvas_cache = QImage(cw, ch, QImage.Format.Format_ARGB32)
             bg = self._canvas_bg_color or '#000000'
             if isinstance(bg, str):
                 from PyQt6.QtGui import QColor as _QColor
@@ -2476,9 +2695,11 @@ class PreviewPlayer(QWidget):
             # ── 纯色背景 ──
             canvas.fill(bg_color)
 
+            # ── 收集绿幕片段（延迟到最顶层绘制，确保透明区露出下层所有轨道）──
+            _green_list = []  # [(clip, processed_img, ox, oy), ...]
+
             painter = QPainter(canvas)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            # 默认 SourceOver：主轨视频含 alpha 时自动透出下层背景，不含时完全不透明
 
             if getattr(self, '_transition_fullframe', False):
                 # 转场已合成全画布帧，直接铺满（不重施 transform / 选中框）
@@ -2538,15 +2759,21 @@ class PreviewPlayer(QWidget):
                 # 模糊（QImage 路径，不转 QPixmap）
                 if blur > 0.5:
                     scaled_img = self._blur_qimage(scaled_img, blur)
-                # 绿幕抠像（主视频轨同样支持，保证导出=预览）
-                scaled_img = self._apply_chroma_key(clip, scaled_img)
+                # 绿幕抠像：视频帧已在后台线程处理，图片仍在此处处理
+                if raw_is_image:
+                    scaled_img = self._apply_chroma_key(clip, scaled_img)
                 ox = (cw - scaled_img.width()) // 2 + int(px)
                 oy = (ch - scaled_img.height()) // 2 + int(py)
-                self._draw_video_layer(painter, clip, scaled_img, ox, oy)
+
+                # 绿幕片段延迟到最顶层绘制
+                if clip and getattr(clip, 'chroma_key_enabled', False):
+                    _green_list.append((clip, scaled_img, ox, oy))
+                else:
+                    self._draw_video_layer(painter, clip, scaled_img, ox, oy)
 
             painter.end()
 
-            # 叠视频帧（PiP）
+            # 叠视频帧（PiP）— 非绿幕直接画，绿幕收集到 _green_list
             if overlays:
                 ov_painter = QPainter(canvas)
                 ov_painter.setRenderHint(
@@ -2602,15 +2829,30 @@ class PreviewPlayer(QWidget):
                         # 模糊（QImage 路径，不转 QPixmap，保留 alpha）
                         if ov_blur > 0.5:
                             ov_img = self._blur_qimage(ov_img, ov_blur)
-                        # 绿幕抠像
-                        ov_img = self._apply_chroma_key(ov_clip, ov_img)
+                        # 绿幕抠像：视频帧已在后台线程处理（ov_src is not None），图片在此处理
+                        if ov_src is None:
+                            ov_img = self._apply_chroma_key(ov_clip, ov_img)
                         ov_ox = (cw - ov_img.width()) // 2 + int(ov_px)
                         ov_oy = (ch - ov_img.height()) // 2 + int(ov_py)
-                        self._draw_video_layer(ov_painter, ov_clip, ov_img, ov_ox, ov_oy)
+                        # 绿幕片段延迟到最顶层绘制
+                        if getattr(ov_clip, 'chroma_key_enabled', False):
+                            _green_list.append((ov_clip, ov_img, ov_ox, ov_oy))
+                        else:
+                            self._draw_video_layer(ov_painter, ov_clip, ov_img, ov_ox, ov_oy)
                     except Exception:
                         logging.debug(
                             "overlay gizmo paint error", exc_info=True)
                 ov_painter.end()
+
+            # ── 统一绘制所有绿幕片段作为最顶层前景 ──
+            if _green_list:
+                fg_painter = QPainter(canvas)
+                fg_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                fg_painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceOver)
+                for g_clip, g_img, g_ox, g_oy in _green_list:
+                    self._draw_video_layer(fg_painter, g_clip, g_img, g_ox, g_oy)
+                fg_painter.end()
 
             # ── 字幕渲染（画布尺寸下，避免视频缩放导致字号不一致）──
             # active_subs 已由后台线程收集（排除了 editing/selected 字幕）
@@ -3087,6 +3329,9 @@ class PreviewPlayer(QWidget):
                 return canvas
 
             # 渲染所有可见视频轨（包含选中片段）
+            # 收集绿幕片段延迟到最顶层绘制
+            _green_list = []  # [(clip, processed_img, ox, oy), ...]
+
             painter = QPainter(canvas)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
 
@@ -3126,11 +3371,13 @@ class PreviewPlayer(QWidget):
                         t, Qt.TransformationMode.SmoothTransformation)
                 if blur > 0.5:
                     scaled_img = self._blur_qimage(scaled_img, blur)
-                # 绿幕抠像（主视频轨）
-                scaled_img = self._apply_chroma_key(clip, scaled_img)
+                # 绿幕抠像已在 _flush_frame / _compute_payload 处理，此处跳过
                 ox = (cw - scaled_img.width()) // 2 + int(px)
                 oy = (ch - scaled_img.height()) // 2 + int(py)
-                self._draw_video_layer(painter, clip, scaled_img, ox, oy)
+                if getattr(clip, 'chroma_key_enabled', False):
+                    _green_list.append((clip, scaled_img, ox, oy))
+                else:
+                    self._draw_video_layer(painter, clip, scaled_img, ox, oy)
             else:
                 # 无主 clip 时仍显示原始帧（全画布适配）
                 scaled_img = raw.scaled(
@@ -3191,15 +3438,27 @@ class PreviewPlayer(QWidget):
                         # 模糊（QImage 路径，不转 QPixmap，保留 alpha）
                         if ov_blur > 0.5:
                             ov_img = self._blur_qimage(ov_img, ov_blur)
-                        # 绿幕抠像
-                        ov_img = self._apply_chroma_key(ov_clip, ov_img)
+                        # 绿幕抠像已在 _flush_frame / _compute_payload 处理，此处跳过
                         ov_ox = (cw - ov_img.width()) // 2 + int(ov_px)
                         ov_oy = (ch - ov_img.height()) // 2 + int(ov_py)
-                        self._draw_video_layer(ov_painter, ov_clip, ov_img, ov_ox, ov_oy)
+                        if getattr(ov_clip, 'chroma_key_enabled', False):
+                            _green_list.append((ov_clip, ov_img, ov_ox, ov_oy))
+                        else:
+                            self._draw_video_layer(ov_painter, ov_clip, ov_img, ov_ox, ov_oy)
                     except Exception:
                         logging.debug(
                             "overlay pixmap paint error", exc_info=True)
                 ov_painter.end()
+
+            # ── 统一绘制所有绿幕片段作为最顶层前景 ──
+            if _green_list:
+                fg_painter = QPainter(canvas)
+                fg_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                fg_painter.setCompositionMode(
+                    QPainter.CompositionMode.CompositionMode_SourceOver)
+                for g_clip, g_img, g_ox, g_oy in _green_list:
+                    self._draw_video_layer(fg_painter, g_clip, g_img, g_ox, g_oy)
+                fg_painter.end()
 
             return canvas
         except Exception:
@@ -4992,6 +5251,11 @@ class PreviewPlayer(QWidget):
         try:
             if getattr(self, '_decoders', None) is not None:
                 self._decoders.release()
+        except Exception:
+            _log_exc()
+        # 释放叠加轨独立解码器
+        try:
+            self._release_overlay_decoders()
         except Exception:
             _log_exc()
         # 清理 alpha 视频整段解码缓存（删除临时 .rgba 文件）

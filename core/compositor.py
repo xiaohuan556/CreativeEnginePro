@@ -46,10 +46,12 @@ class VideoCompositor:
         self.W, self.H = resolution
         self.fps = fps
 
-        # cv2 缓存（惰性加载，LRU 淘汰，防止长时间编辑时句柄泄漏）
-        self._cap_cache: dict = {}
-        self._cap_cache_order: list = []  # 插入序（用于 LRU）
-        self._cap_cache_max = 16
+        # 状态机解码器（替代原始 cv2.VideoCapture：连续 read 替代每帧 seek ~200ms）
+        from core.clip_decoder import DecoderManager, ClipDecoder
+        self._decoders = DecoderManager()
+        self._decode_state = "playing"  # 导出是顺序播放，连续 read 无 seek
+        # 叠加轨独立解码器池：id(clip) -> ClipDecoder（同文件多轨道分离 cap）
+        self._overlay_decoders: dict = {}
         self._clip_src_cache: dict = {}
 
     def _clip_opacity(self, clip, sec: float, default: float = 1.0) -> float:
@@ -153,7 +155,9 @@ class VideoCompositor:
                 alpha = max(0.0, min(1.0, alpha))
                 transition_incoming[id(B)] = (A, alpha, ot['type'], A_end)
 
-        # ── 3. 渲染视频（背景 → PiP）──
+        # ── 3. 渲染视频：非绿幕先画，绿幕后画（保证透明区露出所有下层内容）──
+        normal_clips = []
+        green_clips = []
         for ti, clip in active_clips:
             if id(clip) in transition_incoming:
                 A, alpha, tfn, A_end = transition_incoming[id(clip)]
@@ -162,6 +166,14 @@ class VideoCompositor:
             img = source_images.get(id(clip))
             if img is None or img.isNull():
                 continue
+            if getattr(clip, 'chroma_key_enabled', False):
+                green_clips.append((ti, clip, img))
+            else:
+                normal_clips.append((ti, clip, img))
+
+        for ti, clip, img in normal_clips:
+            self._paint_video_clip(painter, clip, img, sec, ti)
+        for ti, clip, img in green_clips:
             self._paint_video_clip(painter, clip, img, sec, ti)
 
         # ── 3. 渲染字幕 ──
@@ -362,49 +374,72 @@ class VideoCompositor:
             except Exception:
                 logging.debug("alpha path failed, fallback to cv2", exc_info=True)
 
-        if path not in self._cap_cache:
-            # LRU 淘汰：超限时释放最旧的句柄
-            if len(self._cap_cache) >= self._cap_cache_max:
-                oldest = self._cap_cache_order.pop(0)
-                old_cap = self._cap_cache.pop(oldest, None)
-                if old_cap:
-                    try:
-                        old_cap.release()
-                    except Exception:
-                        pass
-            cap = cv2.VideoCapture(path)
-            if not cap.isOpened():
-                return None
-            self._cap_cache[path] = cap
-            self._cap_cache_order.append(path)
-        else:
-            # 刷新使用顺序（移到最近）
-            self._cap_cache_order.remove(path)
-            self._cap_cache_order.append(path)
+        # ── 常规视频：使用状态机解码器（连续 read ~3ms，替代逐帧 seek ~200ms）──
+        return self._extract_with_decoder(clip, sec)
 
-        cap = self._cap_cache[path]
-        fps = cap.get(cv2.CAP_PROP_FPS) or 30
-
-        frame_idx = int(src_sec * fps)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ret, frame = cap.read()
-
-        if frame is None:
+    def _get_compositor_decoder(self, clip, is_overlay: bool = False):
+        """获取或创建解码器。is_overlay=True 时为同文件多轨道分离 cap。"""
+        if is_overlay:
+            clid = id(clip)
+            if clid in self._overlay_decoders:
+                dec = self._overlay_decoders[clid]
+                if dec.is_open():
+                    return dec
+                self._overlay_decoders.pop(clid, None)
+            from core.clip_decoder import ClipDecoder
+            dec = ClipDecoder(clip.source_path)
+            if dec.open():
+                dec.set_state("playing")
+                self._overlay_decoders[clid] = dec
+                return dec
             return None
+        else:
+            return self._decoders.get(clip)
 
-        # 检测并保留 alpha 通道
-        if frame.shape[2] == 4:
-            frame_rgba = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGBA)
-            h, w, ch = frame_rgba.shape
-            bytes_per_line = ch * w
-            return QImage(frame_rgba.data, w, h, bytes_per_line,
+    def _extract_with_decoder(self, clip, sec: float) -> Optional[QImage]:
+        """使用状态机解码器提取帧（连续 read，无逐帧 seek）。"""
+        import cv2
+        src_sec = clip.trim_start + (sec - clip.timeline_start) * clip.speed
+        dec = self._decoders.get(clip)
+        if dec is None:
+            return None
+        res = dec.request(src_sec, "playing", ahead_frames=0)
+        if res is None:
+            return None
+        frame_rgb, w, h = res
+        # frame_rgb 可能是 RGB 或 RGBA
+        if frame_rgb.shape[2] == 4:
+            bytes_per_line = 4 * w
+            return QImage(frame_rgb.data, w, h, bytes_per_line,
                           QImage.Format.Format_RGBA8888).copy()
         else:
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            h, w, ch = frame_rgb.shape
-            bytes_per_line = ch * w
+            bytes_per_line = 3 * w
             return QImage(frame_rgb.data, w, h, bytes_per_line,
                           QImage.Format.Format_RGB888).copy()
+
+    def _release_decoders(self):
+        """释放所有解码器。"""
+        for dec in self._overlay_decoders.values():
+            try:
+                dec.release()
+            except Exception:
+                pass
+        self._overlay_decoders.clear()
+        try:
+            self._decoders.release()
+        except Exception:
+            pass
+
+    def close(self):
+        """释放所有资源"""
+        self._release_decoders()
+        for cap in list(self._cap_cache.values()):
+            try:
+                cap.release()
+            except Exception:
+                pass
+        self._cap_cache.clear()
+        self._cap_cache_order.clear()
 
     def _load_image_frame(self, path: str) -> Optional[QImage]:
         """加载图片帧（保留 alpha 通道）"""
