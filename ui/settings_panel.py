@@ -6,9 +6,11 @@ from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QFrame, QMessageBox, QScrollArea,
 )
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor
 from pathlib import Path
 import os, sys
+import config
 
 
 class SettingsPanel(QWidget):
@@ -16,21 +18,32 @@ class SettingsPanel(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setFixedWidth(300); self._collapsed = True
-        self._build(); self._collapse()
+        # 关键：子 QWidget 带样式表背景时，必须开启 WA_StyledBackground 才能可靠绘制
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        # 不再初始 collapse 到 0 宽：QScrollArea(widgetResizable) 在 0 宽下缓存内容尺寸，
+        # 之后展开到 300 时常常无法重新布局，导致只剩暗色背景、文字图标全无。
+        # 不在此处 setFixedWidth：面板宽度由宿主（voice_workbench._position_settings）控制，
+        # 否则固定宽度会覆盖 setGeometry 的宽度设置。
+        self._collapsed = False
+        self._build()
+        self._content.show()
 
     def _build(self):
-        self.setStyleSheet("background:#141414;border-left:1px solid #1a1a1a;")
+        self.setStyleSheet("background:#232323;border:1px solid #3a3a3a;border-radius:10px;")
         L = QVBoxLayout(self); L.setContentsMargins(0,0,0,0); L.setSpacing(0)
 
         # ═══ 顶部栏 ═══
         top = QWidget(); top.setFixedHeight(40)
-        top.setStyleSheet("background:#0e0e0e;border-bottom:1px solid #1a1a1a;")
+        top.setStyleSheet("background:#1a1a1a;border-bottom:1px solid #333333;border-top-left-radius:10px;border-top-right-radius:10px;")
         th = QHBoxLayout(top); th.setContentsMargins(14,0,10,0)
-        th.addWidget(_lbl("⚙  设置", "#ccc", 13))
+        th.addWidget(_lbl("设置", "#eeeeee", 13, True))
         th.addStretch()
-        self.btn_toggle = QPushButton("✕"); self.btn_toggle.setFixedSize(26,26)
-        self.btn_toggle.setStyleSheet("QPushButton{background:transparent;color:#555;border:1px solid #2a2a2a;border-radius:4px;font-size:13px;}QPushButton:hover{color:#e74c3c;border-color:#e74c3c;}")
+        self.btn_toggle = QPushButton()
+        self.btn_toggle.setFixedSize(26, 26)
+        self.btn_toggle.setIcon(self._x_icon())
+        self.btn_toggle.setIconSize(QSize(14, 14))
+        self.btn_toggle.setToolTip("关闭设置")
+        self.btn_toggle.setStyleSheet("QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:5px;}QPushButton:hover{background:#3a3a3a;border-color:#ff6b6b;}")
         self.btn_toggle.clicked.connect(self.toggle); th.addWidget(self.btn_toggle)
         L.addWidget(top)
 
@@ -38,7 +51,7 @@ class SettingsPanel(QWidget):
         scroll = QScrollArea(); scroll.setWidgetResizable(True)
         scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}QScrollBar:vertical{background:#141414;width:4px;border-radius:2px;}QScrollBar::handle:vertical{background:#333;border-radius:2px;}")
         self._content = QWidget(); self._content.setStyleSheet("background:transparent;")
-        C = QVBoxLayout(self._content); C.setContentsMargins(16,14,16,20); C.setSpacing(16)
+        C = QVBoxLayout(self._content); C.setContentsMargins(16,14,16,18); C.setSpacing(12)
 
         # ═══ TTS 语音引擎 ═══
         C.addWidget(_section_header("🎙  TTS 语音引擎", "选择配音服务商"))
@@ -70,7 +83,7 @@ class SettingsPanel(QWidget):
             b.setStyleSheet(f"QLabel{{background:{'#1a3a1a' if '免费' in badge else '#3a2a1a'};color:{'#4caf50' if '免费' in badge else '#f0ad4e'};border-radius:3px;padding:1px 6px;font-size:9px;}}")
             top_row.addWidget(b); top_row.addStretch()
             left.addLayout(top_row)
-            left.addWidget(_lbl(desc, "#666", 10))
+            left.addWidget(_lbl(desc, "#9a9a9a", 10))
             rl.addLayout(left, 1)
 
             self._engine_btns.append((key, row))
@@ -112,8 +125,8 @@ class SettingsPanel(QWidget):
         C.addWidget(_section_header("🧠  语言模型", "翻译·润色·脚本生成"))
         llm_card = QFrame(); llm_card.setStyleSheet(_CARD)
         lc = QVBoxLayout(llm_card); lc.setContentsMargins(14,10,14,14); lc.setSpacing(8)
-        lc.addWidget(_lbl("DeepSeek-V3", "#ddd", 12, True))
-        lc.addWidget(_lbl("高性能中文大模型，润色/翻译/脚本均用此模型", "#666", 10))
+        lc.addWidget(_lbl("DeepSeek-V3", "#eeeeee", 12, True))
+        lc.addWidget(_lbl("高性能中文大模型，润色/翻译/脚本均用此模型", "#9a9a9a", 10))
         self.llm_key_frame = self._key_row("API Key", "sk-...")
         lc.addWidget(self.llm_key_frame)
         self.edit_openai_key = self._edt_from(self.llm_key_frame)
@@ -171,8 +184,25 @@ class SettingsPanel(QWidget):
         if self._collapsed: self._collapse()
         else: self._expand()
 
-    def _collapse(self): self.setFixedWidth(0); self._content.hide()
-    def _expand(self): self.setFixedWidth(300); self._content.show(); self.btn_toggle.setText("✕")
+    def _x_icon(self):
+        """用 QPainter 画一个关闭「×」图标，完全不依赖字体字形（避免豆腐块）。"""
+        size = 26
+        pm = QPixmap(size, size)
+        pm.fill(QColor(0, 0, 0, 0))  # 透明底
+        p = QPainter(pm)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#dddddd"))
+        pen.setWidth(2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        m = 8  # 边距
+        p.drawLine(m, m, size - m, size - m)
+        p.drawLine(size - m, m, m, size - m)
+        p.end()
+        return QIcon(pm)
+
+    def _collapse(self): self._content.hide()
+    def _expand(self): self._content.show()
 
     def _env_path(self):
         if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
@@ -213,12 +243,25 @@ class SettingsPanel(QWidget):
             lines_out.append(f'{k}="{updates[k]}"')
         ep.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
 
-        # 更新运行时环境变量
+        # 更新运行时环境变量，并同步已加载的 config 模块，避免重启才生效
         for k, v in updates.items():
             os.environ[k] = v
+            if hasattr(config, k):
+                setattr(config, k, v)
+        # LLM 派生配置同步
+        if "OPENAI_API_KEY" in updates:
+            if config.LLM_MODE == "custom_llm" and getattr(config, "CUSTOM_LLM_KEY", ""):
+                config.LLM_API_KEY = config.CUSTOM_LLM_KEY
+                config.LLM_BASE_URL = getattr(config, "CUSTOM_LLM_URL", "") or "https://api.openai.com/v1"
+                config.LLM_MODEL_NAME = getattr(config, "CUSTOM_LLM_MODEL", "") or "gpt-3.5-turbo"
+            else:
+                config.LLM_API_KEY = updates["OPENAI_API_KEY"]
+                config.LLM_BASE_URL = config.OPENAI_BASE_URL
+                config.LLM_MODEL_NAME = getattr(config, "LLM_MODEL", os.getenv("LLM_MODEL", "deepseek-chat"))
         self.settings_changed.emit()
         if not silent:
             QMessageBox.information(self, "已保存", "设置已保存，引擎已切换")
+            self.hide()   # 点击“保存设置”后自动关闭面板
 
     def _load(self):
         ep = self._env_path()
@@ -246,15 +289,15 @@ def _lbl(text, color="#ccc", size=11, bold=False):
 def _section_header(icon_text, desc):
     f = QFrame()
     fl = QVBoxLayout(f); fl.setContentsMargins(0,0,0,0); fl.setSpacing(2)
-    fl.addWidget(_lbl(icon_text, "#3d8ef8", 12, True))
-    fl.addWidget(_lbl(desc, "#555", 10))
+    fl.addWidget(_lbl(icon_text, "#5aa6ff", 12, True))
+    fl.addWidget(_lbl(desc, "#8a8a8a", 10))
     return f
 
-_CARD = "QFrame{background:#181818;border:1px solid #222;border-radius:8px;}"
+_CARD = "QFrame{background:#2a2a2a;border:1px solid #3a3a3a;border-radius:8px;}"
 _INPUT = (
-    "QLineEdit{background:#0e0e0e;border:1px solid #2a2a2a;border-radius:6px;"
-    "color:#ccc;font-size:12px;padding:7px 10px;}"
+    "QLineEdit{background:#141414;border:1px solid #3a3a3a;border-radius:6px;"
+    "color:#dddddd;font-size:12px;padding:7px 10px;}"
     "QLineEdit:focus{border-color:#3d8ef8;}"
 )
-_ENG_OFF = "QFrame{background:#181818;border:none;border-radius:6px;}QFrame:hover{background:#1e1e1e;}"
-_ENG_ON  = "QFrame{background:#1a2a4a;border:none;border-radius:6px;}"
+_ENG_OFF = "QFrame{background:#262626;border:1px solid #333;border-radius:6px;}QFrame:hover{background:#303030;}"
+_ENG_ON  = "QFrame{background:#1a2a4a;border:1px solid #3d8ef8;border-radius:6px;}"

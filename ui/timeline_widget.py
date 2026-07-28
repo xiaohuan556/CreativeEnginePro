@@ -72,6 +72,7 @@ class TimelineCanvas(QWidget):
     replace_video_requested = pyqtSignal(object, str)
     # 旧签名 (object, object, int) 已改为 (object, str)：clip + 可选文件路径
     freeze_requested       = pyqtSignal(object, float)
+    extract_frame_requested = pyqtSignal(object, float)  # 视频片段 → 提取当前帧到图层编辑
     reverse_requested      = pyqtSignal(object)
     clip_trimmed           = pyqtSignal(object)
     subtitle_edit_requested = pyqtSignal(object)  # 右键编辑字幕 → 内联编辑
@@ -402,6 +403,12 @@ class TimelineCanvas(QWidget):
         if abs(sec) < best_dist and abs(sec) <= max(threshold, 1.0):
             best = 0.0
         
+        # ── 4. 播放头吸附 ──
+        ph = getattr(self, 'playhead', None)
+        if ph is not None and abs(ph - sec) < best_dist and abs(ph - sec) <= threshold:
+            best = ph
+            best_dist = abs(ph - sec)
+        
         return best
 
     def _snap_to_keyframes(self, sec: float) -> float:
@@ -724,6 +731,9 @@ class TimelineCanvas(QWidget):
     def _draw_clips(self, p: QPainter, clip_rect: QRect):
         # 拖拽目标轨高亮已按需求移除（不再绘制蓝色轨道高亮 / 深蓝底色）
         p.setOpacity(1.0)
+        # 拖拽中跳过缩略图+关键帧渲染：每像素 mouseMove→update→完整重绘开销巨大，
+        # 跳过非必要的装饰元素可消除闪烁并大幅提升拖拽跟手度。
+        _fast = (self._drag_mode is not None)
 
         for td in self._tracks:
             if td.y + td.h < clip_rect.top() or td.y > clip_rect.bottom():
@@ -806,8 +816,9 @@ class TimelineCanvas(QWidget):
                     elided = fm.elidedText(name, Qt.TextElideMode.ElideRight, r.width() - 8)
                     p.drawText(r.adjusted(4, 0, -4, 0),
                                Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
-                    # 关键帧点（音量等）
-                    self._draw_clip_keyframes(p, clip, r)
+                    # 关键帧点（音量等）— 拖拽中跳过
+                    if not _fast:
+                        self._draw_clip_keyframes(p, clip, r)
                     continue
 
                 # 视频/字幕轨
@@ -825,17 +836,28 @@ class TimelineCanvas(QWidget):
                     p.drawRect(r)
 
                 # 缩略图（视频轨）— 仅绘制视口内可见的缩略图（虚拟列表思想）
-                if td.kind == "video":
+                # ★ 拖拽中跳过缩略图：每像素重绘缩略图是最主要的性能瓶颈
+                if td.kind == "video" and not _fast:
                     thumbs = getattr(clip, "thumbnails", None)
                     if thumbs and len(thumbs) > 0:
                         p.save()
                         if not vis:
                             p.setOpacity(0.3)
-                        clip_w = max(r.width() - 4, 1)
                         thumb_h = r.height() - 4
                         if thumb_h >= 2:
                             n = len(thumbs)
-                            thumb_w = max(clip_w // n, 1)
+                            clip_w = max(r.width() - 4, 1)
+                            # 缩略图数量与缩放解耦（不触发 FFmpeg 重抽），但渲染时自适应降采样：
+                            # 每张至少 8px 才有辨识度，小于此值则均匀跳张、加大单张宽度。
+                            MIN_THUMB_W = 8
+                            if clip_w // n < MIN_THUMB_W:
+                                draw_n = max(1, clip_w // MIN_THUMB_W)
+                                step = max(1, n // draw_n)
+                                thumb_w = max(clip_w // draw_n, 1)
+                            else:
+                                step = 1
+                                draw_n = n
+                                thumb_w = max(clip_w // n, 1)
                             # 视口裁剪：只画可见列
                             vp_l, vp_r = r.x(), r.right()
                             tw = getattr(self, 'parent_timeline', None)
@@ -845,15 +867,18 @@ class TimelineCanvas(QWidget):
                                 vp_r2 = vp_l2 + scroll.viewport().width()
                                 vp_l, vp_r = max(vp_l, vp_l2), min(vp_r, vp_r2)
                             start_i = max(0, int((vp_l - r.x()) / max(thumb_w, 1)))
-                            end_i = min(n, int((vp_r - r.x()) / max(thumb_w, 1)) + 1)
-                            for i in range(start_i, end_i):
-                                tx = r.x() + 2 + i * thumb_w
+                            end_i = min(draw_n, int((vp_r - r.x()) / max(thumb_w, 1)) + 1)
+                            for di in range(start_i, end_i):
+                                i = di * step  # 源缩略图索引（step>1 时跳张）
+                                if i >= n:
+                                    break
+                                tx = r.x() + 2 + di * thumb_w
                                 if tx >= r.right() - 2:
                                     break
                                 sc = thumbs[i]
-                                # 末张缩略图补到右边界，消除 clip_w // n 的余数间隙（蓝条）
+                                # 末张缩略图补到右边界，消除余数间隙（蓝条）
                                 tw_use = thumb_w
-                                if i == n - 1:
+                                if di == draw_n - 1:
                                     tw_use = max(1, (r.right() - 2) - tx)
                                 self._draw_pixmap_cover(p, sc, tx, r.y() + 2,
                                                        tw_use, thumb_h)
@@ -883,12 +908,14 @@ class TimelineCanvas(QWidget):
                 p.drawText(r.adjusted(4, 0, -4, 0),
                            Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, elided)
 
-                # 关键帧点
-                self._draw_clip_keyframes(p, clip, r)
+                # 关键帧点 — 拖拽中跳过
+                if not _fast:
+                    self._draw_clip_keyframes(p, clip, r)
 
                 # 转场标记：左右相邻背景轨片段的接缝处，显示醒目的转场指示器
                 # 仅背景轨（idx==0）生效：compositor 也只在 track 0 渲染转场
-                if td.kind == "video" and td.idx == 0:
+                # ★ 拖拽中跳过转场指示器渲染（非核心元素，省掉重绘开销）
+                if td.kind == "video" and td.idx == 0 and not _fast:
                     ot = getattr(clip, "out_transition", None)
                     # 找紧接 clip 之后的下一个背景轨片段
                     nxt = None
@@ -1011,19 +1038,25 @@ class TimelineCanvas(QWidget):
             dur = clip.timeline_end - clip.timeline_start
         if not (dur and dur > 0):
             return
+        # 预计算菱形路径（只创建一次，平移到各关键帧位置复用）
+        diamond_cache = getattr(TimelineWidget, '_kf_diamond_cache', None)
+        if diamond_cache is None:
+            diamond_cache = QPainterPath()
+            diamond_cache.moveTo(0, -6)
+            diamond_cache.lineTo(5, 0)
+            diamond_cache.lineTo(0, 6)
+            diamond_cache.lineTo(-5, 0)
+            diamond_cache.closeSubpath()
+            TimelineWidget._kf_diamond_cache = diamond_cache
+        p.setPen(self._pen_accent_2)
+        p.setBrush(self._brush_accent)
         for t in all_times:
-            frac = t / dur
-            kx = int(r.x() + frac * r.width())
+            kx = int(r.x() + t / dur * r.width())
             ky = r.bottom() + 2
-            diamond = QPainterPath()
-            diamond.moveTo(kx, ky - 6)
-            diamond.lineTo(kx + 5, ky)
-            diamond.lineTo(kx, ky + 6)
-            diamond.lineTo(kx - 5, ky)
-            diamond.closeSubpath()
-            p.setPen(self._pen_accent_2)
-            p.setBrush(self._brush_accent)
-            p.drawPath(diamond)
+            p.save()
+            p.translate(kx, ky)
+            p.drawPath(diamond_cache)
+            p.restore()
         # 关键：重置画笔，防止泄漏到后续轨道渲染
         p.setBrush(Qt.BrushStyle.NoBrush)
 
@@ -1224,6 +1257,8 @@ class TimelineCanvas(QWidget):
             if self._drag_mode == "trim_left":
                 new_left_px = x - self._drag_pixel_offset
                 new_left_sec = self._x_to_sec(new_left_px)
+                # 吸附到所有轨道片段边界 + 播放头
+                new_left_sec = self._snap_sec(new_left_sec, exclude_clip=clip)
                 if td.kind == "subtitle":
                     clip.timeline_start = max(0.0, min(new_left_sec, clip.timeline_end - 0.1))
                 else:
@@ -1245,6 +1280,8 @@ class TimelineCanvas(QWidget):
             elif self._drag_mode == "trim_right":
                 new_right_px = x
                 new_right_sec = self._x_to_sec(new_right_px)
+                # 吸附到所有轨道片段边界 + 播放头
+                new_right_sec = self._snap_sec(new_right_sec, exclude_clip=clip)
                 if td.kind == "subtitle":
                     clip.timeline_end = max(clip.timeline_start + 0.1, new_right_sec)
                 else:
@@ -1638,6 +1675,7 @@ class TimelineCanvas(QWidget):
                 act_asr = menu.addAction("📝  语音识别")
                 menu.addSeparator()
                 act_freeze = menu.addAction("📸  定格帧 (3s)")
+                act_extract = menu.addAction("🖼  提取当前帧到图层编辑")
                 act_reverse = menu.addAction("🔄  倒放")
             elif td.kind == "subtitle":
                 act_edit = menu.addAction("✏  编辑字幕文本")
@@ -1660,6 +1698,8 @@ class TimelineCanvas(QWidget):
                     self.ai_asr_requested.emit(clip)
                 elif act == act_freeze:
                     self.freeze_requested.emit(clip, self.playhead)
+                elif act == act_extract:
+                    self.extract_frame_requested.emit(clip, self.playhead)
                 elif act == act_reverse:
                     self.reverse_requested.emit(clip)
             elif td.kind == "subtitle" and act == act_edit:
@@ -1684,10 +1724,10 @@ class TimelineCanvas(QWidget):
                 self._selected_track = None
                 self.selection_changed.emit(None, "", -1)
                 self.update()
-                # 强制刷新预览画面，清除被删除片段的残留帧
+                # 强制刷新预览画面，清除被删除片段的残留帧/选中框
                 pt = getattr(self, 'parent_timeline', None)
                 if pt and pt._preview_player:
-                    pt._preview_player.seek(self.playhead, force=True)
+                    pt._preview_player.clear_video_selection()
 
     def _menu_add_keyframe(self, clip):
         try:
@@ -1715,7 +1755,9 @@ class TimelineCanvas(QWidget):
                 kfs[p] = [(float(t), float(v)) for t, v in kfs[p] if abs(t - rel_t) > 0.05]
                 kfs[p].append((float(rel_t), float(val)))
             setattr(clip, "keyframes", kfs)
-            self.tl.changed.emit()
+            # 关键帧变更只需重绘叠加层，不需要清空帧缓存+重新 seek（避免
+            # 缓存冷导致的「拖拽轴锁住 / 画面空白」问题）。
+            self.tl.overlays_changed.emit()
             self.update()
         except Exception as e:
             import traceback
@@ -1847,6 +1889,7 @@ class TimelineWidget(QWidget):
     replace_video_requested = pyqtSignal(object, str)
     # 旧签名 (object, object, int) 已改为 (object, str)：clip + 可选文件路径
     freeze_requested       = pyqtSignal(object, float)
+    extract_frame_requested = pyqtSignal(object, float)  # 视频片段 → 提取当前帧到图层编辑
     reverse_requested      = pyqtSignal(object)
     clip_trimmed           = pyqtSignal(object)
     drop_media_requested   = pyqtSignal(str, str, float, str, int, float)
@@ -1868,6 +1911,11 @@ class TimelineWidget(QWidget):
         self._last_tick = 0.0
         self._last_bc_time = 0.0
         self._play_tick_cnt = 0
+        # 音频时钟→时间线偏移：音频时钟追踪源文件本地时间，
+        # 跨 clip 边界后需加偏移量映射回时间线绝对时间。详见 _sync_audio / _tick_play
+        self._audio_timeline_offset = 0.0
+        self._audio_offset_pending = False
+        self._last_sync_time = 0.0
         self.fps = 30
         self._thumb_regen_timer = QTimer(self)
         self._thumb_regen_timer.setSingleShot(True)
@@ -1988,6 +2036,8 @@ class TimelineWidget(QWidget):
             lambda c, p: self.replace_video_requested.emit(c, p))
         self._canvas.freeze_requested.connect(
             lambda c, s: self.freeze_requested.emit(c, s))
+        self._canvas.extract_frame_requested.connect(
+            lambda c, s: self.extract_frame_requested.emit(c, s))
         self._canvas.reverse_requested.connect(
             lambda c: self.reverse_requested.emit(c))
         self._canvas.clip_trimmed.connect(
@@ -2142,10 +2192,9 @@ class TimelineWidget(QWidget):
             else:
                 # 非播放状态：只停止被删除片段的音频，不启动任何新音频
                 self._preview_player.stop_audio()
-        # 强制刷新预览画面，清除被删除片段的残留帧
+        # 强制刷新预览画面，清除被删除片段的残留帧/选中框
         if self._preview_player:
-            cur_sec = canvas.playhead if hasattr(canvas, 'playhead') else 0.0
-            self._preview_player.seek(cur_sec, force=True)
+            self._preview_player.clear_video_selection()
 
     def _do_toggle_visibility(self):
         """V 键：切换选中片段的可见性"""
@@ -2222,6 +2271,8 @@ class TimelineWidget(QWidget):
             self._playing = False
             self._audio_synced = False
             self._audio_startup = False
+            self._audio_timeline_offset = 0.0
+            self._audio_offset_pending = False
             self._btn_play.setText("▶")
             self._canvas._play_paint_cnt = 0
             self._play_tick_cnt = 0
@@ -2253,6 +2304,8 @@ class TimelineWidget(QWidget):
         self._playing = False
         self._audio_synced = False
         self._audio_startup = False
+        self._audio_timeline_offset = 0.0
+        self._audio_offset_pending = False
         self._btn_play.setText("▶")
         self._canvas._play_paint_cnt = 0
         self._play_tick_cnt = 0
@@ -2277,9 +2330,7 @@ class TimelineWidget(QWidget):
         self._audio_startup = False
         if self._playing:
             import time
-            now = time.time()
-            self._last_tick = now
-            self._last_bc_time = now
+            self._last_bc_time = time.time()
             self._play_timer.start()
 
     def _tick_play(self):
@@ -2287,22 +2338,31 @@ class TimelineWidget(QWidget):
         now = time.time()
         # 主时钟：优先音频时钟（ffplay 子进程反推），消除 wall-clock 漂移导致的卡顿；
         # 无音频（静音 / 纯图片时间线）时回退 wall-clock 累加。
+        # 音频时钟追踪的是源文件本地时间；跨 clip 边界后需加 _audio_timeline_offset
+        # 映射回时间线绝对时间，否则连续播放第二片段时会跳到 ~0.x 秒起。
+        wall_delta = now - getattr(self, "_last_tick", now)
+        if wall_delta > 0.1:
+            wall_delta = 0
         master = self._preview_player.master_clock_sec() if self._preview_player else None
         if master is not None:
-            new_pos = master
+            if getattr(self, '_audio_offset_pending', False):
+                # 用 wall-clock 流逝时间估算当前位置（上一 tick 后可能又过了几十毫秒）
+                estimated = self._canvas.playhead + wall_delta
+                self._audio_timeline_offset = estimated - master
+                self._audio_offset_pending = False
+            new_pos = master + getattr(self, '_audio_timeline_offset', 0.0)
             self._last_tick = now
         else:
-            delta = now - getattr(self, "_last_tick", now)
-            if delta > 0.1:  # V键切换可见性 / 音频重同步 导致 _last_tick 过期 → 限制最大跳帧
-                delta = 0
             self._last_tick = now
-            new_pos = self._canvas.playhead + delta
+            new_pos = self._canvas.playhead + wall_delta
         total = self.tl.total_duration
         if total <= 0 or new_pos >= total:
-            new_pos = 0.0
+            new_pos = max(0.0, total)
             self._play_timer.stop()
             self._playing = False
             self._audio_synced = False
+            self._audio_timeline_offset = 0.0
+            self._audio_offset_pending = False
             self._btn_play.setText("▶")
             if self._preview_player:
                 self._preview_player.stop_audio()
@@ -2315,22 +2375,33 @@ class TimelineWidget(QWidget):
 
         tc = getattr(self, "_play_tick_cnt", 0) + 1
         self._play_tick_cnt = tc
-        # 每 6 tick (~200ms) 检查音频边界，跨越 clip 边界时重新同步
-        if tc % 6 == 0:
+        # 每 3 tick (~100ms) 检查音频边界，跨越 clip 边界时重新同步
+        if tc % 3 == 0:
             bc_delta = now - getattr(self, "_last_bc_time", now)
             self._last_bc_time = now
             self._check_audio_boundary(new_pos, bc_delta)
-        if tc % 6 == 0:
+        if tc % 3 == 0:
             self._time_label.setText(self._sec_to_timestr(new_pos))
 
     def _on_playhead_moved(self, sec: float):
         self.playhead_moved.emit(sec)
 
     def _sync_audio(self, sec: float):
+        import time
         if not self._preview_player:
             return
         self._preview_player.play_all_audio(sec)
         self._audio_synced = True
+        self._last_sync_time = time.time()
+        # 音频时钟是源文件本地时间；跨 clip 边界后需记录偏移映射回时间线绝对时间。
+        # ffplay 子进程启动有延迟，若此时尚无音频时钟，延迟到 _tick_play 首帧取出后再算偏移。
+        mc = self._preview_player.master_clock_sec()
+        if mc is not None:
+            self._audio_timeline_offset = sec - mc
+            self._audio_offset_pending = False
+        else:
+            self._audio_boundary_sec = sec
+            self._audio_offset_pending = True
 
     def _check_audio_boundary(self, sec: float, delta: float):
         prev_sec = sec - delta
@@ -2341,6 +2412,13 @@ class TimelineWidget(QWidget):
                 if prev_sec < c.timeline_start <= sec or prev_sec < c.timeline_end <= sec:
                     need_resync = True
                     break
+        # 若上次同步的音频尚在启动中（_audio_offset_pending），跳过本次重同步，
+        # 避免 ffplay 子进程未就绪就被重复启停 → 音频断流 / 时钟抖动。
+        # 但最多等 300ms，超时后强制放行（无音频流时不至于永久屏蔽）。
+        import time as _time
+        if need_resync and getattr(self, '_audio_offset_pending', False):
+            if _time.time() - getattr(self, '_last_sync_time', 0) < 0.3:
+                need_resync = False
         # 叠加轨（track 1+）边界交叉 → 仅调 play_all_audio 启动/停止音频，
         # 不设 _audio_synced（不干扰主轨时钟），避免频繁触发→时钟跳
         overlay_boundary = False

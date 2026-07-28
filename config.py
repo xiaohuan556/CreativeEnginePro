@@ -1,6 +1,6 @@
 """
 CreativeEnginePro - 统一配置管理
-融合: 图片/视频/轮播 + 热点雷达 + TTS语音/译制/脚本生成
+融合: 图片/视频/轮播 + TTS语音/译制/脚本生成
 """
 import os
 import sys

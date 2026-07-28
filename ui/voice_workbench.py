@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QListWidget, QListWidgetItem, QProgressBar,
     QSplitter, QMessageBox, QInputDialog, QMenu, QFileDialog, QSlider,
 )
+from ui.settings_panel import SettingsPanel
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl
 from PyQt6.QtGui import QShortcut, QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -130,6 +131,20 @@ class VoiceWorkbench(QWidget):
         self.btn_show_orig_right.clicked.connect(lambda: self._toggle_original("right"))
         self.btn_show_orig_right.hide()
         hdr_r.addWidget(self.btn_show_orig_right)
+        hdr_r.addStretch()
+        # 设置（右上角内联开关）—— 用文字「设置」而非 ⚙ 图标，避免缺字形显示成方块
+        self.btn_settings = QPushButton("设置")
+        self.btn_settings.setFixedHeight(28)
+        self.btn_settings.setMinimumWidth(48)
+        self.btn_settings.setToolTip("语音设置")
+        self.btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_settings.setStyleSheet(
+            "QPushButton{background:#2a2a3a;color:#cfd2e0;border:1px solid #3a3a4a;"
+            "border-radius:6px;font-size:13px;padding:0 10px;}"
+            "QPushButton:hover{color:#fff;border-color:#3d8ef8;background:#2d2d3d;}"
+        )
+        self.btn_settings.clicked.connect(self._toggle_settings)
+        hdr_r.addWidget(self.btn_settings)
         right_lay.addLayout(hdr_r)
 
         self.editor_polished = QTextEdit()
@@ -199,16 +214,6 @@ class VoiceWorkbench(QWidget):
 
         ctrl.addStretch()
 
-        # ⚙ 设置
-        btn_settings = QPushButton("⚙ 设置")
-        btn_settings.setStyleSheet(
-            "QPushButton{background:#2a2a3a;color:#aaa;border:1px solid #3a3a4a;"
-            "border-radius:6px;font-size:12px;padding:5px 14px;}"
-            "QPushButton:hover{color:#fff;border-color:#3d8ef8;background:#2d2d3d;}"
-        )
-        btn_settings.clicked.connect(self._open_settings)
-        ctrl.addWidget(btn_settings)
-
         # TTS 音量
         ctrl.addWidget(QLabel("音量"))
         self.vol_slider = QSlider(Qt.Orientation.Horizontal)
@@ -266,6 +271,50 @@ class VoiceWorkbench(QWidget):
         # Ctrl+Enter 快捷生成
         QShortcut(QKeySequence("Ctrl+Return"), self).activated.connect(self._generate)
 
+        # ═══════════════════════════════════════
+        # 内联设置面板（右上角，非弹窗）
+        # ═══════════════════════════════════════
+        self._settings_panel = SettingsPanel(self)   # 作为子控件，内嵌而非弹窗
+        self._settings_panel.hide()
+        # ✕ 按钮：直接收起面板（而非折叠到 0 宽）
+        try:
+            self._settings_panel.btn_toggle.clicked.disconnect()
+        except Exception:
+            pass
+        self._settings_panel.btn_toggle.clicked.connect(self._settings_panel.hide)
+        self._settings_panel.settings_changed.connect(self._on_settings_changed)
+
+    # ── 设置面板（右上角内联） ──
+    def _toggle_settings(self):
+        sp = self._settings_panel
+        if sp.isVisible():
+            sp.hide()
+        else:
+            sp.show()
+            sp.raise_()
+            self._position_settings()
+            # 强制布局重算，避免 QScrollArea(widgetResizable) 缓存到错误尺寸导致内容不显示
+            if sp.layout() is not None:
+                sp.layout().activate()
+            sp.update()
+
+    def _position_settings(self):
+        """把设置面板锚定到工作台右上角（加宽加长，无需滚动即可看到底部）"""
+        sp = self._settings_panel
+        w = 380
+        # 尽量用满窗口高度，使内容（含底部「保存设置」）不必滚动即可见
+        h = min(self.height() - 14, 880)
+        if h < 360:
+            h = 360
+        sp.setGeometry(self.width() - w - 14, 14, w, h)
+
+    def resizeEvent(self, ev):
+        """窗口尺寸变化时把设置面板保持在右上角"""
+        super().resizeEvent(ev)
+        sp = getattr(self, '_settings_panel', None)
+        if sp is not None and sp.isVisible():
+            self._position_settings()
+
     # ── 核心方法 ──
 
     def get_voice_path(self) -> str:
@@ -293,23 +342,6 @@ class VoiceWorkbench(QWidget):
         else:
             self._voice = "zh-CN-XiaoxiaoNeural"
             self.btn_voice.setText("🎵  晓晓")
-
-    def _open_settings(self):
-        """打开设置面板（弹窗）"""
-        from ui.settings_panel import SettingsPanel
-        if not hasattr(self, '_settings_panel'):
-            self._settings_panel = SettingsPanel()
-            self._settings_panel.setWindowFlags(
-                self._settings_panel.windowFlags() | Qt.WindowType.Dialog
-            )
-            self._settings_panel.setWindowTitle("语音设置")
-            self._settings_panel.settings_changed.connect(self._on_settings_changed)
-            # 修复：初始化时不应该 collapse，弹窗必须可见
-            self._settings_panel._expand()
-        if self._settings_panel.isVisible():
-            self._settings_panel.hide()
-        else:
-            self._settings_panel.show()
 
     def _on_settings_changed(self):
         """设置变更后刷新语音引擎"""

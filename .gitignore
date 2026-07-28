@@ -12,3 +12,4 @@ ffmpeg_temp.7z
 nul
 *.zip
 *.7z
+.env

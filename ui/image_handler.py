@@ -132,6 +132,19 @@ class ImageExportThread(QThread):
                 if len(img.shape) == 3 and img.shape[2] == 4:
                     img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
 
+                # AI 去水印
+                wm = self.config.get('watermark')
+                if wm:
+                    ih, iw = img.shape[:2]
+                    x0 = max(0, iw - wm['margin_right'] - wm['width'])
+                    y0 = max(0, ih - wm['margin_bottom'] - wm['height'])
+                    x1 = min(iw, iw - wm['margin_right'])
+                    y1 = min(ih, ih - wm['margin_bottom'])
+                    if x0 < x1 and y0 < y1:
+                        mask = np.zeros((ih, iw), dtype=np.uint8)
+                        mask[y0:y1, x0:x1] = 255
+                        img = cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+
                 result = fit_image(img, target_w, target_h, mode)
 
                 base = os.path.splitext(os.path.basename(src_path))[0]
@@ -219,16 +232,45 @@ class PreviewLabel(QLabel):
             }
         """)
         self._cv_img = None
+        self._mask_w = 300
+        self._mask_h = 80
+        self._mask_mr = 10
+        self._mask_mb = 10
+        self._mask_enabled = False
         self.setText("未选择")
 
     def set_image_from_cv(self, cv_img):
         self._cv_img = cv_img
         self._repaint()
 
+    def set_mask(self, w, h, mr, mb, enabled=True):
+        self._mask_w = w
+        self._mask_h = h
+        self._mask_mr = mr
+        self._mask_mb = mb
+        self._mask_enabled = enabled
+        self._repaint()
+
     def _repaint(self):
         if self._cv_img is None:
             return
-        rgb = cv2.cvtColor(self._cv_img, cv2.COLOR_BGR2RGB)
+        img = self._cv_img.copy()
+        # 蒙版叠加：在 BGR 图上画红色虚线框
+        if self._mask_enabled:
+            H, W = img.shape[:2]
+            x0 = max(0, W - self._mask_mr - self._mask_w)
+            y0 = max(0, H - self._mask_mb - self._mask_h)
+            x1 = min(W, W - self._mask_mr)
+            y1 = min(H, H - self._mask_mb)
+            if x0 < x1 and y0 < y1:
+                cv2.rectangle(img, (x0, y0), (x1, y1), (0, 0, 255), 3)
+                # 四角手柄小方块
+                hs = 6
+                for cx, cy in [(x0, y0), (x1, y0), (x0, y1), (x1, y1)]:
+                    cv2.rectangle(img,
+                                  (cx - hs, cy - hs), (cx + hs, cy + hs),
+                                  (0, 0, 255), -1)
+        rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         h, w, ch = rgb.shape
         qimg = QImage(rgb.data.tobytes(), w, h, ch * w, QImage.Format.Format_RGB888)
         pix = QPixmap.fromImage(qimg)
@@ -462,6 +504,27 @@ class ImageHandler:
         self.cb_img_open_dir.setChecked(True)
         pgl.addWidget(self.cb_img_open_dir)
 
+        # ── AI 去水印 ──
+        self.cb_wm = CheckMarkBox("AI 去水印（固定蒙版）")
+        self.cb_wm.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.cb_wm.toggled.connect(self._on_wm_toggle)
+        pgl.addWidget(self.cb_wm)
+
+        self.wm_box = QWidget()
+        wm_lay = QHBoxLayout(self.wm_box)
+        wm_lay.setContentsMargins(0, 0, 0, 0); wm_lay.setSpacing(4)
+        self.wm_w = QSpinBox(); self.wm_w.setRange(1, 4000); self.wm_w.setValue(300)
+        self.wm_h = QSpinBox(); self.wm_h.setRange(1, 4000); self.wm_h.setValue(80)
+        self.wm_mr = QSpinBox(); self.wm_mr.setRange(0, 2000); self.wm_mr.setValue(10)
+        self.wm_mb = QSpinBox(); self.wm_mb.setRange(0, 2000); self.wm_mb.setValue(10)
+        for s, tip in [(self.wm_w, "宽"), (self.wm_h, "高"),
+                       (self.wm_mr, "距右"), (self.wm_mb, "距底")]:
+            s.setToolTip(tip); s.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            s.valueChanged.connect(self._on_wm_param_changed)
+            wm_lay.addWidget(QLabel(tip)); wm_lay.addWidget(s)
+        self.wm_box.setVisible(False)
+        pgl.addWidget(self.wm_box)
+
         param_grp.setLayout(pgl)
         rl.addWidget(param_grp)
 
@@ -658,6 +721,33 @@ class ImageHandler:
     # ------------------------------------------------------------------ #
     #  预览（防抖 300ms）
     # ------------------------------------------------------------------ #
+    def _on_wm_toggle(self, checked):
+        self.wm_box.setVisible(checked)
+        if self._current_preview_img is not None:
+            self.preview_before.set_mask(
+                self.wm_w.value(), self.wm_h.value(),
+                self.wm_mr.value(), self.wm_mb.value(), enabled=checked)
+        self._schedule_preview_refresh()
+
+    def _on_wm_param_changed(self, _):
+        if self.cb_wm.isChecked() and self._current_preview_img is not None:
+            self.preview_before.set_mask(
+                self.wm_w.value(), self.wm_h.value(),
+                self.wm_mr.value(), self.wm_mb.value(), enabled=True)
+        self._schedule_preview_refresh()
+
+    def _apply_watermark(self, img):
+        """对 BGR 图像应用去水印，返回处理后的图像。"""
+        h, w = img.shape[:2]
+        x0 = max(0, w - self.wm_mr.value() - self.wm_w.value())
+        y0 = max(0, h - self.wm_mb.value() - self.wm_h.value())
+        x1 = min(w, w - self.wm_mr.value())
+        y1 = min(h, h - self.wm_mb.value())
+        if x0 < x1 and y0 < y1:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            mask[y0:y1, x0:x1] = 255
+            return cv2.inpaint(img, mask, 3, cv2.INPAINT_TELEA)
+        return img
     def _on_image_selected(self):
         selected = self.i_table.selectedItems()
         if not selected:
@@ -693,7 +783,10 @@ class ImageHandler:
         th   = self.img_h.value()
         mode = self.img_mode.currentText()
         try:
-            result = fit_image(self._current_preview_img, tw, th, mode)
+            img = self._current_preview_img.copy()
+            if self.cb_wm.isChecked():
+                img = self._apply_watermark(img)
+            result = fit_image(img, tw, th, mode)
             self.preview_after.set_image_from_cv(result)
         except Exception as e:
             self.update_log(f"预览渲染失败: {e}")
@@ -707,7 +800,7 @@ class ImageHandler:
     #  导出（公共）
     # ------------------------------------------------------------------ #
     def _build_export_config(self, out_dir):
-        return {
+        cfg = {
             'out_dir':  out_dir,
             'target_w': self.img_w.value(),
             'target_h': self.img_h.value(),
@@ -716,6 +809,14 @@ class ImageHandler:
             'format':   self.i_format.currentText(),
             'quality':  self.img_quality.value(),
         }
+        if self.cb_wm.isChecked():
+            cfg['watermark'] = {
+                'width':        self.wm_w.value(),
+                'height':       self.wm_h.value(),
+                'margin_right': self.wm_mr.value(),
+                'margin_bottom':self.wm_mb.value(),
+            }
+        return cfg
 
     def _lock_export_ui(self):
         self.btn_export_img.setEnabled(False)

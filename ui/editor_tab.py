@@ -950,6 +950,7 @@ class EditorTab(QWidget):
         tw.drop_media_requested.connect(self._on_drop_media)
         tw.new_timeline_requested.connect(self._on_new_timeline)
         tw.freeze_requested.connect(self._on_freeze_frame)
+        tw.extract_frame_requested.connect(self._on_extract_frame_to_image_editor)
         tw.reverse_requested.connect(self._on_reverse)
         tw.subtitle_edit_requested.connect(self._on_subtitle_edit_requested)
         tw.clip_trimmed.connect(self._on_clip_trimmed)
@@ -973,6 +974,7 @@ class EditorTab(QWidget):
             (tw.drop_media_requested, self._on_drop_media),
             (tw.new_timeline_requested, self._on_new_timeline),
             (tw.freeze_requested, self._on_freeze_frame),
+            (tw.extract_frame_requested, self._on_extract_frame_to_image_editor),
             (tw.reverse_requested, self._on_reverse),
             (tw.subtitle_edit_requested, self._on_subtitle_edit_requested),
             (tw.clip_trimmed, self._on_clip_trimmed),
@@ -1362,8 +1364,19 @@ class EditorTab(QWidget):
 
     def _do_property_seek(self):
         """debounce 到期后真正执行 seek + 音频重启（音量/速度等变动需要立即反映）"""
-        self.preview._seq_state = None
         sec = self.timeline_widget.get_playhead()
+        if getattr(self.props_panel, '_track', '') == "subtitle":
+            # 字幕属性（位置/缩放/旋转/字间距/字号等）只影响叠加层，视频底图不变，
+            # 走轻量重绘路径，避免 seek(force=True) 全量重解码导致的卡顿（问题5）。
+            try:
+                self.preview._recompose_overlays()
+            except Exception:
+                logging.debug(
+                    "subtitle recompose failed, fallback to seek", exc_info=True)
+                self.preview._seq_state = None
+                self.preview.seek(sec, force=True)
+            return
+        self.preview._seq_state = None
         # force=True：属性变更（含 out_transition 转场）后，即使播放头未移动也必须
         # 重新取帧——否则 seek 的同位置快速路径会跳过 fetch，导致"加了转场预览没反应"。
         self.preview.seek(sec, force=True)
@@ -1901,9 +1914,10 @@ class EditorTab(QWidget):
     def _on_selection_changed(self, clip, track: str, track_idx: int):
         if clip is None:
             self.props_panel.clear_selection()
-            self.preview._selected_video_clip = None
-            self.preview._selected_sub = None
+            # 清除画布上的选中/拖拽/编辑态（删除片段/轨道后防止残留选中框）
+            self.preview.clear_video_selection()
         else:
+            prev_video = self.preview._selected_video_clip
             self.props_panel.set_selection(clip, track)
             if track == "subtitle":
                 self.preview._selected_sub = clip
@@ -1911,8 +1925,11 @@ class EditorTab(QWidget):
             else:
                 self.preview._selected_video_clip = clip
                 self.preview._selected_sub = None
-            # 只选中，不动播放头
-            self.preview._seq_state = None
+                # 仅在选中的视频片段【对象】真正变化时才清除 _seq_state；
+                # 重复选中同一片段（或拖动中重复触发选中回调）保持 _seq_state 不变，
+                # 避免强制从头重解码导致主轨二次拖动闪屏（问题1）。
+                if clip is not prev_video:
+                    self.preview._seq_state = None
 
     def _on_preview_selection(self, clip, kind: str):
         """预览画布点击选中（视频/字幕）"""
@@ -2269,6 +2286,58 @@ class EditorTab(QWidget):
             QMessageBox.warning(self, "错误", f"FFmpeg 定格帧失败：\n{e.stderr.decode() if e.stderr else str(e)}")
         except Exception as e:
             QMessageBox.warning(self, "错误", f"定格帧生成异常：{e}")
+
+    # ── 提取当前帧到图层编辑 ──
+    def _on_extract_frame_to_image_editor(self, clip, playhead_pos: float):
+        """在播放头位置截取当前帧（保留 alpha），发送到图层编辑作为新图层。"""
+        from utils.ffmpeg_utils import get_ffmpeg_path
+        import time as _time
+
+        ffmpeg = get_ffmpeg_path()
+        src = clip.source_path
+        if not src or not os.path.exists(src):
+            QMessageBox.warning(self, "错误", "源文件不存在")
+            return
+
+        rel_time = playhead_pos - clip.timeline_start
+        if rel_time <= 0 or rel_time >= clip.duration * 0.99:
+            QMessageBox.warning(self, "错误", "提取点需要在片段内部（不能是开头或结尾）")
+            return
+        src_time = clip.trim_start + rel_time * clip.speed
+
+        has_alpha = getattr(clip, "has_alpha", False)
+        # 透明视频：先探测（clip.has_alpha 可能未设置）
+        if not has_alpha:
+            try:
+                from utils.alpha_video import probe_has_alpha
+                has_alpha = probe_has_alpha(src)
+            except Exception:
+                has_alpha = False
+
+        stamp = str(int(_time.time() * 1000))
+        os.makedirs("work_temp", exist_ok=True)
+        img_path = os.path.join("work_temp", f"frame_{stamp}.png")
+
+        pix = "rgba" if has_alpha else "rgb24"
+        try:
+            subprocess.run([
+                ffmpeg, "-y", "-ss", str(src_time), "-i", src,
+                "-vframes", "1", "-pix_fmt", pix, img_path
+            ], capture_output=True, check=True)
+        except subprocess.CalledProcessError as e:
+            QMessageBox.warning(self, "错误",
+                                f"提取当前帧失败：\n{e.stderr.decode() if e.stderr else str(e)}")
+            return
+
+        # 发送到图层编辑
+        mw = self.window()
+        if mw is None or not hasattr(mw, "image_editor"):
+            QMessageBox.warning(self, "错误", "未找到图层编辑模块")
+            return
+        mw.image_editor.add_image_from_path(img_path)
+        # 跳转并高亮图层编辑 Tab（stacked index = 8）
+        mw._xh_jump_tab(8)
+        self.status_msg.emit("当前帧已提取到图层编辑 ✓", "success")
 
     # ── 倒放 ──
     def _on_reverse(self, clip):

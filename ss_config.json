@@ -1,7 +1,7 @@
 {
   "imgs_per_video": 6,
   "video_duration": 12,
-  "video_count": 50,
+  "video_count": 5,
   "fps": 30,
   "resolution": "1080x1920",
   "transition_frames": 10,

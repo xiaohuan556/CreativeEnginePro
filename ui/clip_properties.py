@@ -268,6 +268,9 @@ class ClipPropertiesPanel(QWidget):
         if self._current_sec is None:
             self._current_sec = clip.timeline_start if clip else None
         self._rebuild_ui()
+        # 重建 UI 后必须补一次高亮：playhead_moved 可能在 selection_changed
+        # 之前触发，此时 _kf_buttons 尚未建好 → 菱形一直暗着。
+        self._highlight_kf_buttons()
 
     def set_current_time(self, sec: float | None):
         """更新当前播放头时间（用于关键帧按钮高亮）"""
@@ -1278,7 +1281,9 @@ class ClipPropertiesPanel(QWidget):
             kfs[prop] = [(t0, v) for t0, v in kfs[prop] if abs(t0 - rel_t) > 0.05]
             kfs[prop].append((rel_t, val))
         self._highlight_kf_buttons()
-        self.tl.changed.emit()
+        # 关键帧变更：用 overlays_changed（轻量重绘，不消帧缓存），
+        # 避免 changed 导致 seek→清空缓存→拖拽时画面空白/轴锁住。
+        self.tl.overlays_changed.emit()
         self.property_changed.emit()
 
     def _jump_kf(self, prop: str, direction: int):

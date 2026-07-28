@@ -1,0 +1,531 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>热点雷达 · Web</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  :root {
+    --bg:#F5F7FB; --panel:#FFFFFF; --ink:#1F2937; --muted:#94A3B8;
+    --line:#E8ECF1; --line2:#EEF2F7; --accent:#3B82F6;
+  }
+  body {
+    font-family:-apple-system,BlinkMacSystemFont,'Microsoft YaHei','Segoe UI',sans-serif;
+    background:var(--bg); color:var(--ink); min-height:100vh;
+  }
+  .app { max-width:1120px; margin:0 auto; padding:20px 22px 60px; }
+
+  /* ── Header ── */
+  .header { display:flex; align-items:center; gap:12px; margin-bottom:14px; }
+  .live-dot {
+    width:10px; height:10px; border-radius:50%; flex:none;
+    background:radial-gradient(circle at 30% 30%, #4dffc0, #14b886);
+    box-shadow:0 0 0 4px rgba(20,184,134,.15); animation:pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+  .title { font-size:21px; font-weight:800; color:#0F172A; letter-spacing:-.3px; }
+  .accent-bar { width:46px; height:4px; border-radius:2px; margin-top:3px;
+    background:linear-gradient(90deg,#3D8EF8,#00EAFF); }
+  .subtitle { font-size:11px; color:var(--muted); margin-top:4px; }
+  .spacer { flex:1; }
+  .btn {
+    border:none; border-radius:9px; font-size:13px; font-weight:600;
+    padding:9px 16px; cursor:pointer; transition:.15s; white-space:nowrap;
+  }
+  .btn-primary { background:linear-gradient(90deg,#3D8EF8,#2F7FE0); color:#fff; }
+  .btn-primary:hover { background:linear-gradient(90deg,#5AA0FF,#3D8EF8); }
+  .btn-primary:disabled { background:#CBD5E1; color:#94A3B8; cursor:not-allowed; }
+  .btn-ghost { background:#fff; color:#475569; border:1px solid var(--line); }
+  .btn-ghost:hover { border-color:#3D8EF8; color:#3D8EF8; }
+
+  /* ── Status bar ── */
+  .status-bar { display:flex; align-items:center; gap:12px; margin-bottom:12px; }
+  .progress { flex:1; height:3px; background:var(--line2); border-radius:2px; overflow:hidden; }
+  .progress > i { display:block; height:100%; width:0; background:linear-gradient(90deg,#3D8EF8,#00EAFF); transition:width .3s; }
+  .status-text { font-size:11px; color:var(--muted); white-space:nowrap; }
+
+  /* ── Tabs ── */
+  .tabs { display:flex; gap:8px; overflow-x:auto; padding-bottom:10px; scrollbar-width:none; }
+  .tabs::-webkit-scrollbar { display:none; }
+  .tab {
+    flex:none; padding:7px 15px; border-radius:14px; font-size:12.5px; font-weight:600;
+    background:#fff; color:#64748B; border:1px solid var(--line); cursor:pointer;
+    transition:.15s; white-space:nowrap;
+  }
+  .tab:hover { color:var(--tc); border-color:var(--tbc); background:var(--tbg); }
+  .tab.active { color:var(--tc); background:var(--tbg); border-color:var(--tbc); }
+  .sep { height:1px; background:var(--line); margin-bottom:14px; }
+
+  /* ── Content ── */
+  .panel { display:none; }
+  .panel.active { display:block; }
+  .summary {
+    background:var(--panel); border:1px solid var(--line); border-left:4px solid var(--cc);
+    border-radius:12px; padding:12px 16px; margin-bottom:14px; font-size:12.5px;
+    color:#475569; line-height:1.6; box-shadow:0 1px 2px rgba(15,23,42,.03);
+  }
+  .list-head { display:flex; align-items:center; gap:10px; padding:0 4px 8px; font-size:10px; font-weight:700; color:#9AA6B2; letter-spacing:.5px; }
+  .list-head .h-rank { width:30px; text-align:center; }
+  .list-head .h-trans { width:30px; }
+  .list-head .h-title { flex:1; }
+  .list-head .h-actions { display:flex; align-items:center; gap:10px; }
+  .btn-trans-all {
+    font-size:11px; padding:4px 12px; border-radius:7px; cursor:pointer;
+    border:1px solid var(--cc); color:var(--cc); background:transparent; font-weight:600;
+  }
+  .btn-trans-all:hover { background:var(--ccbg); }
+  .btn-trans-all:disabled { color:#C0C8D4; border-color:var(--line); cursor:not-allowed; }
+  .count { font-size:11px; color:var(--muted); white-space:nowrap; }
+
+  .item-list { display:flex; flex-direction:column; gap:7px; }
+  .sub-group-header { font-size:12px; font-weight:700; color:#64748B; padding:8px 4px 2px; margin-top:4px; border-bottom:1px solid #E2E8F0; letter-spacing:.3px; }
+  .sub-tab-bar { display:flex; gap:6px; padding:4px 0 12px; flex-wrap:wrap; }
+  .sub-tab { padding:5px 12px; border-radius:18px; border:1px solid var(--line); background:#fff; font-size:12px; font-weight:600; color:#64748B; cursor:pointer; }
+  .sub-tab.active { background:var(--cc); color:#fff; border-color:var(--cc); }
+  .sub-tab:hover:not(.active) { background:#F1F5F9; }
+  .item {
+    display:flex; align-items:center; gap:11px; padding:9px 13px; background:var(--panel);
+    border:1px solid var(--line); border-radius:11px; cursor:pointer; transition:.14s;
+    box-shadow:0 1px 2px rgba(15,23,42,.03);
+  }
+  .item:hover { border-color:#BFDBFE; box-shadow:0 3px 10px rgba(61,142,248,.10); transform:translateY(-1px); }
+  .badge {
+    width:30px; height:30px; flex:none; border-radius:50%; display:flex; align-items:center;
+    justify-content:center; font-size:12px; font-weight:800;
+  }
+  .badge.gold { background:linear-gradient(135deg,#FFD86B,#F7A823); color:#1a1a1a; }
+  .badge.silver { background:linear-gradient(135deg,#E6E9EE,#AEB6C2); color:#1a1a1a; }
+  .badge.bronze { background:linear-gradient(135deg,#EFA878,#C77B4A); color:#1a1a1a; }
+  .badge.hot { background:var(--cc); color:#101010; }
+  .badge.plain { background:#F1F5F9; color:var(--cc); border:1px solid var(--ccbg); }
+  .i-trans {
+    width:30px; height:30px; flex:none; border-radius:7px; font-size:11px; font-weight:700;
+    cursor:pointer; background:transparent; color:var(--cc);
+    border:1px solid var(--cc); border-color:var(--tbc);
+  }
+  .i-trans:hover { background:var(--ccbg); border-color:var(--cc); }
+  .i-trans:disabled { opacity:.5; cursor:not-allowed; }
+  .i-trans.done { background:var(--ccbg); }
+  .thumb { width:42px; height:42px; flex:none; border-radius:8px; object-fit:cover; background:#EEF2F7; }
+  .thumb-ph {
+    display:flex; align-items:center; justify-content:center;
+    font-size:17px; font-weight:800; color:#fff; user-select:none;
+  }
+  .i-bar { width:4px; height:30px; border-radius:2px; background:var(--cc); flex:none; }
+  .i-main { flex:1; min-width:0; }
+  .i-title { font-size:13.5px; color:#1E293B; font-weight:500; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .i-title.translated { color:var(--cc); }
+  .i-sub { font-size:11px; color:#9AA6B2; margin-top:2px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .i-source {
+    font-size:10px; color:var(--cc); background:var(--ccbg); border:1px solid var(--tbc);
+    border-radius:5px; padding:2px 7px; max-width:130px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:none;
+  }
+  .heat {
+    font-size:11px; font-weight:800; border-radius:9px; padding:3px 9px; flex:none; white-space:nowrap;
+  }
+  .heat.hot { color:#0a0a0a; background:linear-gradient(90deg,#3D8EF8,#00EAFF); }
+  .heat.plain { color:#8A94A6; background:#F1F5F9; border:1px solid var(--line); }
+
+  .hint { color:var(--muted); font-size:12px; padding:26px 0; text-align:center; }
+  .empty-card {
+    color:#B0894A; font-size:12px; background:#FFFBEB; border:1px solid #FDE68A;
+    border-radius:9px; padding:12px 16px; line-height:1.6;
+  }
+
+  /* ── Settings modal ── */
+  .overlay {
+    position:fixed; inset:0; background:rgba(15,23,42,.45); display:none;
+    align-items:flex-start; justify-content:center; padding-top:60px; z-index:50;
+  }
+  .overlay.show { display:flex; }
+  .modal {
+    background:#fff; border-radius:16px; width:460px; max-width:92vw; max-height:84vh;
+    overflow:auto; box-shadow:0 20px 60px rgba(0,0,0,.25); padding:22px;
+  }
+  .modal h2 { font-size:16px; color:#0F172A; margin-bottom:14px; }
+  .group { border:1px solid var(--line); border-radius:11px; padding:12px 14px; margin-bottom:12px; }
+  .group > .g-title { font-size:12px; font-weight:700; color:#3D8EF8; margin-bottom:10px; }
+  .row { display:flex; align-items:center; gap:10px; padding:5px 0; }
+  .row label.src { flex:1; font-size:13px; color:#334155; }
+  .row input[type=number] {
+    width:64px; padding:4px 6px; border:1px solid var(--line); border-radius:6px;
+    font-size:12px; text-align:center; color:#334155;
+  }
+  .row input[type=checkbox] { width:16px; height:16px; accent-color:#3D8EF8; }
+  .field { display:flex; align-items:center; gap:10px; margin:8px 0; }
+  .field > span { font-size:12px; color:#475569; width:88px; flex:none; }
+  .field input[type=text], .field input[type=number] {
+    flex:1; padding:6px 9px; border:1px solid var(--line); border-radius:7px; font-size:12px; color:#334155;
+  }
+  .modal-actions { display:flex; justify-content:flex-end; gap:10px; margin-top:6px; }
+  @media (max-width:680px){ .app{padding:12px} .item{flex-wrap:wrap} }
+</style>
+</head>
+<body>
+<div class="app">
+  <div class="header">
+    <span class="live-dot"></span>
+    <div>
+      <div class="title">热点雷达</div>
+      <div class="accent-bar"></div>
+      <div class="subtitle">海外热点聚合 · 点击卡片跳转原文 · 🔥 为高热度</div>
+    </div>
+    <span class="spacer"></span>
+    <button class="btn btn-ghost" id="btnSettings" onclick="openSettings()">⚙ 设置</button>
+    <button class="btn btn-primary" id="btnRefresh" onclick="refresh()">🔄 刷新热点</button>
+  </div>
+
+  <div class="status-bar">
+    <div class="progress"><i id="progress"></i></div>
+    <span class="status-text" id="status">就绪</span>
+  </div>
+
+  <div class="tabs" id="tabs"></div>
+  <div class="sep"></div>
+  <div class="content" id="content"></div>
+</div>
+
+<!-- Settings -->
+<div class="overlay" id="overlay" onclick="if(event.target===this)closeSettings()">
+  <div class="modal">
+    <h2>数据源配置</h2>
+    <div class="group">
+      <div class="g-title">数据源（启用后参与抓取 · 绝大多数免 Key）</div>
+      <div id="srcRows"></div>
+    </div>
+    <div class="group">
+      <div class="g-title">过滤与调度</div>
+      <div class="field"><span>排除关键词</span>
+        <input type="text" id="excl" placeholder="逗号分隔，如 trump, politics"></div>
+      <div class="field"><span>刷新间隔</span>
+        <input type="number" id="interval" min="1" max="240" style="width:80px"> 分钟</div>
+      <div class="field"><span>最低热度分</span>
+        <input type="number" id="minscore" min="0" max="100" style="width:80px"></div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="closeSettings()">取消</button>
+      <button class="btn btn-primary" onclick="saveSettings()">保存并刷新</button>
+    </div>
+  </div>
+</div>
+
+<script>
+{% autoescape false %}
+const CAT_KEYS = {{ cat_keys_json }};
+const CAT_COLORS = {{ cat_colors_json }};
+const SOURCE_LABELS = {{ source_labels_json }};
+const CONFIG = {{ config_json }};
+{% endautoescape %}
+
+let allData = {};
+let allSummaries = {};
+let currentTab = CAT_KEYS[0];
+let lastUpdate = 0;
+
+const hexA = (hex, a) => {
+  const h = hex.replace('#','');
+  const r = parseInt(h.slice(0,2),16), g = parseInt(h.slice(2,4),16), b = parseInt(h.slice(4,6),16);
+  return `rgba(${r},${g},${b},${a})`;
+};
+
+function initUI() {
+  const tabsEl = document.getElementById('tabs');
+  CAT_KEYS.forEach(cat => {
+    const c = CAT_COLORS[cat];
+    const btn = document.createElement('button');
+    btn.className = 'tab';
+    btn.textContent = cat;
+    btn.style.setProperty('--tc', c);
+    btn.style.setProperty('--tbc', hexA(c,.5));
+    btn.style.setProperty('--tbg', hexA(c,.14));
+    btn.onclick = () => switchTab(cat);
+    tabsEl.appendChild(btn);
+  });
+
+  const contentEl = document.getElementById('content');
+  CAT_KEYS.forEach(cat => {
+    const c = CAT_COLORS[cat];
+    const div = document.createElement('div');
+    div.className = 'panel';
+    div.id = 'panel-' + CAT_KEYS.indexOf(cat);
+    div.style.setProperty('--cc', c);
+    div.style.setProperty('--ccbg', hexA(c,.12));
+    div.style.setProperty('--tbc', hexA(c,.35));
+    contentEl.appendChild(div);
+  });
+  switchTab(currentTab);
+  buildSettings();
+}
+
+function switchTab(cat) {
+  currentTab = cat;
+  document.querySelectorAll('.tab').forEach((t,i)=>t.classList.toggle('active', CAT_KEYS[i]===cat));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('panel-'+CAT_KEYS.indexOf(cat)).classList.add('active');
+}
+
+function renderAll() {
+  CAT_KEYS.forEach(cat => renderPanel(cat, allData[cat]||[], allSummaries[cat]||''));
+}
+
+function renderPanel(cat, items, summary) {
+  const c = CAT_COLORS[cat];
+  const panel = document.getElementById('panel-'+CAT_KEYS.indexOf(cat));
+  if (!panel) return;
+  let html = '';
+  if (summary) html += `<div class="summary">${summary}</div>`;
+
+  // ── 热映资讯：子标签页 ──
+  const isMovie = (cat === '🔥 热映资讯' || cat.includes('热映'));
+  if (isMovie && items.length) {
+    const groups = ['正在热映的电影','今日播放的电视剧','即将上映的热门电影','正在热映的动漫'];
+    const grouped = {};
+    groups.forEach(g => grouped[g] = []);
+    items.forEach(it => {
+      const g = it.sub_group || '';
+      if (grouped.hasOwnProperty(g)) grouped[g].push(it);
+    });
+    const activeGroup = panel.dataset.movieTab || groups.find(g => grouped[g].length) || groups[0];
+    panel.dataset.movieTab = activeGroup;
+    html += `<div class="list-head">
+      <span class="h-title">${cat}</span>
+      <span class="h-actions"><button class="btn-trans-all" data-cat="${cat}" onclick="translateAll('${cat}')">🌐 全部翻译</button>
+      <span class="count">${items.length} 条</span></span></div>`;
+    html += '<div class="sub-tab-bar">';
+    groups.forEach(g => {
+      const cls = (g === activeGroup) ? 'sub-tab active' : 'sub-tab';
+      const n = grouped[g].length;
+      html += `<button class="${cls}" onclick="switchMovieSubTab('${cat}','${g.replace(/'/g,"\\'")}')">${g} ${n ? '('+n+')' : ''}</button>`;
+    });
+    html += '</div><div class="item-list">';
+    (grouped[activeGroup] || []).forEach((it,i) => {
+      html += renderItemHTML(it, i+1, cat, i);
+    });
+    html += '</div>';
+    panel.innerHTML = html;
+    return;
+  }
+
+  // ── 普通分类：平铺列表 ──
+  html += `<div class="list-head">
+    <span class="h-rank">#</span><span class="h-trans"></span><span class="h-title">标题 / 来源</span>
+    <span class="h-actions">
+      <button class="btn-trans-all" data-cat="${cat}" onclick="translateAll('${cat}')" ${items.length?'':'disabled'}>🌐 全部翻译</button>
+      <span class="count">${items.length?items.length+' 条':'暂无数据'}</span>
+    </span></div>`;
+  html += '<div class="item-list">';
+  if (!items.length) {
+    html += '<div class="empty-card">⚠️ 该分类暂无数据。</div>';
+  } else {
+    items.forEach((it,i) => { html += renderItemHTML(it, i+1, cat, i); });
+  }
+  html += '</div>';
+  panel.innerHTML = html;
+}
+
+function switchMovieSubTab(cat, group) {
+  const panel = document.getElementById('panel-'+CAT_KEYS.indexOf(cat));
+  if (!panel) return;
+  panel.dataset.movieTab = group;
+  renderPanel(cat, allData[cat]||[], allSummaries[cat]||'');
+}
+
+function renderItemHTML(it, rank, cat, idx) {
+  const bcls = rank===1?'gold':rank===2?'silver':rank===3?'bronze':(it.hot?'hot':'plain');
+  const heat = (it.composite!=null)
+    ? (it.hot ? `<span class="heat hot">🔥${it.composite}</span>`
+              : `<span class="heat plain">${it.composite}</span>`)
+    : (it.score ? `<span class="heat plain">⬆${it.score>=1000?(it.score/1000).toFixed(1)+'k':it.score}</span>` : '');
+  const phColor = CAT_COLORS[cat] || '#8B7CF6';
+  let phLetter = '';
+  {
+    const raw = (it.title || it.source || '◆');
+    const stripped = raw.replace(/^[#\s]+/, '').trim();
+    for (const ch of stripped) {
+      if (/[A-Za-z0-9\u4e00-\u9fff]/.test(ch)) { phLetter = ch.toUpperCase(); break; }
+    }
+    if (!phLetter) phLetter = '◆';
+  }
+  let thumbBg = phColor;
+  if (!it.image) {
+    const key = it.title || it.source || 'ph';
+    let h = 0;
+    for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) | 0;
+    thumbBg = `hsl(${Math.abs(h) % 360}, 65%, 55%)`;
+  }
+  const img = it.image
+    ? `<img class="thumb" src="${it.image}" loading="lazy" data-ph="${phLetter}" onerror="imgFail(this,'${cat}')">`
+    : `<div class="thumb thumb-ph" style="background:${thumbBg};color:#fff">${phLetter}</div>`;
+  const title = (it.title||'').replace(/"/g,'&quot;');
+  const sub = (it.desc||'').replace(/</g,'&lt;');
+  return `<div class="item" data-cat="${cat}" data-idx="${idx}" data-url="${it.url||''}" onclick="openLink(this)">
+    <span class="badge ${bcls}">${String(rank).padStart(2,'0')}</span>
+    <button class="i-trans" data-cat="${cat}" data-idx="${idx}" onclick="event.stopPropagation();translateOne(this)">译</button>
+    ${img}<span class="i-bar"></span>
+    <div class="i-main">
+      <div class="i-title" data-original="${title}">${title}</div>
+      ${sub?`<div class="i-sub">${sub}</div>`:''}
+    </div>
+    ${it.source?`<span class="i-source" title="${it.source.replace(/"/g,'&quot;')}">${it.source}</span>`:''}
+    ${heat}</div>`;
+}
+
+function openLink(el){
+  const u = el.dataset.url;
+  if (u) window.open(u, '_blank');
+}
+
+function imgFail(el, cat){
+  const ph = document.createElement('div');
+  ph.className = 'thumb thumb-ph';
+  ph.style.background = CAT_COLORS[cat] || '#8B7CF6';
+  ph.style.color = '#fff';
+  ph.textContent = el.dataset.ph || '◆';
+  el.replaceWith(ph);
+}
+
+async function refresh() {
+  const btn = document.getElementById('btnRefresh');
+  const prog = document.getElementById('progress');
+  const status = document.getElementById('status');
+  btn.disabled = true; btn.textContent = '⏳ 抓取中…';
+  prog.style.width = '35%'; status.textContent = '并发抓取各平台热点…';
+  try {
+    const resp = await fetch('/api/refresh', {method:'POST'});
+    const j = await resp.json();
+    allData = j.data || {}; allSummaries = j.summaries || {};
+    lastUpdate = j.updated_at || Math.floor(Date.now()/1000);
+    renderAll();
+    prog.style.width = '100%'; status.textContent = '✅ 热点更新完成';
+    updateStatus();
+    setTimeout(()=>prog.style.width='0%', 1800);
+  } catch(e) {
+    status.textContent = '❌ 获取失败：' + e.message;
+    prog.style.width = '0%';
+  }
+  btn.disabled = false; btn.textContent = '🔄 刷新热点';
+}
+
+async function loadInitial() {
+  try {
+    const resp = await fetch('/api/data');
+    const j = await resp.json();
+    if (j.data && Object.keys(j.data).length) {
+      allData = j.data; allSummaries = j.summaries||{};
+      lastUpdate = j.updated_at || 0;
+      renderAll();
+      updateStatus();
+      document.getElementById('status').textContent = lastUpdate ? '⚡ 已加载缓存，后台刷新中…' : '首次加载，正在抓取…';
+    }
+  } catch(e) { /* ignore */ }
+  // 后台再拉一次最新
+  refresh();
+}
+
+/* ── 翻译 ── */
+async function translateOne(btn) {
+  const cat = btn.dataset.cat, idx = +btn.dataset.idx;
+  const item = (allData[cat]||[])[idx];
+  if (!item) return;
+  const titleEl = btn.parentElement.querySelector('.i-title');
+  const original = titleEl.dataset.original;
+  if (btn.classList.contains('done')) {
+    titleEl.textContent = original; titleEl.classList.remove('translated');
+    btn.textContent='译'; btn.classList.remove('done'); return;
+  }
+  btn.disabled = true; btn.textContent='⏳';
+  try {
+    const r = await fetch('/api/translate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({text: original})});
+    const d = await r.json();
+    titleEl.textContent = d.translated; titleEl.classList.add('translated');
+    btn.classList.add('done'); btn.textContent='↩';
+  } catch(e) { btn.textContent='译'; }
+  btn.disabled = false;
+}
+
+async function translateAll(cat) {
+  const items = allData[cat]||[];
+  const panel = document.getElementById('panel-'+CAT_KEYS.indexOf(cat));
+  const btn = panel.querySelector('.btn-trans-all');
+  const titles = panel.querySelectorAll('.i-title');
+  const transBtns = panel.querySelectorAll('.i-trans');
+  btn.disabled = true;
+  const originals = [...titles].map(t=>t.dataset.original);
+  try {
+    const r = await fetch('/api/translate',{method:'POST',headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({texts: originals})});
+    const d = await r.json();
+    const map = d.translated || {};
+    titles.forEach((t,i)=>{
+      const tr = map[t.dataset.original] || t.dataset.original;
+      t.textContent = tr; t.classList.add('translated');
+      transBtns[i].classList.add('done'); transBtns[i].textContent='↩';
+      btn.textContent = `${i+1}/${titles.length}`;
+    });
+    btn.textContent = '✓ 已翻译';
+  } catch(e) {
+    btn.textContent = '翻译失败';
+  }
+}
+
+/* ── 设置 ── */
+function buildSettings() {
+  const wrap = document.getElementById('srcRows');
+  const srcs = CONFIG.sources || {};
+  wrap.innerHTML = '';
+  Object.keys(SOURCE_LABELS).forEach(key => {
+    const label = SOURCE_LABELS[key];
+    const cfg = srcs[key] || {enabled:true, limit:20};
+    const row = document.createElement('div');
+    row.className = 'row';
+    row.innerHTML = `<input type="checkbox" data-k="${key}" ${cfg.enabled?'checked':''}>
+      <label class="src">${label}</label>
+      <span style="font-size:11px;color:#9AA6B2">条数</span>
+      <input type="number" data-k="${key}" min="1" max="100" value="${cfg.limit||20}">`;
+    wrap.appendChild(row);
+  });
+  document.getElementById('excl').value = (CONFIG.exclude_keywords||[]).join(', ');
+  document.getElementById('interval').value = CONFIG.refresh_interval_min||15;
+  document.getElementById('minscore').value = CONFIG.min_score||0;
+}
+
+function openSettings(){ document.getElementById('overlay').classList.add('show'); }
+function closeSettings(){ document.getElementById('overlay').classList.remove('show'); }
+
+async function saveSettings() {
+  const sources = {};
+  document.querySelectorAll('#srcRows input[type=checkbox]').forEach(cb=>{
+    const key = cb.dataset.k;
+    const num = document.querySelector(`#srcRows input[type=number][data-k="${key}"]`);
+    sources[key] = { enabled: cb.checked, limit: parseInt(num.value)||20 };
+  });
+  const excl = document.getElementById('excl').value.split(',').map(s=>s.trim()).filter(Boolean);
+  const payload = {
+    sources,
+    exclude_keywords: excl,
+    refresh_interval_min: parseInt(document.getElementById('interval').value)||15,
+    min_score: parseInt(document.getElementById('minscore').value)||0,
+  };
+  try {
+    await fetch('/api/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    closeSettings();
+    refresh();
+  } catch(e) { alert('保存失败：'+e.message); }
+}
+
+/* ── 状态时间 ── */
+function updateStatus() {
+  const el = document.getElementById('status');
+  if (!lastUpdate) { el.textContent='就绪'; return; }
+  const mins = Math.floor((Date.now()/1000 - lastUpdate)/60);
+  el.textContent = mins<1 ? '✅ 刚刚更新' : mins<60 ? `✅ 更新于 ${mins} 分钟前` : `✅ 更新于 ${Math.floor(mins/60)} 小时前`;
+}
+setInterval(updateStatus, 30000);
+
+initUI();
+loadInitial();
+</script>
+</body>
+</html>

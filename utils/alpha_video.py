@@ -163,6 +163,29 @@ def probe_has_alpha(path: str, input_path_override: str | None = None) -> bool:
     return has
 
 
+_audio_cache: dict[str, bool] = {}
+
+
+def probe_has_audio(path: str) -> bool:
+    """快速检测文件是否包含音频流（结果缓存）"""
+    if path in _audio_cache:
+        return _audio_cache[path]
+    has = False
+    try:
+        fp = _ffprobe_bin()
+        result = subprocess.run(
+            [fp, '-v', 'quiet', '-select_streams', 'a', '-show_entries',
+             'stream=codec_type', '-of', 'csv=p=0', path],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            timeout=5, creationflags=_NO_WINDOW,
+        )
+        has = len(result.stdout.strip()) > 0
+    except Exception:
+        pass
+    _audio_cache[path] = has
+    return has
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # AlphaVideoPipeReader — 持久 FFmpeg 管道读取器
 # ═══════════════════════════════════════════════════════════════════════════

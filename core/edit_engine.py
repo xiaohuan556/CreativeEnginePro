@@ -1677,7 +1677,7 @@ class FFmpegDirectExportWorker(QThread):
                     "playback_dur": dur_playback,
                 })
                 total_dur = max(total_dur, c.timeline_start + dur_playback)
-                # 视频轨音频也在内（如未静音）
+                # 视频轨音频也在内（如未静音）—— 后面会用 ffprobe 探测实际有无音频流过滤
                 if not c.mute:
                     audio_clips.append({
                         "track": ti, "clip": c, "input_idx": idx,
@@ -1791,11 +1791,20 @@ class FFmpegDirectExportWorker(QThread):
                 f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1"
             )
 
-            # 如果 scale != 1.0，额外缩放后再 pad
+            # 如果 scale != 1.0，额外缩放后再 pad / crop
             if abs(s - 1.0) > 0.001:
-                sw = max(1, int(W * s))
-                sh = max(1, int(H * s))
-                chain += f",scale={sw}:{sh},pad={W}:{H}:(ow-iw)/2+{int(px)}:(oh-ih)/2+{int(py)}:color=0x00000000,setsar=1"
+                sw = max(1, int(round(W * s)))
+                sh = max(1, int(round(H * s)))
+                chain += f",scale={sw}:{sh}"
+                if sw > W or sh > H:
+                    # 放大后超出画布：用 crop 取画布区域（居中 + 偏移，并 clamp 到合法范围），避免 pad 报错
+                    chain += (
+                        f",crop={W}:{H}:"
+                        f"max(0\\,min(iw-{W}\\,(iw-{W})/2+{int(px)})):"
+                        f"max(0\\,min(ih-{H}\\,(ih-{H})/2+{int(py)})),setsar=1"
+                    )
+                else:
+                    chain += f",pad={W}:{H}:(ow-iw)/2+{int(px)}:(oh-ih)/2+{int(py)}:color=0x00000000,setsar=1"
             elif abs(px) > 0.5 or abs(py) > 0.5:
                 # 纯位移
                 chain += f",pad={W}:{H}:(ow-iw)/2+{int(px)}:(oh-ih)/2+{int(py)}:color=0x00000000,setsar=1"
@@ -1804,8 +1813,12 @@ class FFmpegDirectExportWorker(QThread):
             rot = getattr(c, 'rotation', 0.0) or 0.0
             if abs(rot) > 0.1:
                 chain += f",rotate={rot}*PI/180:ow=rotow(\\,{rot}*PI/180\\,):oh=rotoh(\\,{rot}*PI/180\\,)"
-                # 旋转后 pad 回画布尺寸
-                chain += f",pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1"
+                # 旋转后画布边界可能 > W×H 也可能 < W×H（如 90° 竖屏旋转），
+                # 统一 scale-to-fit + pad 回画布，避免 pad/crop 尺寸不匹配崩溃
+                chain += (
+                    f",scale={W}:{H}:force_original_aspect_ratio=decrease,"
+                    f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2:color=0x00000000,setsar=1"
+                )
 
             # 模糊
             blur = getattr(c, 'blur_radius', 0.0) or 0.0
@@ -2131,17 +2144,20 @@ class FFmpegDirectExportWorker(QThread):
         """判断是否需要走 compositor 逐帧渲染（而非 FFmpeg filter_complex 直接导出）。
 
         compositor 路径在以下情况必须启用：
-        1. 背景轨含转场（xfade 不支持自定义型）
+        1. 背景轨含任意转场（xfade 不支持自定义型，且与预览逐帧一致）
         2. 任意视频片段启用了绿幕抠像（chroma_key_enabled）
-        3. 任意输入文件含 alpha 通道（MOV ProRes 4444 / WebM VP9 alpha 等）
+
+        注意：alpha 视频（MOV ProRes 4444 / WebM VP9 alpha 等）「不再」强制走
+        compositor —— filter_complex 路径已通过 `format=rgba` + `overlay=format=auto`
+        正确完成透明叠加，最终 yuv420p 输出会压平透明通道。逐帧 compositor 在
+        1080p 下约 8MB/帧经 Python 管道喂给 ffmpeg，速度慢一个数量级以上，
+        因此仅在转场 / 绿幕这类 filter_complex 无法精确复现时才启用。
         """
         if FFmpegDirectExportWorker._bg_has_transition(video_clips):
             return True
         for vc in video_clips:
             if getattr(vc["clip"], "chroma_key_enabled", False):
                 return True
-        if any(input_alpha):
-            return True
         return False
 
     def _export_via_compositor(self, ff, input_files, audio_clips, total_dur):
@@ -2213,12 +2229,28 @@ class FFmpegDirectExportWorker(QThread):
 
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            # stderr → DEVNULL：逐帧渲染时进度由帧计数提供，
-            # 不使用后台线程（避免 Qt 信号跨 threading.Thread 崩溃）
+            # stderr → PIPE（不吞）：ffmpeg 中途挂掉时能从 stderr 推断死因（如输入文件丢失、
+            # 编码器拒绝参数、输出路径无权限等），写入失败时附加最近 stderr 给用户看。
+            # 读 stderr 用 try-read（不阻塞主循环），避免线程化。
             proc = subprocess.Popen(
-                cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=False, creationflags=creationflags,
             )
+            import threading as _threading
+            _stderr_chunks = []
+            _stderr_done = _threading.Event()
+            def _drain_stderr():
+                try:
+                    while True:
+                        chunk = proc.stderr.read(4096)
+                        if not chunk:
+                            break
+                        _stderr_chunks.append(chunk)
+                except Exception:
+                    pass
+                _stderr_done.set()
+            _stderr_thread = _threading.Thread(target=_drain_stderr, daemon=True)
+            _stderr_thread.start()
         except Exception as e:
             self.finished.emit(False, f"无法启动 FFmpeg：{e}")
             return
@@ -2257,6 +2289,15 @@ class FFmpegDirectExportWorker(QThread):
             proc.stdin.flush()
             proc.stdin.close()
         except Exception as e:
+            import traceback as _tb
+            tb = _tb.format_exc()
+            # 抓 ffmpeg 最近 stderr（限 500 字符），帮用户判断是 pipe 死掉还是编码器拒绝
+            try:
+                _stderr_done.wait(timeout=1.0)
+                stderr_text = b"".join(_stderr_chunks).decode("utf-8", "replace").strip()[-500:]
+            except Exception:
+                stderr_text = ""
+            extra = f"\n\nFFmpeg 报错：\n{stderr_text}" if stderr_text else ""
             try:
                 comp.close()
             except Exception:
@@ -2265,7 +2306,7 @@ class FFmpegDirectExportWorker(QThread):
                 proc.terminate()
             except Exception:
                 pass
-            self.finished.emit(False, f"渲染失败：{e}")
+            self.finished.emit(False, f"渲染失败：{e}\n{tb}{extra}")
             return
 
         try:
@@ -2313,6 +2354,18 @@ class FFmpegDirectExportWorker(QThread):
                     self._input_alpha.append(probe_has_alpha(f))
         except Exception:
             self._input_alpha = [False] * len(input_files)
+
+        # 检测每个输入文件是否有音频流（图片/MOV纯视频→无音轨→不能放进 audio filter graph）
+        try:
+            from utils.alpha_video import probe_has_audio
+            input_has_audio = [False] * len(input_files)
+            for i, f in enumerate(input_files):
+                ext = os.path.splitext(f)[1].lower()
+                input_has_audio[i] = probe_has_audio(f) if ext not in _IMG_EXTS else False
+            # 过滤 audio_clips：只有输入文件确实含音频流才参与 filter_complex
+            audio_clips = [ac for ac in audio_clips if input_has_audio[ac["input_idx"]]]
+        except Exception:
+            pass  # 探测失败全量参与（旧行为），最坏原样报错
 
         self._check_cancel()
         self.progress.emit(10, "构建导出命令…")

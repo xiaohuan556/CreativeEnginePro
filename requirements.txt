@@ -24,10 +24,18 @@ numpy>=1.24.0
 
 # ── 视频处理 ──
 moviepy>=1.0.3
-opencv-python>=4.8.0
+# opencv-contrib-python 是 opencv-python 的超集，提供 FaceDetectorYN（人脸修复检测所需）
+opencv-contrib-python>=4.8.0
 
 # ── 音频分离 (按需安装，较重) ──
 # torch>=2.0.0
 # onnxruntime>=1.15.0
 # spleeter>=2.4.0
 # demucs>=4.0.0
+
+# ── AI 抠图 (按需安装；程序内也可自动安装) ──
+rembg>=2.0.50
+onnxruntime>=1.18.0
+
+# ── PSD 导入 (图片工作台) ──
+psd-tools>=1.9.30

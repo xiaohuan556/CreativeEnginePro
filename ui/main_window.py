@@ -12,7 +12,7 @@ from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink
 from .image_handler import ImageHandler
 from .mix_handler import MixHandler
 from .slideshow_handler import SlideshowHandler
-from .hotspot_handler import HotspotHandler
+from .image_editor import ImageEditorHandler
 from .widgets import CheckMarkBox
 
 # ═══════════════ 侧边栏折叠分组 ═══════════════
@@ -226,7 +226,7 @@ class SmartTimeline(QWidget):
             self.cut_changed.emit(new_ratio)
 
 # ==================== 主工作站 ====================
-class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, HotspotHandler):
+class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, ImageEditorHandler):
 
     def select_tail_video(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择标准尾页视频", "", "Video Files (*.mp4 *.mov *.avi)")
@@ -513,6 +513,13 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Ho
                 background: #2d7ee8;
             }
         """)
+        # 同时把同一套暗色主题应用到整个应用程序（QApplication），
+        # 否则顶层弹窗（QMessageBox / QDialog）不会继承本窗口的样式表，
+        # 在系统深色主题下会变成「黑底黑字」看不清。Qt 中控件的样式表不会
+        # 自动传递给顶层子窗口，必须显式设置到 QApplication 上才能覆盖全部弹窗。
+        _app = QApplication.instance()
+        if _app is not None:
+            _app.setStyleSheet(self.styleSheet())
 
     def keyPressEvent(self, event):
         # 视频处理模块(tab 0)快捷键
@@ -635,7 +642,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Ho
         btn_editor = QPushButton("  ✂ 剪辑工作台")
         btn_editor.setCheckable(True)
         btn_editor.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_editor.setProperty("tab_index", 7)
+        btn_editor.setProperty("tab_index", 6)
         btn_editor.setStyleSheet(
             "QPushButton[checkable=\"true\"] {"
             "text-align:left; padding:10px 12px; border:none; border-left:3px solid transparent;"
@@ -646,6 +653,25 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Ho
             "color:#fff; background:rgba(255,255,255,0.08); border-left:3px solid #00eaff; font-weight:bold; }"
         )
         side_lay.addWidget(btn_editor)
+        side_lay.addSpacing(6)
+
+        # ── 图片工作台（紧随剪辑工作台下方）──
+        IMAGE_ACCENT = "#a78bfa"  # 与剪辑工作台(青色)区分的左侧颜色条
+        btn_image_edit = QPushButton("  🎨 图片工作台")
+        btn_image_edit.setCheckable(True)
+        btn_image_edit.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_image_edit.setProperty("tab_index", 7)
+        btn_image_edit.setStyleSheet(
+            "QPushButton[checkable=\"true\"] {"
+            "text-align:left; padding:10px 12px; border:none; border-left:3px solid transparent;"
+            "font-size:12px; color:#999; background:transparent; }"
+            "QPushButton[checkable=\"true\"]:hover {"
+            "color:#ccc; background:rgba(255,255,255,0.05); border-left:3px solid #555; }"
+            "QPushButton[checkable=\"true\"]:checked {"
+            "color:#fff; background:rgba(255,255,255,0.08); border-left:3px solid "
+            + IMAGE_ACCENT + "; font-weight:bold; }"
+        )
+        side_lay.addWidget(btn_image_edit)
         side_lay.addSpacing(6)
 
         # ── 📹 视频部分 ──
@@ -662,28 +688,12 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Ho
 
         # ── 🎤 语音部分 ──
         grp_voice = SidebarGroup("语音部分")
-        btn_voice  = grp_voice.add_button("语音配音", 5)
-        btn_script = grp_voice.add_button("AI脚本", 6)
+        btn_voice  = grp_voice.add_button("语音配音", 4)
+        btn_script = grp_voice.add_button("AI脚本", 5)
         side_lay.addWidget(grp_voice)
 
-        # ── 🔥 热点雷达（独立按钮）──
-        btn_hotspot = QPushButton("  热点雷达")
-        btn_hotspot.setCheckable(True)
-        btn_hotspot.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_hotspot.setProperty("tab_index", 4)
-        btn_hotspot.setStyleSheet(
-            "QPushButton[checkable=\"true\"] {"
-            "text-align:left; padding:10px 12px; border:none; border-left:3px solid transparent;"
-            "font-size:12px; color:#999; background:transparent; }"
-            "QPushButton[checkable=\"true\"]:hover {"
-            "color:#ccc; background:rgba(255,255,255,0.05); border-left:3px solid #555; }"
-            "QPushButton[checkable=\"true\"]:checked {"
-            "color:#fff; background:rgba(255,255,255,0.08); border-left:3px solid #3d8ef8; font-weight:bold; }"
-        )
-        side_lay.addWidget(btn_hotspot)
-
         # 注册所有按钮（剪辑工作台在最前）
-        for btn in [btn_editor, btn_tail, btn_image, btn_mix, btn_slide, btn_voice, btn_script, btn_hotspot]:
+        for btn in [btn_editor, btn_tail, btn_image, btn_image_edit, btn_mix, btn_slide, btn_voice, btn_script]:
             if btn:
                 idx = btn.property("tab_index")
                 self._tab_index[btn] = idx
@@ -716,13 +726,13 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Ho
         self.stacked.addWidget(self.build_image_module())    # 1
         self.stacked.addWidget(self.build_mix_module())      # 2
         self.stacked.addWidget(self.build_slideshow_module()) # 3
-        self.stacked.addWidget(self.build_hotspot_module())  # 4
-        self.stacked.addWidget(self.voice_workbench)         # 5
-        self.stacked.addWidget(self.script_workbench)        # 6
-        self.stacked.addWidget(self.editor_tab)              # 7
+        self.stacked.addWidget(self.voice_workbench)         # 4
+        self.stacked.addWidget(self.script_workbench)        # 5
+        self.stacked.addWidget(self.editor_tab)              # 6
+        self.stacked.addWidget(self.build_image_editor_module())  # 7 图片工作台
         main_layout.addWidget(self.stacked)
         # 默认打开剪辑工作台
-        self.stacked.setCurrentIndex(7)
+        self.stacked.setCurrentIndex(6)
         btn_editor.setChecked(True)
 
         # ── 跨功能信号连接 ──
@@ -734,6 +744,10 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Ho
         # 语音配音 → 推送选中音频到剪辑工作台素材库
         self.voice_workbench.voice_pushed.connect(
             lambda path: self.editor_tab.media_lib.add_file(path))
+        # 图层编辑 → 添加图层到视频素材库（保留透明通道）
+        self.image_editor.add_layer_to_media_requested.connect(
+            lambda path: (self.editor_tab.media_lib.add_file(path),
+                          self.statusBar().showMessage("图层已添加到视频素材库", 3000)))
 
         # 恢复窗口几何
         s = QSettings("CreativeEnginePro", "MainWindow")

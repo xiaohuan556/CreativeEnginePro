@@ -10,6 +10,7 @@ media_library.py — 素材库面板（剪映风格卡片网格）
 from __future__ import annotations
 import os
 import re
+import sys
 import logging
 from typing import Optional, Callable
 from PyQt6.QtWidgets import (
@@ -496,15 +497,23 @@ class MediaLibrary(QWidget):
     def add_file(self, path: str):
         self._add_item(path)
 
+    def _norm_key(self, path: str) -> str:
+        """归一化路径去重键：绝对路径 + Windows 大小写不敏感"""
+        p = os.path.abspath(path)
+        if sys.platform == "win32":
+            return os.path.normcase(p)
+        return p
+
     def _add_item(self, path: str):
         if not os.path.exists(path):
             return
-        if path in self._item_map:
+        key = self._norm_key(path)
+        if key in self._item_map:
             return
 
         media = MediaItem(path)
         self._items.append(media)
-        self._item_map[path] = media
+        self._item_map[key] = media
 
         cb = {
             "add": lambda p, t, d: self.add_to_timeline_requested.emit(p, t, d),
@@ -514,33 +523,34 @@ class MediaLibrary(QWidget):
         }
         card = _MediaCard(media, cb)
         self._cards.append(card)
-        self._card_map[path] = card
+        self._card_map[key] = card
         self._reflow()
-        self._start_thumb_worker(media)
+        self._start_thumb_worker(media, key)
 
     def _on_select(self, path: str):
         self.last_selected_path = path
 
     def _remove_media(self, path: str):
-        media = self._item_map.get(path)
+        key = self._norm_key(path)
+        media = self._item_map.get(key)
         if media is None:
             return
-        card = self._card_map.pop(path, None)
+        card = self._card_map.pop(key, None)
         if card is not None:
             self._grid.removeWidget(card)
             card.deleteLater()
             self._cards = [c for c in self._cards if c is not card]
-        self._items = [m for m in self._items if m.path != path]
-        self._item_map.pop(path, None)
+        self._items = [m for m in self._items if self._norm_key(m.path) != key]
+        self._item_map.pop(key, None)
         self.file_removed.emit(path)
         self._reflow()
 
-    def _start_thumb_worker(self, media: MediaItem):
+    def _start_thumb_worker(self, media: MediaItem, key: str = ""):
         if media.media_type == "image":
             try:
                 pix = _make_thumbnail(media.path, media.media_type)
                 media.thumbnail = pix
-                card = self._card_map.get(media.path)
+                card = self._card_map.get(key or self._norm_key(media.path))
                 if card:
                     card.set_thumbnail(pix)
                 return
@@ -554,10 +564,11 @@ class MediaLibrary(QWidget):
         worker.start()
 
     def _on_thumb_ready(self, path: str, pix: QPixmap):
-        media = self._item_map.get(path)
+        key = self._norm_key(path)
+        media = self._item_map.get(key)
         if media:
             media.thumbnail = pix
-        card = self._card_map.get(path)
+        card = self._card_map.get(key)
         if card:
             card.set_thumbnail(pix)
 
@@ -611,14 +622,15 @@ class MediaLibrary(QWidget):
 
     # ─── 轨道状态角标 ───
     def mark_on_track(self, path: str, on_track: bool):
-        card = self._card_map.get(path)
+        card = self._card_map.get(self._norm_key(path))
         if card:
             card.set_on_track(on_track)
 
     def refresh_statuses(self, on_track_paths: set):
         """批量刷新所有卡片的轨道状态角标"""
-        for path, card in self._card_map.items():
-            card.set_on_track(path in on_track_paths)
+        normal_on_track = {self._norm_key(p) for p in on_track_paths}
+        for key, card in self._card_map.items():
+            card.set_on_track(key in normal_on_track)
 
     def get_paths(self) -> list:
         return [item.path for item in self._items]

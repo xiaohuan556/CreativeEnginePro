@@ -1,0 +1,13 @@
+# 热点雷达
+__pycache__/
+*.pyc
+.env
+.DS_Store
+*.spec
+dist/
+build/
+.workbuddy/
+meme_cache.json
+hotspot_cache.json
+hotspot_config.json
+__pycache__/

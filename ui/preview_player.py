@@ -591,6 +591,7 @@ class PreviewPlayer(QWidget):
         self._rotation_center_xy = (0, 0)
         self._sub_interaction = None
         self._last_frame_image = None
+        self._last_frame_no_subs = None  # 无字幕合成帧缓存（视频+背景+叠加轨，供字幕重绘避免残影）
         self._last_raw_img = None
         self._last_raw_overlays = []
         self._profile = False  # 调试开关（已关闭）
@@ -736,11 +737,14 @@ class PreviewPlayer(QWidget):
                  or self._screen.width() or 320, 320)
         ch = max(getattr(self, '_canvas_h', 0)
                  or self._screen.height() or 180, 180)
-        img = self._alloc_canvas(cw, ch)
-        painter = QPainter(img)
-        # 文字颜色按背景亮度自适应
+        # 不用 _alloc_canvas 缓存——其返回的 QImage 可能残留上次渲染的剪辑画面像素。
+        # 必须新建 QImage 并 fill 背景色，确保画面干净（尤其是删除片段后立即调用时）。
         bg = getattr(self, '_canvas_bg_color', '#000000') or '#000000'
         bg_c = QColor(bg)
+        img = QImage(cw, ch, QImage.Format.Format_ARGB32)
+        img.fill(bg_c)
+        painter = QPainter(img)
+        # 文字颜色按背景亮度自适应
         text_lum = bg_c.red() * 0.299 + bg_c.green() * 0.587 + bg_c.blue() * 0.114
         text_col = QColor(
             "#cccccc") if text_lum < 128 else QColor("#333333")
@@ -1191,6 +1195,7 @@ class PreviewPlayer(QWidget):
             self._recompose_overlays()
             return
         self._last_frame_image = None  # 清除帧缓存，确保 seek 后显示正确画面
+        self._last_frame_no_subs = None  # 同步清除无字幕底图，防止 _subtitle_base_canvas 复用过期帧
         self._last_raw_img = None       # 同步清除原始帧缓存
         self._last_raw_overlays = []
         if force:
@@ -1199,6 +1204,25 @@ class PreviewPlayer(QWidget):
             with self._frame_lock:
                 rk = self._ring_key(sec)
                 self._payload_ring.pop(rk, None)
+            # 同时清空所有 _pending_* 态（删除前的过期帧仍驻留在 _pending_raw 中，
+            # _flush_frame 环未命中时会回退到 _pending_raw → 渲染出已删片段的内容）。
+            self._pending_raw = None
+            self._pending_clip = None
+            self._pending_subs = []
+            self._pending_raw_overlays = []
+            self._pending_cleared = False
+            self._pending_raw_is_image = False
+            self._pending_raw_w = 0
+            self._pending_raw_h = 0
+            self._pending_transition = None
+            # 清空 fetch 队列中的过期请求（删除前排队的请求仍会按旧时间线取帧，
+            # 虽时间线已更新所以结果大概率正确，但清掉避免浪费 + 极端竞态）
+            import queue as _qmod
+            while True:
+                try:
+                    self._fetch_queue.get_nowait()
+                except _qmod.Empty:
+                    break
         if self._preview_active:
             self.stop_preview()
         m = int(sec // 60)
@@ -2244,6 +2268,24 @@ class PreviewPlayer(QWidget):
             painter.setBrush(QBrush(QColor("#1a1a2e")))
             painter.drawEllipse(QPoint(rcx, rcy), 6, 6)
 
+    def _subtitle_base_canvas(self, cw: int, ch: int):
+        """返回不含任何字幕的干净底图（视频+背景+叠加轨），供字幕重绘，避免旧字幕残影。
+
+        优先级：
+          1. 「无字幕合成帧」缓存 _last_frame_no_subs（与主合成帧完全对齐，最干净）；
+          2. 用原始帧重新合成 _compose_from_raw（同样不含字幕，零残留）；
+          3. 纯背景色画布兜底（极少触发：尚未产生过合成帧时）。
+        绝不返回已烤入字幕的 _last_frame_image，从根上消除残影。
+        """
+        ns = getattr(self, '_last_frame_no_subs', None)
+        if ns is not None and not ns.isNull() and ns.width() == cw and ns.height() == ch:
+            return ns.copy()
+        raw = self._compose_from_raw(cw, ch)
+        if raw is not None and not raw.isNull() and raw.width() == cw and raw.height() == ch:
+            return raw
+        bg = QColor(getattr(self, '_canvas_bg_color', '#000000') or '#000000')
+        return self._alloc_canvas(cw, ch)
+
     def _recompose_overlays(self):
         """同一位置轻量刷新：复用原始帧，仅重新渲染叠加层（字幕/变换），不异步解码、不闪黑。
         用于属性面板 slider 拖拽等场景。"""
@@ -2254,15 +2296,10 @@ class PreviewPlayer(QWidget):
         if cw <= 0 or ch <= 0:
             return
 
-        # 优先从原始帧重新合成（零残留）
-        canvas = self._compose_from_raw(cw, ch)
+        # 优先用「无字幕合成帧」缓存作为底图（零残留，杜绝旧字幕叠加残影）
+        canvas = self._subtitle_base_canvas(cw, ch)
         if canvas is None or canvas.isNull():
-            # 回退：复用缓存帧
-            last_img = getattr(self, '_last_frame_image', None)
-            if last_img is not None and not last_img.isNull() and last_img.width() == cw and last_img.height() == ch:
-                canvas = last_img.copy()
-            else:
-                return
+            return
 
         # ── 收集当前活跃字幕（主线程，使用已更新的数据模型）──
         skip = self._editing_sub or self._selected_sub
@@ -2305,8 +2342,67 @@ class PreviewPlayer(QWidget):
 
         self._screen.setPixmap(QPixmap.fromImage(canvas))
 
+    def _clip_in_timeline(self, clip) -> bool:
+        """判断 clip 是否仍存在于任意轨道（用于删除后清除残留选中态）"""
+        if clip is None:
+            return False
+        try:
+            for track in self.tl.video_tracks:
+                if clip in track:
+                    return True
+            for track in self.tl.audio_tracks:
+                if clip in track:
+                    return True
+            for track in self.tl.subtitle_tracks:
+                if clip in track:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def clear_video_selection(self):
+        """删除片段/轨道后调用：清除画布上的选中/拖拽/编辑态并强制重渲染。
+
+        防止已删除的 clip 仍被 _selected_video_clip 引用，导致画布上残留
+        选中框/把手。同时立即把屏幕刷成占位画布（不等异步管线），杜绝
+        旧 pixmap 残留（"删除轨道后画面去不掉"的根因之二）。"""
+        self._selected_video_clip = None
+        self._selected_sub = None
+        self._dragging_video = None
+        self._resize_handle = None
+        self._rotation_active = False
+        self._sub_interaction = None
+        self._editing_sub = None
+        self._seq_state = None
+        try:
+            self.seek(self._current_sec, force=True)
+        except Exception:
+            pass
+        # 立即清除屏幕残留 Pixmap：不等异步管线，直接刷占位画布。
+        # seek(force=True) 已清掉 _last_frame_image / _last_raw_img / _pending_raw，
+        # 在此时间窗口内 _flush_frame 的 need_frame=False → 旧 pixmap 挂在 _screen 上不动。
+        # 这里同步设占位画布，确保屏幕立刻清干净。
+        try:
+            self._show_placeholder()
+        except Exception:
+            pass
+
     def _flush_frame(self, force: bool = False):
         """主线程：把后台线程准备好的帧合成到画布上再渲染"""
+        # 防御：删除片段/轨道后，_selected_video_clip 可能仍引用已删除对象
+        # （例如 selection_changed 未及时触发），导致画布上残留选中框/把手。
+        # 这里统一校验：clip 不在时间线则清除其全部选中/拖拽态，避免残留。
+        if (self._selected_video_clip is not None
+                and not self._clip_in_timeline(self._selected_video_clip)):
+            self._selected_video_clip = None
+            self._dragging_video = None
+            self._resize_handle = None
+            self._rotation_active = False
+        if (self._selected_sub is not None
+                and not self._clip_in_timeline(self._selected_sub)):
+            self._selected_sub = None
+            self._sub_interaction = None
+            self._editing_sub = None
         if self._perf.enabled:
             self._perf_t = time.perf_counter()
             self._perf_scale_acc = 0.0
@@ -2331,7 +2427,16 @@ class PreviewPlayer(QWidget):
                       or self._pending_cleared or _has_ring)
 
         # ── 快速路径：交互期间复用缓存帧，不消耗异步帧池，零闪烁 ──
-        if force and (self._sub_interaction is not None or self._selected_video_clip is not None):
+        # 关键修复：主轨带关键帧时「二次拖动闪烁/跳跃」的根因。
+        # 拖拽/缩放/旋转过程中，8ms 定时器也会调用 _flush_frame()（无 force）。
+        # 若此时 _pending_raw/环帧可用 → need_frame=True → 落入下方「完整合成」路径，
+        # 主视频会按关键帧插值位置渲染，与拖拽实时位置互相打架 → 来回跳变。
+        # 首次拖动之所以不显是因为当时尚无关键帧（插值返回基值==拖拽值）。
+        # 故只要处于交互态，即便无 force 也优先走快速路径：
+        #   _compose_from_raw 对正在交互的片段跳过关键帧插值，用真实拖拽基值，画面跟手不跳。
+        if (force or self._sub_interaction is not None or self._dragging_video is not None
+                or self._resize_handle is not None or self._rotation_active) and \
+           (self._sub_interaction is not None or self._selected_video_clip is not None):
             try:
                 cw = getattr(self, '_canvas_w', 0) or (
                     self._screen.width() if self._screen else 640)
@@ -2339,14 +2444,20 @@ class PreviewPlayer(QWidget):
                     self._screen.height() if self._screen else 360)
                 if cw <= 0 or ch <= 0:
                     return
-                last_img = getattr(self, '_last_frame_image', None)
-                if last_img is not None and not last_img.isNull() and last_img.width() == cw and last_img.height() == ch:
-                    canvas = last_img.copy()
-                else:
-                    canvas = self._alloc_canvas(cw, ch)
+                # 字幕交互快速路径：用「无字幕合成帧」作为干净底图，
+                # 杜绝复用已烤入旧字幕的 _last_frame_image 造成的残影。
+                # 视频选中分支(line 2499 附近)会再次覆盖 canvas，故此处改动不影响视频选中。
+                canvas = self._subtitle_base_canvas(cw, ch)
+                if canvas is None or canvas.isNull():
+                    return
 
                 if self._sub_interaction is not None and self._selected_sub is not None:
-                    # 字幕拖拽/缩放：复用缓存帧 + 绘制新位置文字 + 选中框
+                    # 字幕拖拽/缩放：在干净底图上绘制新位置文字 + 选中框。
+                    # 先重绘其它活跃字幕（保持可见），再绘当前选中字幕，避免旧位置残影。
+                    _others = [s for s in getattr(self, '_last_active_subs', [])
+                               if s is not self._selected_sub]
+                    if _others:
+                        self._overlay_subtitles(canvas, _others, cw, ch)
                     sel_block = self._selected_sub
                     sel_text = getattr(sel_block, 'text', '') or ''
                     if sel_text.strip():
@@ -2361,8 +2472,45 @@ class PreviewPlayer(QWidget):
                     if self._dragging_video is not None or self._resize_handle is not None or self._rotation_active:
                         canvas = self._compose_from_raw(cw, ch)
                         if canvas is None:
-                            # 无原始帧缓存 → 用 _alloc_canvas 准备的画布（纯色/虚化背景）
-                            canvas = self._alloc_canvas(cw, ch)
+                            # 无原始帧缓存（_last_raw_img 尚未产出）。用最后一帧完整合成图
+                            # 作为底图兜底，而不是空白画布。同时把被拖拽片段的帧从 pending 覆盖层
+                            # 中取出叠到底图上，确保拖拽时片段画面跟手移动（而不是"只有边框动"）。
+                            if last_img is not None and not last_img.isNull() and last_img.width() == cw and last_img.height() == ch:
+                                canvas = last_img.copy()
+                            else:
+                                canvas = self._alloc_canvas(cw, ch)
+                            # 尝试从 pending 叠加轨数据中取出被拖拽片段的帧，叠到底图上
+                            ov_src = self._pending_raw_overlays or getattr(self, '_last_raw_overlays', [])
+                            if ov_src and self._dragging_video is not None:
+                                ov_painter = QPainter(canvas)
+                                ov_painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                                for ov_entry in ov_src:
+                                    ov_clip = ov_entry[0] if isinstance(ov_entry, tuple) else None
+                                    if ov_clip is None or ov_clip is not self._dragging_video:
+                                        continue
+                                    ov_data = ov_entry[1] if len(ov_entry) > 1 else None
+                                    ov_img = None
+                                    if isinstance(ov_data, tuple) and len(ov_data) == 2:
+                                        if ov_data[0] == "image" and os.path.exists(ov_data[1]):
+                                            ov_img = self._qimage_from_path(ov_data[1])
+                                        elif ov_data[0] == "video" and isinstance(ov_data[1], np.ndarray):
+                                            ov_img = self._numpy_to_qimage(ov_data[1])
+                                    if ov_img is not None and not ov_img.isNull():
+                                        ov_iw, ov_ih = self._cache_src_size(ov_clip.source_path) or (ov_img.width(), ov_img.height())
+                                        if ov_iw > 0 and ov_ih > 0:
+                                            ov_s = getattr(ov_clip, 'scale', 1.0) or 1.0
+                                            ov_px = getattr(ov_clip, 'pos_x', 0.0) or 0.0
+                                            ov_py = getattr(ov_clip, 'pos_y', 0.0) or 0.0
+                                            ov_base = min(cw / ov_iw, ch / ov_ih)
+                                            ov_ts = ov_base * ov_s
+                                            ov_nw = max(1, int(ov_iw * ov_ts))
+                                            ov_nh = max(1, int(ov_ih * ov_ts))
+                                            ov_img = ov_img.scaled(ov_nw, ov_nh, Qt.AspectRatioMode.IgnoreAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                                            ov_ox = (cw - ov_img.width()) // 2 + int(ov_px)
+                                            ov_oy = (ch - ov_img.height()) // 2 + int(ov_py)
+                                            ov_painter.drawImage(ov_ox, ov_oy, ov_img)
+                                            break
+                                ov_painter.end()
                     else:
                         if last_img is not None and not last_img.isNull() and last_img.width() == cw and last_img.height() == ch:
                             canvas = last_img.copy()
@@ -2456,11 +2604,16 @@ class PreviewPlayer(QWidget):
                 self._screen.height() if self._screen else 360)
             if cw <= 0 or ch <= 0:
                 return
-            last_img = getattr(self, '_last_frame_image', None)
-            if last_img is not None and not last_img.isNull() and last_img.width() == cw and last_img.height() == ch:
-                canvas = last_img.copy()
+            # 用「无字幕合成帧」作为干净底图重绘编辑层/选中框，从根上消除旧字幕残影
+            canvas = self._subtitle_base_canvas(cw, ch)
+            if canvas is not None and not canvas.isNull():
                 # 重新叠编辑层/选中框
                 if self._selected_sub is not None and self._editing_sub is None:
+                    # 先重绘其它活跃字幕（保持可见），再绘选中字幕 + 选中框
+                    _others = [s for s in getattr(self, '_last_active_subs', [])
+                               if s is not self._selected_sub]
+                    if _others:
+                        self._overlay_subtitles(canvas, _others, cw, ch)
                     sel_block = self._selected_sub
                     sel_text = getattr(sel_block, 'text', '') or ''
                     if sel_text.strip():
@@ -2718,18 +2871,14 @@ class PreviewPlayer(QWidget):
                     py = getattr(clip, 'pos_y', 0.0) or 0.0
                     rot = getattr(clip, 'rotation', 0.0) or 0.0
                     blur = getattr(clip, 'blur_radius', 0.0) or 0.0
-                    kf = getattr(clip, 'keyframes', None) or {}
-                    if kf:
-                        rel_t = self._current_sec - clip.timeline_start
-                        base = {"scale": s, "pos_x": px, "pos_y": py,
-                            "rotation": rot, "blur_radius": blur}
-                        from core.edit_engine import interpolate_keyframes
-                        vals = interpolate_keyframes(clip, kf, rel_t, base)
-                        s = vals["scale"]
-                        px = vals["pos_x"]
-                        py = vals["pos_y"]
-                        rot = vals["rotation"]
-                        blur = vals["blur_radius"]
+                    vals = self._interpolate_clip_transform(clip, {
+                        "scale": s, "pos_x": px, "pos_y": py,
+                        "rotation": rot, "blur_radius": blur})
+                    s = vals["scale"]
+                    px = vals["pos_x"]
+                    py = vals["pos_y"]
+                    rot = vals["rotation"]
+                    blur = vals["blur_radius"]
 
                 fit_w = cw / iw
                 fit_h = ch / ih
@@ -2792,6 +2941,15 @@ class PreviewPlayer(QWidget):
                         ov_py = getattr(ov_clip, 'pos_y', 0.0) or 0.0
                         ov_rot = getattr(ov_clip, 'rotation', 0.0) or 0.0
                         ov_blur = getattr(ov_clip, 'blur_radius', 0.0) or 0.0
+                        # 拖拽时跳过关键帧插值——拖拽直接修改 pos_x/pos_y 基值，
+                        # 若关键帧插值覆盖基值则画面被锁住（只有边框动）。
+                        if ov_clip is not getattr(self, '_dragging_video', None):
+                            ov_vals = self._interpolate_clip_transform(ov_clip, {
+                                "scale": ov_s, "pos_x": ov_px, "pos_y": ov_py,
+                                "rotation": ov_rot, "blur_radius": ov_blur})
+                            ov_s = ov_vals["scale"]
+                            ov_px = ov_vals["pos_x"]; ov_py = ov_vals["pos_y"]
+                            ov_rot = ov_vals["rotation"]; ov_blur = ov_vals["blur_radius"]
                         ov_base = min(cw / ov_iw, ch / ov_ih)
                         ov_ts = ov_base * ov_s
                         ov_nw = max(1, int(ov_iw * ov_ts))
@@ -2856,6 +3014,9 @@ class PreviewPlayer(QWidget):
 
             # ── 字幕渲染（画布尺寸下，避免视频缩放导致字号不一致）──
             # active_subs 已由后台线程收集（排除了 editing/selected 字幕）
+            # 先缓存「无字幕合成帧」：视频+背景+叠加轨，不含任何字幕，
+            # 供字幕编辑/拖拽/变换时作为干净底图重绘，从根上消除残影。
+            self._last_frame_no_subs = canvas.copy()
             _ts = time.perf_counter() if self._perf.enabled else 0
             if active_subs:
                 self._overlay_subtitles(canvas, active_subs, cw, ch)
@@ -2898,6 +3059,11 @@ class PreviewPlayer(QWidget):
 
         else:
             # ── 无视频帧：黑底渲染编辑框或选中框 ──
+            # 同时清空帧缓存，防止快速路径复用旧合成图（含已删片段帧）造成残留
+            self._last_frame_image = None
+            self._last_frame_no_subs = None
+            self._last_raw_img = None
+            self._last_raw_overlays = []
             if self._editing_sub is not None:
                 sel_canvas = self._alloc_canvas(cw, ch)
                 sp = QPainter(sel_canvas)
@@ -3067,7 +3233,10 @@ class PreviewPlayer(QWidget):
             rot = getattr(b, 'rotation', 0.0) or 0.0
             sc = getattr(b, 'scale', 1.0) or 1.0
             kf_applied = False
-            if _HAS_KF and kf:
+            # 拖拽/缩放/旋转字幕时跳过关键帧插值，直接用拖拽写入的基值，
+            # 否则插值会把位置弹回关键帧值 → 字幕不跟手 / 释放后跳回（与视频拖拽修复一致）。
+            _skip_kf = (b is self._selected_sub and self._sub_interaction is not None)
+            if _HAS_KF and kf and not _skip_kf:
                 try:
                     rel_t = sec - b.timeline_start
                     base = {"pos_x": px, "pos_y": py,
@@ -3106,7 +3275,7 @@ class PreviewPlayer(QWidget):
             painter.save()
             if _op < 1.0:
                 painter.setOpacity(_op)
-            if word_anim and from_asr and not has_fill and text.strip():
+            if word_anim and not has_fill and text.strip():
                 self._draw_subtitle_word_anim(painter, b, text, sec, cx, cy, img_w, img_h,
                                               fs, fc, family, bold, italic, underline,
                                               ow, oc, word_anim_dur, word_timings, letter_sp, line_sp)
@@ -3344,13 +3513,11 @@ class PreviewPlayer(QWidget):
                 py = getattr(clip, 'pos_y', 0.0) or 0.0
                 rot = getattr(clip, 'rotation', 0.0) or 0.0
                 blur = getattr(clip, 'blur_radius', 0.0) or 0.0
-                kf = getattr(clip, 'keyframes', None) or {}
-                if kf and clip.timeline_start is not None:
-                    rel_t = (self._current_sec or 0.0) - clip.timeline_start
-                    base_vals = {"scale": s, "pos_x": px, "pos_y": py,
-                        "rotation": rot, "blur_radius": blur}
-                    from core.edit_engine import interpolate_keyframes
-                    vals = interpolate_keyframes(clip, kf, rel_t, base_vals)
+                # 拖拽主轨时跳过关键帧插值，与叠加轨同理
+                if clip is not getattr(self, '_dragging_video', None):
+                    vals = self._interpolate_clip_transform(clip, {
+                        "scale": s, "pos_x": px, "pos_y": py,
+                        "rotation": rot, "blur_radius": blur})
                     s = vals["scale"]
                     px = vals["pos_x"]; py = vals["pos_y"]; rot = vals["rotation"]; blur = vals["blur_radius"]
                 total_s = base_s * s
@@ -3413,6 +3580,15 @@ class PreviewPlayer(QWidget):
                         ov_py = getattr(ov_clip, 'pos_y', 0.0) or 0.0
                         ov_rot = getattr(ov_clip, 'rotation', 0.0) or 0.0
                         ov_blur = getattr(ov_clip, 'blur_radius', 0.0) or 0.0
+                        # 拖拽时跳过关键帧插值——拖拽直接修改 pos_x/pos_y 基值，
+                        # 若关键帧插值覆盖基值则画面被锁住（只有边框动）。
+                        if ov_clip is not getattr(self, '_dragging_video', None):
+                            ov_vals = self._interpolate_clip_transform(ov_clip, {
+                                "scale": ov_s, "pos_x": ov_px, "pos_y": ov_py,
+                                "rotation": ov_rot, "blur_radius": ov_blur})
+                            ov_s = ov_vals["scale"]
+                            ov_px = ov_vals["pos_x"]; ov_py = ov_vals["pos_y"]
+                            ov_rot = ov_vals["rotation"]; ov_blur = ov_vals["blur_radius"]
                         ov_base = min(cw / ov_iw, ch / ov_ih)
                         ov_ts = ov_base * ov_s
                         ov_nw = max(1, int(ov_iw * ov_ts))
@@ -3647,6 +3823,7 @@ class PreviewPlayer(QWidget):
         # 清掉帧缓存，确保换色后重新合成/重绘画布：
         # 空时间线也会按新背景色刷新，不会因复用 _last_frame_image 而背景色不变
         self._last_frame_image = None
+        self._last_frame_no_subs = None
         self._last_raw_img = None
         self._last_raw_overlays = []
         self._async_fetch(self._current_sec)
@@ -3764,16 +3941,61 @@ class PreviewPlayer(QWidget):
                 self._on_screen_move(event)
             elif event.type() == QEvent.Type.MouseButtonRelease:
                 if self._sub_interaction is not None:
+                    block = self._selected_sub
+                    _sub_mode = self._sub_interaction
+                    if block is not None:
+                        # 同步字幕关键帧（与视频拖拽一致）：当前播放头位置若该属性已有
+                        # 关键帧，则把该关键帧更新为拖拽后的新值，避免释放后插值弹回旧位置。
+                        kfs = getattr(block, 'keyframes', None) or {}
+                        if kfs:
+                            rel_t = max(
+                                0.0, self._current_sec - getattr(block, 'timeline_start', 0.0))
+                            te = getattr(block, 'timeline_end', None)
+                            ts = getattr(block, 'timeline_start', 0.0)
+                            dur = (te - ts) if te else 9999
+                            if _sub_mode == "move":
+                                _synced = ['pos_x', 'pos_y']
+                            elif _sub_mode in ("resize_nw", "resize_ne",
+                                              "resize_sw", "resize_se"):
+                                _synced = ['scale']
+                            else:  # width_left / width_right 也会改 scale
+                                _synced = ['scale']
+                            if 0 <= rel_t <= dur:
+                                for _p in _synced:
+                                    if _p in kfs and kfs[_p]:
+                                        kfs[_p] = [(t, v) for t, v in kfs[_p]
+                                                  if abs(t - rel_t) > 0.05]
+                                        kfs[_p].append(
+                                            (float(rel_t), float(getattr(block, _p, 0.0))))
+                                        kfs[_p].sort(key=lambda x: x[0])
                     self.tl.overlays_changed.emit()
                     self._sub_interaction = None
                 if self._resize_handle is not None or self._dragging_video is not None or self._rotation_active:
-                    # 拖拽/缩放/旋转释放：snap 到边界 + 标记工程脏
-                    if self._dragging_video is not None and self._selected_video_clip is not None:
-                        clip = self._selected_video_clip
-                        snap_x, snap_y = self._snap_video_position(
-                            clip.pos_x, clip.pos_y, getattr(clip, 'scale', 1.0), clip)
-                        clip.pos_x, clip.pos_y = snap_x, snap_y
-                    self.tl.changed.emit()  # 标记工程脏，触发属性面板刷新
+                    # 拖拽/缩放/旋转释放：snap 到边界 + 同步关键帧 + 标记工程脏
+                    clip = self._selected_video_clip
+                    if clip is not None:
+                        synced_props = []
+                        if self._dragging_video is not None:
+                            snap_x, snap_y = self._snap_video_position(
+                                clip.pos_x, clip.pos_y, getattr(clip, 'scale', 1.0), clip)
+                            clip.pos_x, clip.pos_y = snap_x, snap_y
+                            synced_props = ['pos_x', 'pos_y']
+                        elif self._resize_handle is not None:
+                            synced_props = ['scale']
+                        elif self._rotation_active:
+                            synced_props = ['rotation']
+                        if synced_props:
+                            kfs = getattr(clip, 'keyframes', None) or {}
+                            rel_t = max(0.0, self._current_sec - clip.timeline_start)
+                            dur = getattr(clip, 'duration', None) or \
+                                (clip.timeline_end - clip.timeline_start if hasattr(clip, 'timeline_end') else 9999)
+                            if 0 <= rel_t <= dur:
+                                for prop in synced_props:
+                                    if prop in kfs and kfs[prop]:
+                                        kfs[prop] = [(t, v) for t, v in kfs[prop]
+                                                      if abs(t - rel_t) > 0.05]
+                                        kfs[prop].append((float(rel_t), float(getattr(clip, prop, 0.0))))
+                    self.tl.changed.emit()  # 标记工程脏，触发属性面���刷新
                     self._resize_handle = None
                     self._dragging_video = None
                     self._rotation_active = False
@@ -3803,6 +4025,18 @@ class PreviewPlayer(QWidget):
                 if c.timeline_start <= (self._current_sec or 0.0) < c.timeline_start + c.duration:
                     return c
         return None
+
+    def _interpolate_clip_transform(self, clip, base_vals: dict) -> dict:
+        """对 clip 的变换属性做关键帧插值。无关键帧或时间越界时返回 base_vals。"""
+        kf = getattr(clip, 'keyframes', None) or {}
+        if not kf or clip.timeline_start is None:
+            return base_vals
+        rel_t = (self._current_sec or 0.0) - clip.timeline_start
+        try:
+            from core.edit_engine import interpolate_keyframes
+            return interpolate_keyframes(clip, kf, rel_t, base_vals)
+        except Exception:
+            return base_vals
 
     def _get_all_active_clips(self) -> list:
         result = []
@@ -3899,6 +4133,7 @@ class PreviewPlayer(QWidget):
         font.setBold(getattr(block, 'font_bold', False))
         font.setItalic(getattr(block, 'font_italic', False))
         fm = QFontMetrics(font)
+        letter_sp = int(getattr(block, 'letter_spacing', 0) or 0)
         lines = text.split('\n')
         # ── custom_width 实时换行：重算 lines + 框宽以匹配渲染 ──
         cw_custom = getattr(block, 'custom_width', 0) or 0
@@ -3907,7 +4142,14 @@ class PreviewPlayer(QWidget):
             lines = self._wrap_text_pixel(flat, fm, max(1, cw_custom))
             max_w = cw_custom  # 框宽 = 自定义宽度
         else:
-            widths = [fm.horizontalAdvance(ln) for ln in lines]
+            # 框宽必须与渲染一致：字间距会在每个字符间插入 letter_sp，
+            # 故每行宽度 = horizontalAdvance + letter_sp*(字符数-1)，否则选中框不跟随文字宽度。
+            widths = []
+            for ln in lines:
+                if letter_sp > 0 and len(ln) > 1:
+                    widths.append(fm.horizontalAdvance(ln) + letter_sp * (len(ln) - 1))
+                else:
+                    widths.append(fm.horizontalAdvance(ln))
             max_w = max(widths) if widths else 0
         px = getattr(block, 'pos_x', None)
         py = getattr(block, 'pos_y', None)
@@ -4187,7 +4429,6 @@ class PreviewPlayer(QWidget):
                         new_rot = snap
                         break
                 clip.rotation = round(new_rot, 1)
-                self._set_seq_state(None)
                 self._flush_frame(force=True)
             except Exception:
                 self._rotation_active = False
@@ -4248,7 +4489,6 @@ class PreviewPlayer(QWidget):
                 clip.pos_x = new_ox - (cw - new_w) // 2
                 clip.pos_y = new_oy - (ch - new_h) // 2
 
-                self._set_seq_state(None)
                 self._flush_frame(force=True)
             except Exception:
                 import traceback
@@ -4277,7 +4517,6 @@ class PreviewPlayer(QWidget):
             # 拖拽中不 snap（只在 release 时做），避免接近边界/中心时振荡跳动
             self._dragging_video.pos_x = new_x
             self._dragging_video.pos_y = new_y
-            self._set_seq_state(None)
             self._flush_frame(force=True)
             return
 
@@ -5046,6 +5285,7 @@ class PreviewPlayer(QWidget):
         self._preview_last_tick_time = 0.0
         # 恢复画布：清缓存，让 _flush_frame 根据时间线帧重建正确的画布尺寸
         self._last_frame_image = None
+        self._last_frame_no_subs = None
         self._last_raw_img = None
         self._last_raw_overlays = []
         self._seq_state = None

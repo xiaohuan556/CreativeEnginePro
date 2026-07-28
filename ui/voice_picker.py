@@ -143,11 +143,18 @@ def _batch_translate_titles(titles: list) -> dict:
     return result
 
 def _fetch_fish_voices() -> list:
+    """拉取 Fish Audio 模型列表。
+
+    注意：必须用模型唯一 ID（_id）去重，不能按 title 去重。
+    Fish Audio 上存在大量显示名相同的模型（克隆/默认名），
+    按 title 去重会导致 all_v 增长极慢、翻页无穷无尽，表现为“一直加载不显示”。
+    """
     import urllib.request, json, os
     key = os.getenv("FISH_AUDIO_KEY","") or os.getenv("BAIDU_TTS_KEY","")
     if not key: raise ValueError("未设置 Fish Audio Key")
-    all_v = []; seen = set(); page = 0
-    while len(all_v) < 30:
+    all_v = []; seen_ids = set(); page = 0
+    MAX_PAGES = 5  # 安全上限，防止接口异常时死循环
+    while len(all_v) < 30 and page < MAX_PAGES:
         url = f"https://api.fish.audio/model?page={page}&page_size=30"
         req = urllib.request.Request(url, headers={"Authorization":f"Bearer {key}","Accept":"application/json"})
         with urllib.request.urlopen(req, timeout=8) as resp:
@@ -157,17 +164,16 @@ def _fetch_fish_voices() -> list:
         for v in items:
             if v.get("type")!="tts": continue
             vid = v.get("_id","")
+            if not vid or vid in seen_ids: continue
+            seen_ids.add(vid)
             title = v.get("title","")
-            key_dedup = title.lower().strip()
-            if key_dedup in seen: continue
-            seen.add(key_dedup)
             ls = v.get("languages",[])
             if isinstance(ls,str): ls=[ls]
             desc = v.get("description","")
             all_v.append({"voice_id":vid,"name":title,"name_orig":title,"labels":{"language":ls,"description":desc},"preview_url":"","category":v.get("type","")})
         page += 1
         if len(items)<30: break
-    return all_v
+    return all_v[:30]
 
 
 VOICE_ZH_MAP = {

@@ -19,10 +19,11 @@ from PyQt6.QtWidgets import (
     QGroupBox, QLineEdit, QComboBox, QFileDialog, QSlider,
     QSpinBox, QMessageBox, QProgressBar, QSizePolicy,
     QScrollArea, QGridLayout, QFrame, QTextEdit, QListWidget,
-    QListWidgetItem, QAbstractItemView, QSplitter
+    QListWidgetItem, QAbstractItemView, QSplitter,
+    QMenu
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QSize
-from PyQt6.QtGui import QPixmap, QImage, QColor, QIcon
+from PyQt6.QtGui import QPixmap, QImage, QColor, QIcon, QAction
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 
 from core.slideshow_engine import (
@@ -347,6 +348,8 @@ class SlideshowHandler:
         self.ss_image_list = QListWidget()
         self.ss_image_list.itemSelectionChanged.connect(self._ss_on_selection_changed)
         self.ss_image_list.itemDoubleClicked.connect(self._ss_preview_image)
+        self.ss_image_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.ss_image_list.customContextMenuRequested.connect(self._ss_list_context_menu)
         self.ss_image_list.setViewMode(QListWidget.ViewMode.IconMode)
         self.ss_image_list.setIconSize(QSize(120, 90))
         self.ss_image_list.setResizeMode(QListWidget.ResizeMode.Fixed)
@@ -914,8 +917,23 @@ class SlideshowHandler:
         cur_pos = img_paths.index(path) if path in img_paths else 0
         self._ss_show_overlay(cur_pos, img_paths, total)
 
+    def _ss_close_preview(self):
+        """关闭所有仍打开的图片预览覆盖层（保证同一时刻只有一个）"""
+        dlgs = getattr(self, '_ss_preview_dlgs', None)
+        if not dlgs:
+            return
+        for d in dlgs:
+            try:
+                if d.isVisible():
+                    d.close()
+            except Exception:
+                pass
+        self._ss_preview_dlgs = []
+
     def _ss_show_overlay(self, pos: int, paths: list, total: int):
         """显示预览覆盖层，pos=当前索引，paths=所有图片路径"""
+        # 先关掉上一个预览，避免双击多个后层层叠加、需要逐个关闭
+        self._ss_close_preview()
         try:
             path = paths[pos]
             pix = QPixmap(path)
@@ -934,10 +952,22 @@ class SlideshowHandler:
             screen = self.screen().availableGeometry()
             max_w, max_h = int(screen.width() * 0.88), int(screen.height() * 0.85)
             img_w, img_h = pix.width(), pix.height()
+            # 小图保持原始 1:1 像素尺寸，大图才等比缩小（不拉伸、不放大）
             scale = min((max_w - 24) / img_w, (max_h - 60) / img_h, 1.0)
-            scaled_w = max(1, int(img_w * scale))
-            scaled_h = max(1, int(img_h * scale))
+            if scale >= 1.0:
+                scaled = pix
+                scaled_w, scaled_h = img_w, img_h
+            else:
+                scaled_w = max(1, int(img_w * scale))
+                scaled_h = max(1, int(img_h * scale))
+                scaled = pix.scaled(
+                    scaled_w, scaled_h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation)
             win_w, win_h = scaled_w + 24, scaled_h + 60
+            # 多图时预留左右导航按钮(各 36px)的横向空间，避免布局被挤压导致图片错位
+            if total > 1:
+                win_w += 72
 
             dlg = QWidget(self, Qt.WindowType.Dialog | Qt.WindowType.FramelessWindowHint)
             dlg.setWindowTitle(Path(path).name)
@@ -958,34 +988,39 @@ class SlideshowHandler:
             top_bar.addStretch()
             lbl_pos = QLabel(f"{pos + 1} / {total}", styleSheet="color:#555;font-size:12px;")
             top_bar.addWidget(lbl_pos)
-            btn_close = QPushButton("✕")
+            btn_close = QPushButton("X")
             btn_close.setFixedSize(28, 28)
-            btn_close.setStyleSheet("QPushButton{background:#2a2a2a;color:#999;border:none;border-radius:4px;font-size:16px;}QPushButton:hover{background:#555;}")
+            btn_close.setStyleSheet("QPushButton{background:#2a2a2a;color:#999;border:none;border-radius:4px;font-size:14px;font-weight:bold;}QPushButton:hover{background:#555;}")
             btn_close.clicked.connect(dlg.close)
             top_bar.addWidget(btn_close)
             root_lay.addLayout(top_bar)
 
-            # 图片 + 方向箭头
-            body = QHBoxLayout()
+            # 图片 + 方向箭头：用 QGridLayout + 列拉伸，保证图片始终水平居中，
+            # 不受 prev/next 按钮（pos==0 时 prev 隐藏）影响，避免双击后图片错位
+            body = QGridLayout()
+            body.setContentsMargins(0, 0, 0, 0)
             body.setSpacing(0)
+            body.setColumnStretch(0, 1)   # 左列（prev 所在）可拉伸
+            body.setColumnStretch(1, 0)   # 中列（图片）自适应
+            body.setColumnStretch(2, 1)   # 右列（next 所在）可拉伸
 
             btn_prev = QPushButton("◀")
             btn_prev.setFixedSize(36, 36)
             btn_prev.setStyleSheet("QPushButton{background:transparent;color:#555;border:none;font-size:18px;}QPushButton:hover{color:#aaa;}")
             btn_prev.setVisible(pos > 0)
-            body.addWidget(btn_prev)
+            body.addWidget(btn_prev, 0, 0, alignment=Qt.AlignmentFlag.AlignLeft)
 
             lbl_img = QLabel()
             lbl_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            scaled = pix.scaled(scaled_w, scaled_h, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+            lbl_img.setFixedSize(scaled_w, scaled_h)
             lbl_img.setPixmap(scaled)
-            body.addWidget(lbl_img)
+            body.addWidget(lbl_img, 0, 1, alignment=Qt.AlignmentFlag.AlignCenter)
 
             btn_next = QPushButton("▶")
             btn_next.setFixedSize(36, 36)
             btn_next.setStyleSheet("QPushButton{background:transparent;color:#555;border:none;font-size:18px;}QPushButton:hover{color:#aaa;}")
             btn_next.setVisible(pos < total - 1)
-            body.addWidget(btn_next)
+            body.addWidget(btn_next, 0, 2, alignment=Qt.AlignmentFlag.AlignRight)
             root_lay.addLayout(body)
 
             dlg.move(screen.x() + (screen.width() - win_w) // 2,
@@ -999,18 +1034,22 @@ class SlideshowHandler:
             btn_prev.clicked.connect(lambda: go_to(pos - 1))
             btn_next.clicked.connect(lambda: go_to(pos + 1))
 
-            def key_handler(e):
-                from PyQt6.QtGui import QKeyEvent
+            def _on_preview_key(e):
                 if e.key() == Qt.Key.Key_Escape:
                     dlg.close()
                 elif e.key() == Qt.Key.Key_Left:
                     go_to(pos - 1)
                 elif e.key() == Qt.Key.Key_Right:
                     go_to(pos + 1)
-            dlg.keyPressEvent = key_handler
+
+            def _on_preview_img_click(e):
+                if e.button() == Qt.MouseButton.LeftButton:
+                    dlg.close()
+
+            dlg.keyPressEvent = _on_preview_key
             dlg.setFocus()
 
-            lbl_img.mousePressEvent = lambda e: dlg.close() if e.button() == Qt.MouseButton.LeftButton else None
+            lbl_img.mousePressEvent = _on_preview_img_click
             lbl_img.setCursor(Qt.CursorShape.PointingHandCursor)
 
             dlg.show()
@@ -1024,15 +1063,62 @@ class SlideshowHandler:
         except Exception as e:
             QMessageBox.warning(self, "预览失败", str(e))
 
+    def _ss_list_context_menu(self, pos):
+        """图片列表右键菜单：删除选中 / 在文件夹中显示"""
+        item = self.ss_image_list.itemAt(pos)
+        if item is None:
+            return
+        path = getattr(item, 'image_path', None)
+        # 右键时选中该项（若未选中），便于直接删除单张
+        if item not in self.ss_image_list.selectedItems():
+            self.ss_image_list.setCurrentItem(item)
+        sel_items = self.ss_image_list.selectedItems()
+
+        menu = QMenu(self)
+        act_open = QAction("在文件夹中显示", self)
+        act_del = QAction("删除图片", self)
+        menu.addAction(act_open)
+        menu.addAction(act_del)
+
+        if path and Path(path).exists():
+            act_open.triggered.connect(lambda: self._ss_reveal_in_folder(path))
+        else:
+            act_open.setEnabled(False)
+        act_del.triggered.connect(lambda: self._ss_delete_items(sel_items))
+        menu.exec(self.ss_image_list.viewport().mapToGlobal(pos))
+
+    def _ss_reveal_in_folder(self, path: str):
+        """在资源管理器中定位并选中该文件"""
+        p = Path(path)
+        try:
+            if sys.platform.startswith("win"):
+                os.system(f'explorer /select,"{p}"')
+            elif sys.platform == "darwin":
+                os.system(f'open -R "{p}"')
+            else:
+                os.system(f'xdg-open "{p.parent}"')
+        except Exception as e:
+            QMessageBox.warning(self, "操作失败", f"无法打开文件夹:\n{e}")
+
+    def _ss_delete_items(self, items):
+        """删除指定的若干张图片（右键单张或选中的多张）"""
+        if not items:
+            return
+        paths_to_remove = {getattr(it, 'image_path', None) for it in items}
+        paths_to_remove.discard(None)
+        before = len(self._ss_images)
+        self._ss_images = [p for p in self._ss_images if p not in paths_to_remove]
+        if len(self._ss_images) == before:
+            return
+        self._ss_refresh_image_list()
+        self._ss_update_stat()
+        self._ss_save_imagelist()
+
     def _ss_delete_selected(self):
         items = self.ss_image_list.selectedItems()
         if not items:
             return
-        paths_to_remove = {item.image_path for item in items}
-        self._ss_images = [p for p in self._ss_images if p not in paths_to_remove]
-        self._ss_refresh_image_list()
-        self._ss_update_stat()
-        self._ss_save_imagelist()
+        self._ss_delete_items(items)
 
     def _ss_clear_images(self):
         if not self._ss_images:
