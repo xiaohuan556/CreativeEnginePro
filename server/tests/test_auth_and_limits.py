@@ -8,12 +8,13 @@ data_dir = Path(tempfile.mkdtemp(prefix="creative-engine-server-tests-"))
 os.environ["CEP_DATABASE_URL"] = f"sqlite:///{(data_dir / 'test.db').as_posix()}"
 os.environ["CEP_PUBLIC_ORIGIN"] = "http://testserver"
 os.environ["CEP_LOGIN_MAX_FAILURES"] = "3"
+os.environ["CEP_STORAGE_DIR"] = str(data_dir / "media")
 
 from fastapi.testclient import TestClient  # noqa: E402
 
 from creative_server.database import SessionLocal, create_schema  # noqa: E402
 from creative_server.main import app  # noqa: E402
-from creative_server.models import Asset, GenerationTask, ProductionRun, Project, WorkflowRun, UsageLimit, User  # noqa: E402
+from creative_server.models import Asset, GenerationTask, ProductionRun, Project, ServiceHeartbeat, WorkflowRun, UsageLimit, User  # noqa: E402
 from creative_server.security import hash_password  # noqa: E402
 
 
@@ -280,3 +281,31 @@ def test_project_membership_reviewer_and_template_permissions() -> None:
         viewer_csrf = login(viewer, "view.one", "Member-Secure-42!")
         forbidden = viewer.post(f"/api/projects/{project_id}/members", headers={"x-csrf-token": viewer_csrf}, json={"username": "review.one", "role": "editor"})
         assert forbidden.status_code == 403
+
+
+def test_readiness_heartbeat_and_revoked_worker_policy() -> None:
+    seed_admin()
+    with SessionLocal() as db:
+        db.add(ServiceHeartbeat(id="worker:test", service="worker", instance="test:1", detail_json='{"pid":1}'))
+        admin = db.query(User).filter(User.username == "admin").first()
+        db.query(GenerationTask).filter(GenerationTask.status == "queued").update({"status": "completed"})
+        project = Project(owner_id=admin.id, title="撤权队列测试", canvas_json='{"protocol":"creative-engine-canvas","version":1,"nodes":[],"edges":[]}')
+        db.add(project); db.flush()
+        revoked = User(username="revoked.worker", display_name="撤权账号", password_hash=hash_password("Revoked-Secure-42!"), role="producer", status="suspended")
+        db.add(revoked); db.flush()
+        db.add(UsageLimit(user_id=revoked.id, daily_tasks=5, daily_credits=5, concurrent_tasks=1, allow_paid_models=False, allowed_models_json="[]"))
+        task = GenerationTask(project_id=project.id, node_id="voice-revoked", owner_id=revoked.id, kind="text_to_speech", provider="edge_tts", model="", idempotency_key="revoked-worker-policy", status="queued")
+        db.add(task); db.commit(); task_id = task.id
+    with TestClient(app) as client:
+        ready = client.get("/ready")
+        assert ready.status_code == 200 and ready.json()["storage"] == "ok"
+        csrf = login(client, "admin", "Correct-Horse-42!")
+        status_response = client.get("/api/admin/readiness")
+        assert status_response.status_code == 200
+        assert status_response.json()["active_workers"] >= 1
+    from creative_server.worker import claim_task
+    assert claim_task() is None
+    with SessionLocal() as db:
+        stopped = db.get(GenerationTask, task_id)
+        assert stopped.status == "paused"
+        assert stopped.error_code == "policy_revoked"

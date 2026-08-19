@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import tempfile
 from contextlib import asynccontextmanager
 from datetime import timedelta, timezone
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
@@ -16,7 +18,7 @@ from .audit import client_ip, record_audit
 from .config import Settings, get_settings
 from .database import create_schema, get_db
 from .dependencies import current_user, require_admin, require_csrf
-from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, UsageLimit, User, WorkflowRun, WorkflowTemplate
+from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, ServiceHeartbeat, UsageLimit, User, WorkflowRun, WorkflowTemplate
 from .production import handle_command
 from .production_state import STAGES
 from .provider_catalog import available_providers
@@ -75,6 +77,18 @@ app.add_middleware(CORSMiddleware, allow_origins=[settings.public_origin], allow
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok", "service": "creative-engine-control-plane"}
+
+
+@app.get("/ready")
+def readiness(db: Session = Depends(get_db), config: Settings = Depends(get_settings)) -> dict:
+    try:
+        db.execute(select(1))
+        storage = Path(config.storage_dir); storage.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".readiness-", dir=storage, delete=True) as probe:
+            probe.write(b"ok"); probe.flush()
+    except Exception as error:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, f"数据库或媒体存储尚未就绪：{str(error)[:240]}") from error
+    return {"status": "ready", "database": "ok", "storage": "ok"}
 
 
 @app.post("/api/auth/login")
@@ -396,6 +410,22 @@ def admin_usage(user: User = Depends(current_user), db: Session = Depends(get_db
     rows = db.execute(select(User.id, User.username, User.display_name, func.count(GenerationTask.id), func.coalesce(func.sum(GenerationTask.estimated_credits), 0)).join(GenerationTask, GenerationTask.owner_id == User.id).where(GenerationTask.created_at >= day_start).group_by(User.id, User.username, User.display_name).order_by(func.count(GenerationTask.id).desc())).all()
     status_rows = db.execute(select(GenerationTask.status, func.count()).where(GenerationTask.created_at >= day_start).group_by(GenerationTask.status)).all()
     return {"window_hours": 24, "users": [{"id": row[0], "username": row[1], "display_name": row[2], "tasks": row[3], "credits": row[4]} for row in rows], "statuses": {row[0]: row[1] for row in status_rows}}
+
+
+@app.get("/api/admin/readiness")
+def admin_readiness(user: User = Depends(current_user), db: Session = Depends(get_db), config: Settings = Depends(get_settings)) -> dict:
+    if user.role != "admin": raise HTTPException(status.HTTP_403_FORBIDDEN, "只有管理员可以查看系统就绪状态")
+    cutoff = utcnow() - timedelta(seconds=45)
+    workers = db.scalars(select(ServiceHeartbeat).where(ServiceHeartbeat.service == "worker", ServiceHeartbeat.updated_at >= cutoff).order_by(ServiceHeartbeat.updated_at.desc())).all()
+    try:
+        storage = Path(config.storage_dir); storage.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(prefix=".admin-readiness-", dir=storage, delete=True) as probe:
+            probe.write(b"ok"); probe.flush()
+        storage_ok, storage_error = True, ""
+    except Exception as error:
+        storage_ok, storage_error = False, str(error)[:240]
+    provider_names = [item["name"] for item in available_providers()]
+    return {"ready": bool(workers and storage_ok), "database": True, "storage": storage_ok, "storage_error": storage_error, "active_workers": len(workers), "workers": [{"instance": item.instance, "updated_at": item.updated_at.isoformat(), "detail": json.loads(item.detail_json or "{}")} for item in workers], "providers": provider_names}
 
 
 @app.get("/api/admin/audit")

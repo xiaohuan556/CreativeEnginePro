@@ -26,12 +26,15 @@ def get_db() -> Generator[Session, None, None]:
 
 def create_schema() -> None:
     from . import models  # noqa: F401
-    Base.metadata.create_all(engine)
-    # `create_all` intentionally does not alter existing tables. Keep this
-    # compatibility migration tiny and idempotent so upgrades from the first
-    # company preview do not fail when the asset-library flag is introduced.
-    columns = {column["name"] for column in inspect(engine).get_columns("assets")}
-    if "in_library" not in columns:
-        with engine.begin() as connection:
+    # API and worker may start together. Serialize DDL on PostgreSQL so an
+    # upgrade cannot race the same compatibility migration from two processes.
+    with engine.begin() as connection:
+        if connection.dialect.name == "postgresql":
+            connection.execute(text("SELECT pg_advisory_xact_lock(742019381)"))
+        Base.metadata.create_all(bind=connection)
+        # `create_all` intentionally does not alter existing tables. Keep this
+        # compatibility migration tiny and idempotent for the first preview DB.
+        columns = {column["name"] for column in inspect(connection).get_columns("assets")}
+        if "in_library" not in columns:
             connection.execute(text("ALTER TABLE assets ADD COLUMN in_library BOOLEAN NOT NULL DEFAULT FALSE"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_assets_in_library ON assets (in_library)"))

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import socket
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
@@ -10,7 +13,7 @@ from sqlalchemy import select
 
 from .config import get_settings
 from .database import SessionLocal, create_schema
-from .models import Asset, GenerationTask, ProductionRun, User, WorkflowRun
+from .models import Asset, GenerationTask, ProductionRun, ServiceHeartbeat, User, WorkflowRun
 from .storage import import_generated_file, media_kind, resolve_object
 from .request_compiler import compile_request
 from .task_policy import enforce_existing_task_policy
@@ -26,6 +29,17 @@ def _finish_orchestrators(task_id: str, success: bool, error: str = "") -> None:
     from .workflows import on_workflow_task_finished
     on_task_finished(task_id, success, error)
     on_workflow_task_finished(task_id, success, error)
+
+
+def record_heartbeat() -> None:
+    instance = f"{socket.gethostname()}:{os.getpid()}"
+    with SessionLocal.begin() as db:
+        item = db.get(ServiceHeartbeat, f"worker:{instance}")
+        if item:
+            item.updated_at = datetime.now(timezone.utc)
+            item.detail_json = json.dumps({"pid": os.getpid()}, separators=(",", ":"))
+        else:
+            db.add(ServiceHeartbeat(id=f"worker:{instance}", service="worker", instance=instance, detail_json=json.dumps({"pid": os.getpid()}, separators=(",", ":"))))
 
 
 def _desktop_api():
@@ -187,10 +201,19 @@ def execute_task(task_id: str) -> None:
 def main() -> None:
     create_schema(); settings = get_settings()
     print("Creative Engine worker started")
+    last_heartbeat = 0.0
     while True:
-        task_id = claim_task()
-        if task_id: execute_task(task_id)
-        else: time.sleep(settings.worker_poll_seconds)
+        try:
+            if time.monotonic() - last_heartbeat >= 10:
+                record_heartbeat(); last_heartbeat = time.monotonic()
+            task_id = claim_task()
+            if task_id: execute_task(task_id)
+            else: time.sleep(settings.worker_poll_seconds)
+        except KeyboardInterrupt:
+            raise
+        except Exception as error:
+            print(f"Worker loop error: {error}", file=sys.stderr, flush=True)
+            time.sleep(max(1.0, settings.worker_poll_seconds))
 
 
 if __name__ == "__main__":

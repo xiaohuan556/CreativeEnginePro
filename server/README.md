@@ -18,6 +18,8 @@
 
 ## 启动
 
+正式部署优先使用仓库中的 `deploy/compose.yml`，详细步骤见 [DEPLOYMENT.md](./DEPLOYMENT.md)。手工启动方式如下：
+
 1. 复制 `.env.example` 为 `.env`，配置 PostgreSQL、媒体目录和正式 HTTPS 域名。
 2. API 安装 `requirements.txt`；生成工作进程再安装 `requirements-worker.txt`。
 3. 在 `server` 目录执行 `python scripts/create_admin.py` 创建首个管理员。
@@ -26,3 +28,5 @@
 6. 另启一个工作进程：`python -m creative_server.worker`。可按额度和 API 并发增加工作进程，但不要超过供应商限制。
 
 开发环境可暂用默认 SQLite；正式多人环境必须使用 PostgreSQL。任务队列直接持久化在 PostgreSQL，API 只负责校验和入队，工作进程崩溃不会丢失排队任务。任务结束后，服务端会在事务中把状态和媒体结果节点写回画布，再允许用户主动复制到资产库。
+
+`GET /health` 是进程存活检查，`GET /ready` 会实际验证数据库与媒体目录可写。管理员登录后可通过 `/api/admin/readiness` 查看在线 Worker、存储和模型提供方；Worker 每 10 秒写一次心跳。

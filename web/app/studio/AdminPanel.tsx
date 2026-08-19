@@ -11,6 +11,7 @@ type ManagedUser = {
 };
 type UsageRow = { id: string; username: string; display_name: string; tasks: number; credits: number };
 type AuditEvent = { id: string; action: string; target_type: string; target_id: string; ip_address: string; created_at: string };
+type Readiness = { ready: boolean; database: boolean; storage: boolean; active_workers: number; providers: string[]; storage_error?: string };
 
 const roles = [
   ["producer", "制片人"], ["director", "导演"], ["editor", "编辑"],
@@ -25,14 +26,16 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
   const [usage, setUsage] = useState<UsageRow[]>([]);
   const [statuses, setStatuses] = useState<Record<string, number>>({});
   const [events, setEvents] = useState<AuditEvent[]>([]);
+  const [readiness, setReadiness] = useState<Readiness | null>(null);
 
   const load = useCallback(async () => {
     setBusy(true);
     try {
-      const [response, usageResponse, auditResponse] = await Promise.all([
+      const [response, usageResponse, auditResponse, readinessResponse] = await Promise.all([
         apiFetch("/api/admin/users", { cache: "no-store" }),
         apiFetch("/api/admin/usage", { cache: "no-store" }),
         apiFetch("/api/admin/audit?limit=20", { cache: "no-store" }),
+        apiFetch("/api/admin/readiness", { cache: "no-store" }),
       ]);
       const data = await response.json() as { users?: ManagedUser[]; detail?: string };
       if (!response.ok) throw new Error(data.detail || "账号列表读取失败");
@@ -45,6 +48,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
         const payload = await auditResponse.json() as { events?: AuditEvent[] };
         setEvents(payload.events || []);
       }
+      if (readinessResponse.ok) setReadiness(await readinessResponse.json() as Readiness);
     } catch (error) { setMessage(error instanceof Error ? error.message : "账号列表读取失败"); }
     finally { setBusy(false); }
   }, [apiFetch]);
@@ -99,6 +103,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
         <section className="admin-observability">
           <div className="admin-section-title"><Activity size={15} /><span>最近 24 小时使用与安全记录</span></div>
           <div className="usage-cards"><article><strong>{totalTasks}</strong><span>任务总数</span></article><article><strong>{totalCredits}</strong><span>预估额度</span></article><article><strong>{statuses.failed || 0}</strong><span>失败任务</span></article><article><strong>{loginFailures}</strong><span>近期登录失败</span></article></div>
+          <div className={`system-readiness ${readiness?.ready ? "is-ready" : "is-warning"}`}><strong>{readiness?.ready ? "生产服务正常" : "生产服务待检查"}</strong><span>数据库 {readiness?.database ? "正常" : "异常"} · 媒体存储 {readiness?.storage ? "正常" : "异常"} · Worker {readiness?.active_workers ?? 0} 个在线 · 已配置引擎 {readiness?.providers?.join("、") || "无外部引擎"}</span>{readiness?.storage_error && <small>{readiness.storage_error}</small>}</div>
           <div className="usage-detail"><div>{usage.length ? usage.slice(0, 8).map((item) => <span key={item.id}><strong>{item.display_name || item.username}</strong>{item.tasks} 次 · {item.credits} credits</span>) : <span>最近 24 小时暂无模型任务</span>}</div><div>{events.length ? events.slice(0, 8).map((item) => <span key={item.id}><strong>{item.action}</strong>{new Date(item.created_at).toLocaleString("zh-CN")} · {item.ip_address || "内部"}</span>) : <span>暂无审计记录</span>}</div></div>
         </section>
 

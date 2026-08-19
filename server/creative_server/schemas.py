@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 Role = Literal["admin", "producer", "director", "editor", "reviewer", "viewer"]
@@ -64,7 +64,14 @@ class ProjectUpdate(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     title: str | None = Field(None, min_length=1, max_length=200)
     canvas: CanvasDocument
-    expected_version: int = Field(..., ge=1, alias="expectedVersion")
+    expected_version: int = Field(ge=1)
+
+    @model_validator(mode="before")
+    @classmethod
+    def accept_camel_case_version(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "expected_version" not in value and "expectedVersion" in value:
+            value = {**value, "expected_version": value["expectedVersion"]}
+        return value
 
 
 class ProductionRunCreate(BaseModel):

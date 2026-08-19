@@ -13,8 +13,15 @@ nul
 *.zip
 *.7z
 .env
+deploy/.env.production
 server/.venv/
 server/creative_engine_server.db
+server/creative_engine_media/
+server/.smoke_e2e*
+
+# Container build context
+web/node_modules/
+web/.wrangler/
 
 # Local canvas/media state and development diagnostics
 .tmpframes/

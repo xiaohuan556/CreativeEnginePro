@@ -1,0 +1,92 @@
+name: creative-engine
+
+services:
+  postgres:
+    image: postgres:16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: creative_engine
+      POSTGRES_USER: creative_engine
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in deploy/.env.production}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U creative_engine -d creative_engine"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks: [backend]
+
+  api:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    env_file: .env.production
+    environment:
+      CEP_DATABASE_URL: postgresql+psycopg://creative_engine:${POSTGRES_PASSWORD}@postgres:5432/creative_engine
+      CEP_PUBLIC_ORIGIN: https://${STUDIO_DOMAIN}
+      CEP_STORAGE_DIR: /var/lib/creative-engine/media
+    volumes:
+      - media_data:/var/lib/creative-engine/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+  worker:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    restart: unless-stopped
+    command: ["python", "-m", "creative_server.worker"]
+    env_file: .env.production
+    environment:
+      CEP_DATABASE_URL: postgresql+psycopg://creative_engine:${POSTGRES_PASSWORD}@postgres:5432/creative_engine
+      CEP_PUBLIC_ORIGIN: https://${STUDIO_DOMAIN}
+      CEP_STORAGE_DIR: /var/lib/creative-engine/media
+    volumes:
+      - media_data:/var/lib/creative-engine/media
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [backend]
+
+  web:
+    build:
+      context: ../web
+      dockerfile: Dockerfile
+      args:
+        NEXT_PUBLIC_CONTROL_PLANE_URL: /control
+    restart: unless-stopped
+    depends_on:
+      api:
+        condition: service_healthy
+    networks: [backend]
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    environment:
+      STUDIO_DOMAIN: ${STUDIO_DOMAIN:?set STUDIO_DOMAIN in deploy/.env.production}
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      web:
+        condition: service_healthy
+    networks: [backend]
+
+networks:
+  backend:
+
+volumes:
+  postgres_data:
+  media_data:
+  caddy_data:
+  caddy_config:
