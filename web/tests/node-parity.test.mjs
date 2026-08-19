@@ -19,7 +19,7 @@ test("web registry covers every desktop canvas node family and primary workflow"
 
 test("web canvas exposes explicit media roles, safe result adoption, native audio, and synced writes", async () => {
   const canvas = await readFile(canvasPath, "utf8");
-  for (const contract of ["first_frame", "last_frame", "script_candidate", "采用AI候选稿", "generate_audio", "audio_prompt", "compileShotPrompt", "saveCurrentProjectNow", "lastSyncedProjectRef", "node-media"]) {
+  for (const contract of ["first_frame", "last_frame", "script_candidate", "采用AI候选稿", "generate_audio", "audio_prompt", "compileShotPrompt", "saveCurrentProjectNow", "lastSyncedProjectRef", "node-media", "模型版本 / 端点 ID", "planning_model", "video_model"]) {
     assert.match(canvas, new RegExp(contract), `missing canvas contract ${contract}`);
   }
   assert.match(canvas, /selectedAction === "图生视频" \? "image_to_video" : "text_to_video"/);

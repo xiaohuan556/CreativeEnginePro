@@ -148,6 +148,7 @@ class SeedreamProvider(ImageProvider):
         )
         try:
             api_key, model, base = self._creds()
+            model = str(request.params.get("model") or model).strip()
             if not api_key:
                 raise ArkHTTPError("未配置 Ark API Key（请在 .env 设置 SEEDREAM_API_KEY）")
             if not model:
@@ -275,6 +276,7 @@ class GPTImageProvider(ImageProvider):
         )
         try:
             api_key, model, base = self._creds()
+            model = str(request.params.get("model") or model).strip()
             if not api_key:
                 raise ArkHTTPError("未配置 OPENAI_API_KEY")
 

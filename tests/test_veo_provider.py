@@ -172,6 +172,15 @@ class VeoProviderTests(unittest.TestCase):
         self.assertEqual(8, params["durationSeconds"])
         self.assertEqual("flicker, subtitles", params["negativePrompt"])
 
+    def test_paid_submit_uses_the_task_locked_model(self):
+        request = self._request(model="locked-veo-model")
+        patches = self._patches([_done()])
+        with patches[0] as mock_post, patches[1], patches[2], patches[3], patches[4]:
+            handle = self.provider.execute(request)
+
+        self.assertTrue(handle.is_success, handle.result.error if handle.result else "")
+        self.assertIn("/locked-veo-model:predictLongRunning", mock_post.call_args.args[0])
+
     def test_typed_asset_references_use_veo_ingredients(self):
         refs = []
         for index, role in enumerate(("scene", "character", "element", "style")):

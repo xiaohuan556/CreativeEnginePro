@@ -223,6 +223,7 @@ class VeoProvider(VideoProvider):
         operation_log: Path | None = None
         try:
             api_key, model, base = self._creds()
+            model = str(request.params.get("model") or model).strip()
             if not api_key:
                 raise ArkHTTPError("未配置 OPENAI_API_KEY（请在 .env 设置 OPENAI_API_KEY）")
             if not model:
@@ -687,6 +688,7 @@ class SeedanceProvider(VideoProvider):
                        status=TaskStatus.RUNNING)
         try:
             api_key, model, base = self._creds()
+            model = str(request.params.get("model") or model).strip()
             if not api_key:
                 raise ArkHTTPError("未配置豆包共享 Key（请在 .env 设置 SEEDREAM_API_KEY）")
             if not model:

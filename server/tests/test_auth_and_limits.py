@@ -109,7 +109,11 @@ def test_production_pause_resume_and_rewind_do_not_duplicate_active_task() -> No
         project_response = client.post("/api/projects", headers={"x-csrf-token": csrf}, json={"title": "流程测试", "canvas": canvas})
         assert project_response.status_code == 201, project_response.text
         project_id = project_response.json()["project"]["id"]
-        run_response = client.post("/api/production-runs", headers={"x-csrf-token": csrf}, json={"project_id": project_id, "node_id": "storyboard-1", "automation_mode": "checkpoints"})
+        missing_locks = client.post("/api/production-runs", headers={"x-csrf-token": csrf}, json={"project_id": project_id, "node_id": "storyboard-1", "automation_mode": "checkpoints"})
+        assert missing_locks.status_code == 422
+        profiles = [{"name": "openai", "capabilities": ["chat"]}, {"name": "seedream", "capabilities": ["text_to_image"]}, {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"]}]
+        with patch("creative_server.main.available_providers", return_value=profiles):
+            run_response = client.post("/api/production-runs", headers={"x-csrf-token": csrf}, json={"project_id": project_id, "node_id": "storyboard-1", "automation_mode": "checkpoints", "provider_locks": {"planning": "openai", "planning_model": "locked-planning-model", "image": "seedream", "image_model": "locked-image-model", "video": "seedance", "video_model": "locked-video-model"}})
         assert run_response.status_code == 201
         run_id = run_response.json()["run"]["id"]
         with patch("creative_server.production.available_providers", return_value=[{"name": "openai", "capabilities": ["chat"]}]):
@@ -117,6 +121,8 @@ def test_production_pause_resume_and_rewind_do_not_duplicate_active_task() -> No
         assert started.status_code == 200, started.text
         task_id = started.json()["run"]["active_task_id"]
         assert task_id
+        with SessionLocal() as db:
+            assert db.get(GenerationTask, task_id).model == "locked-planning-model"
         paused = client.post(f"/api/production-runs/{run_id}/command", headers={"x-csrf-token": csrf}, json={"command": "pause"})
         assert paused.json()["run"]["status"] == "paused"
         resumed = client.post(f"/api/production-runs/{run_id}/command", headers={"x-csrf-token": csrf}, json={"command": "resume"})
@@ -352,9 +358,23 @@ def test_readiness_heartbeat_and_revoked_worker_policy() -> None:
         ready = client.get("/ready")
         assert ready.status_code == 200 and ready.json()["storage"] == "ok"
         csrf = login(client, "admin", "Correct-Horse-42!")
-        status_response = client.get("/api/admin/readiness")
+        complete_profiles = [
+            {"name": "llm", "capabilities": ["chat"]},
+            {"name": "image", "capabilities": ["text_to_image", "image_edit"]},
+            {"name": "video", "capabilities": ["text_to_video", "image_to_video"]},
+            {"name": "voice", "capabilities": ["text_to_speech"]},
+        ]
+        with patch("creative_server.main.available_providers", return_value=complete_profiles):
+            status_response = client.get("/api/admin/readiness")
         assert status_response.status_code == 200
         assert status_response.json()["active_workers"] >= 1
+        assert status_response.json()["ready"] is True
+        assert status_response.json()["missing_capabilities"] == []
+        with patch("creative_server.main.available_providers", return_value=[{"name": "edge_tts", "capabilities": ["text_to_speech"]}]):
+            incomplete = client.get("/api/admin/readiness").json()
+        assert incomplete["control_ready"] is True
+        assert incomplete["generation_ready"] is False
+        assert "image_to_video" in incomplete["missing_capabilities"]
     from creative_server.worker import claim_task
     assert claim_task() is None
     with SessionLocal() as db:

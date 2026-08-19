@@ -8,7 +8,7 @@ from sqlalchemy.orm import Session
 
 from .models import GenerationTask, ProductionEvent, ProductionRun, Project, User
 from .production_state import STAGES, State, approve, pause, resume, rewind, start, task_finished
-from .provider_catalog import available_providers
+from .provider_catalog import available_providers, resolve_provider_model
 from .task_policy import enforce_task_policy, estimate_task_credits
 
 
@@ -83,15 +83,20 @@ def enqueue_current_stage(db: Session, run: ProductionRun) -> GenerationTask:
     if run.stage in (1, 3, 4): provider = str(locks.get("planning") or provider)
     elif run.stage in (2, 5): provider = str(locks.get("image") or provider)
     elif run.stage == 6: provider = str(locks.get("video") or provider)
+    if run.stage in (1, 3, 4): requested_model = str(locks.get("planning_model") or "")
+    elif run.stage in (2, 5): requested_model = str(locks.get("image_model") or "")
+    elif run.stage == 6: requested_model = str(locks.get("video_model") or "")
+    else: requested_model = ""
+    model = resolve_provider_model(provider, requested_model)
     profile = next((item for item in available_providers() if item["name"] == provider), None)
     if not profile or operation not in profile["capabilities"]:
         raise HTTPException(status.HTTP_409_CONFLICT, f"已锁定引擎 {provider} 当前不可用或不支持 {operation}；流程已停止，不会静默切换")
     credits = estimate_task_credits(operation, provider)
-    enforce_task_policy(db, user, provider, "", credits)
+    enforce_task_policy(db, user, provider, model, credits)
     attempt = (db.scalar(select(func.count()).select_from(GenerationTask).where(GenerationTask.production_run_id == run.id, GenerationTask.production_stage == run.stage)) or 0) + 1
     inputs, params = _stage_inputs(db, run, project)
-    task = GenerationTask(project_id=run.project_id, node_id=run.node_id, owner_id=run.owner_id, production_run_id=run.id, production_stage=run.stage, kind=operation, provider=provider, model="", estimated_credits=credits, idempotency_key=f"production:{run.id}:stage:{run.stage}:attempt:{attempt}", input_json=json.dumps({"inputs": inputs, "params": params, "use_cache": False}, ensure_ascii=False))
-    db.add(task); db.flush(); apply_state(run, start(state_of(run), task.id)); event(db, run, "stage.queued", detail={"task_id": task.id, "stage_name": STAGES[run.stage]})
+    task = GenerationTask(project_id=run.project_id, node_id=run.node_id, owner_id=run.owner_id, production_run_id=run.id, production_stage=run.stage, kind=operation, provider=provider, model=model, estimated_credits=credits, idempotency_key=f"production:{run.id}:stage:{run.stage}:attempt:{attempt}", input_json=json.dumps({"inputs": inputs, "params": params, "use_cache": False}, ensure_ascii=False))
+    db.add(task); db.flush(); apply_state(run, start(state_of(run), task.id)); event(db, run, "stage.queued", detail={"task_id": task.id, "stage_name": STAGES[run.stage], "provider": provider, "model": model})
     return task
 
 

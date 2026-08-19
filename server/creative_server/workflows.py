@@ -10,6 +10,7 @@ from .models import GenerationTask, User, WorkflowRun
 from .schemas import WorkflowRunCreate
 from .task_policy import enforce_existing_task_policy, enforce_task_policy, enforce_workflow_policy, estimate_task_credits
 from .task_validation import validate_task_request
+from .provider_catalog import resolve_provider_model
 
 
 def public_workflow_run(run: WorkflowRun) -> dict:
@@ -34,10 +35,11 @@ def prepare_workflow_items(db: Session, user: User, payload: WorkflowRunCreate) 
     for item in payload.items:
         value = item.model_dump()
         validate_task_request(db, payload.project_id, item.kind, item.provider, item.input)
+        value["model"] = resolve_provider_model(item.provider, item.model)
         credits = estimate_task_credits(item.kind, item.provider)
         value["estimated_credits"] = credits
         prepared.append(value)
-        policy_requests.append((item.provider, item.model, credits))
+        policy_requests.append((item.provider, str(value["model"]), credits))
     enforce_workflow_policy(db, user, policy_requests)
     return prepared, sum(item[2] for item in policy_requests)
 

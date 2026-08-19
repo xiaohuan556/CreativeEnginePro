@@ -21,13 +21,16 @@ from .dependencies import current_user, require_admin, require_csrf
 from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, ServiceHeartbeat, UsageLimit, User, WorkflowRun, WorkflowTemplate
 from .production import handle_command
 from .production_state import STAGES
-from .provider_catalog import available_providers
+from .provider_catalog import available_providers, resolve_provider_model
 from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectMemberCreate, ProjectMemberUpdate, ProjectReviewCreate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate, WorkflowCommand, WorkflowRunCreate, WorkflowTemplateCreate
 from .security import DUMMY_PASSWORD_HASH, expiry, hash_password, opaque_token, token_hash, utcnow, validate_password, validate_username, verify_password
 from .storage import media_kind, resolve_object, save_upload
 from .task_policy import enforce_existing_task_policy, enforce_task_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
 from .task_validation import validate_task_request
 from .workflows import command_workflow, initialize_workflow_tasks, prepare_workflow_items, public_workflow_run
+
+
+REQUIRED_GENERATION_CAPABILITIES = ("chat", "text_to_image", "image_edit", "text_to_video", "image_to_video", "text_to_speech")
 
 
 def _aware(value):
@@ -323,12 +326,23 @@ def save_asset_to_library(asset_id: str, request: Request, user: User = Depends(
 def create_production_run(payload: ProductionRunCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
     require_project_write(db, payload.project_id, user)
     run = db.scalar(select(ProductionRun).where(ProductionRun.project_id == payload.project_id, ProductionRun.node_id == payload.node_id))
+    supplied_locks = payload.provider_locks or (json.loads(run.provider_locks_json or "{}") if run else {})
+    locks = {str(key): str(value or "").strip() for key, value in supplied_locks.items()}
+    required_locks = ("planning", "planning_model", "image", "image_model", "video", "video_model")
+    missing_locks = [key for key in required_locks if not locks.get(key)]
+    if missing_locks:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"开始制片前必须明确锁定引擎和模型：{', '.join(missing_locks)}")
+    profiles = {item["name"]: item for item in available_providers()}
+    for key, capability in (("planning", "chat"), ("image", "text_to_image"), ("video", "text_to_video")):
+        provider = locks[key]
+        if provider not in profiles or capability not in profiles[provider].get("capabilities", []):
+            raise HTTPException(status.HTTP_409_CONFLICT, f"已锁定引擎 {provider} 当前不可用或不支持 {capability}；流程未创建")
     if not run:
-        run = ProductionRun(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, automation_mode=payload.automation_mode, provider_locks_json=json.dumps(payload.provider_locks, ensure_ascii=False))
+        run = ProductionRun(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, automation_mode=payload.automation_mode, provider_locks_json=json.dumps(locks, ensure_ascii=False))
         db.add(run); db.flush(); record_audit(db, request, "production.created", user, "production_run", run.id)
     else:
         run.automation_mode = payload.automation_mode
-        if payload.provider_locks: run.provider_locks_json = json.dumps(payload.provider_locks, ensure_ascii=False)
+        run.provider_locks_json = json.dumps(locks, ensure_ascii=False)
     db.commit(); return {"run": public_run(run)}
 
 
@@ -450,8 +464,27 @@ def admin_readiness(user: User = Depends(current_user), db: Session = Depends(ge
         storage_ok, storage_error = True, ""
     except Exception as error:
         storage_ok, storage_error = False, str(error)[:240]
-    provider_names = [item["name"] for item in available_providers()]
-    return {"ready": bool(workers and storage_ok), "database": True, "storage": storage_ok, "storage_error": storage_error, "active_workers": len(workers), "workers": [{"instance": item.instance, "updated_at": item.updated_at.isoformat(), "detail": json.loads(item.detail_json or "{}")} for item in workers], "providers": provider_names}
+    provider_rows = available_providers()
+    provider_names = [item["name"] for item in provider_rows]
+    capability_providers = {
+        capability: [item["name"] for item in provider_rows if capability in item.get("capabilities", [])]
+        for capability in REQUIRED_GENERATION_CAPABILITIES
+    }
+    missing_capabilities = [capability for capability, names in capability_providers.items() if not names]
+    control_ready = bool(workers and storage_ok)
+    return {
+        "ready": bool(control_ready and not missing_capabilities),
+        "control_ready": control_ready,
+        "generation_ready": not missing_capabilities,
+        "database": True,
+        "storage": storage_ok,
+        "storage_error": storage_error,
+        "active_workers": len(workers),
+        "workers": [{"instance": item.instance, "updated_at": item.updated_at.isoformat(), "detail": json.loads(item.detail_json or "{}")} for item in workers],
+        "providers": provider_names,
+        "capability_providers": capability_providers,
+        "missing_capabilities": missing_capabilities,
+    }
 
 
 @app.get("/api/admin/audit")
@@ -538,15 +571,17 @@ def create_task(payload: TaskCreate, request: Request, user: User = Depends(requ
         return {"task": {"id": existing.id, "status": existing.status, "progress": existing.progress}, "deduplicated": True}
     require_project_write(db, payload.project_id, user)
     validate_task_request(db, payload.project_id, payload.kind, payload.provider, payload.input)
+    resolved_model = resolve_provider_model(payload.provider, payload.model)
     credits = estimate_task_credits(payload.kind, payload.provider, payload.estimated_credits)
-    enforce_task_policy(db, user, payload.provider, payload.model, credits)
-    task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=payload.model, estimated_credits=credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))
+    enforce_task_policy(db, user, payload.provider, resolved_model, credits)
+    task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=resolved_model, estimated_credits=credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))
     db.add(task); record_audit(db, request, "task.queued", user, "task", task.id, {"kind": task.kind, "provider": task.provider, "model": task.model, "credits": task.estimated_credits}); db.commit()
     return {"task": {"id": task.id, "status": task.status, "progress": task.progress}}
 
 
 @app.get("/api/tasks/quote")
 def quote_task(kind: str, provider: str = "", model: str = "", user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    model = resolve_provider_model(provider, model)
     credits = estimate_task_credits(kind, provider)
     enforce_task_policy(db, user, provider, model, credits)
     return {"quote": {"credits": credits, "kind": kind, "provider": provider, "model": model}}

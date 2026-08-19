@@ -63,6 +63,23 @@ python server/scripts/production_smoke.py
 
 脚本会验证：HTTPS API、数据库与媒体存储、Worker 心跳、管理员登录、待批准账号不可登录、项目成员与审片只读权限、媒体真实类型校验、资产库显式复制、工作流模板、两段持久顺序任务、结果写回画布以及强制会话下线。它会保留一个带时间戳的验收项目作为审计证据，并在结束时停用临时审片账号。只检查控制层而暂不调用 Edge TTS 时可设置 `CEP_SMOKE_SKIP_GENERATION=1`。
 
+### 完整模型链路验收（会产生真实模型费用）
+
+控制层冒烟通过后，再显式锁定本次验收使用的三个供应商。脚本不会猜测或静默切换模型，且只有设置付费确认字符串才会执行：
+
+```bash
+export CEP_SMOKE_LLM_PROVIDER="deepseek"
+export CEP_SMOKE_LLM_MODEL="deepseek-chat"
+export CEP_SMOKE_IMAGE_PROVIDER="seedream"
+export CEP_SMOKE_IMAGE_MODEL="seedream-v4"
+export CEP_SMOKE_VIDEO_PROVIDER="seedance"
+export CEP_SMOKE_VIDEO_MODEL="doubao-seedance-2-0-260128"
+export CEP_SMOKE_PAID_CONFIRM="RUN_PAID_PIPELINE"
+python server/scripts/full_model_pipeline_smoke.py
+```
+
+该脚本按顺序真实执行：脚本生成 → 文生图 → 图生图 → 带声音的图生视频 → 尾帧续拍 → AI 拉片 → 配音，并核对每个结果的媒体类型、持久化资产和画布节点写回。它会保留一个带时间戳的“完整模型链路验收”项目作为上线证据。管理员必须先在网页中为验收账号明确开启付费模型、额度和上述供应商白名单；密码和密钥只通过终端环境变量提供，不写入仓库。
+
 ## 备份与告警
 
 - PostgreSQL 每日全量备份，保留 30 天；每小时增量或 WAL 归档。
