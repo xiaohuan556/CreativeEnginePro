@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QLabel, QLineEdit,
     QProgressBar, QFileDialog, QApplication,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
 
 from core.edit_engine import EditTimeline
 
@@ -25,6 +25,9 @@ from core.edit_engine import EditTimeline
 
 class ExportDialog(QDialog):
     """导出设置弹窗"""
+    _SETTINGS_ORG = "CreativeEnginePro"
+    _SETTINGS_APP = "EditorExport"
+
     def __init__(self, parent=None, canvas_size=None, default_name=""):
         """canvas_size: (w, h) 画布像素尺寸，用于预选分辨率
            default_name: 默认文件名（不含扩展名）"""
@@ -44,6 +47,54 @@ class ExportDialog(QDialog):
         self._canvas_size = canvas_size
         self._default_name = default_name
         self._build()
+
+    def _settings(self):
+        return QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+
+    @staticmethod
+    def _safe_output_name(name: str) -> str:
+        import re
+        return re.sub(r'[<>:"/\\|?*]', '_', name.strip() or "output")
+
+    def _restore_settings(self):
+        """恢复上次确认导出时使用的参数和目录。"""
+        settings = self._settings()
+
+        resolution = str(settings.value("resolution", "") or "")
+        if resolution:
+            resolution = resolution.replace("x", "×")
+            idx = self.res_combo.findText(resolution)
+            if idx < 0 and "×" in resolution:
+                self.res_combo.insertItem(0, resolution)
+                idx = 0
+            if idx >= 0:
+                self.res_combo.setCurrentIndex(idx)
+
+        fps = str(settings.value("fps", "") or "")
+        idx = self.fps_combo.findText(fps)
+        if idx >= 0:
+            self.fps_combo.setCurrentIndex(idx)
+
+        try:
+            quality_idx = int(settings.value("quality_index", 0))
+        except (TypeError, ValueError):
+            quality_idx = 0
+        if 0 <= quality_idx < self.quality_combo.count():
+            self.quality_combo.setCurrentIndex(quality_idx)
+
+        last_dir = str(settings.value("last_directory", "") or "")
+        name = self._safe_output_name(self._default_name or "output") + ".mp4"
+        self.path_edit.setText(os.path.join(last_dir, name) if last_dir else name)
+
+    def _save_settings(self, path: str):
+        """仅在用户确认开始导出后保存，取消弹窗不会覆盖上次设置。"""
+        settings = self._settings()
+        settings.setValue("resolution", self.res_combo.currentText())
+        settings.setValue("fps", self.fps_combo.currentText())
+        settings.setValue("quality_index", self.quality_combo.currentIndex())
+        if path:
+            settings.setValue("last_directory", os.path.dirname(os.path.abspath(path)))
+        settings.sync()
 
     def _build(self):
         lay = QVBoxLayout(self)
@@ -85,12 +136,6 @@ class ExportDialog(QDialog):
         # 输出路径
         path_row = QHBoxLayout()
         self.path_edit = QLineEdit()
-        # 默认文件名：项目名.mp4 或 output.mp4
-        name = self._default_name.strip() if self._default_name else "output"
-        # 去除不安全字符
-        import re
-        name = re.sub(r'[<>:"/\\|?*]', '_', name)
-        self.path_edit.setText(f"{name}.mp4")
         self.path_edit.setPlaceholderText("输入文件名或点击浏览选择路径…")
         btn_browse = QPushButton("浏览")
         btn_browse.setStyleSheet("QPushButton{background:#2a2a2a;color:#ccc;border:1px solid #444;"
@@ -99,6 +144,9 @@ class ExportDialog(QDialog):
         path_row.addWidget(self.path_edit, 1)
         path_row.addWidget(btn_browse)
         lay.addLayout(path_row)
+
+        # 控件全部创建后恢复上次参数；文件名仍使用当前工程名。
+        self._restore_settings()
 
         # 进度条
         self._progress = QProgressBar()
@@ -155,6 +203,7 @@ class ExportDialog(QDialog):
         # 确保有 .mp4 扩展名
         if path and not path.lower().endswith(".mp4"):
             path += ".mp4"
+        self._save_settings(path)
         return {"resolution": (W, H), "fps": fps, "crf": crf, "path": path}
 
     def show_progress(self, pct: int, msg: str):

@@ -38,15 +38,15 @@ class MixWorkerThread(QThread):
     def __init__(self, tasks, audio_path, out_dir, rename_tpl,
                  total_duration, target_w, target_h, ffmpeg_path='ffmpeg'):
         super().__init__()
-        self.tasks       = tasks
-        self.audio_path  = audio_path
-        self.out_dir     = out_dir
-        self.rename_tpl  = rename_tpl
-        self.total_dur   = total_duration
-        self.target_w    = target_w
-        self.target_h    = target_h
-        self.ffmpeg_path = ffmpeg_path
-        self._is_running = True
+        self.tasks         = tasks
+        self.audio_path    = audio_path
+        self.out_dir       = out_dir
+        self.rename_tpl    = rename_tpl
+        self.total_dur     = total_duration
+        self.target_w      = target_w
+        self.target_h      = target_h
+        self.ffmpeg_path   = ffmpeg_path
+        self._is_running   = True
 
     def stop(self):
         self._is_running = False
@@ -69,11 +69,16 @@ class MixWorkerThread(QThread):
                 self.log_signal.emit("已停止。")
                 break
             idx_str = str(i + 1).zfill(3)
-            name = (self.rename_tpl
-                    .replace('{index}', idx_str)
-                    .replace('{date}', now)
-                    if self.rename_tpl.strip()
-                    else f"mix_{idx_str}_{now}")
+            if self.rename_tpl.strip():
+                name = (self.rename_tpl
+                        .replace('{index}', idx_str)
+                        .replace('{date}', now))
+                # 自定义模板未写 {index} 时也必须追加序号，否则批量任务会
+                # 全部覆盖到同一个 mp4，最终目录里看起来只有一条。
+                if '{index}' not in self.rename_tpl:
+                    name = f"{name}_{idx_str}"
+            else:
+                name = f"mix_{idx_str}_{now}"
 
             out_path = os.path.join(self.out_dir, f"{name}.mp4")
             self.log_signal.emit(f"[{i+1}/{total}] 渲染: {name}.mp4")
@@ -186,7 +191,7 @@ class MixHandler:
     #  顶层构建
     # ------------------------------------------------------------------ #
     def build_mix_module(self):
-        self._mix_materials  = {'random': [], 'head': [], 'mid': [], 'tail': []}
+        self._mix_materials  = {'random': [], 'head': [], 'mid': [], 'tail': [], 'suffix': []}
         self._mix_audio_path = ""
         self._mix_out_dir    = ""
         self._mix_tasks      = []
@@ -250,7 +255,7 @@ class MixHandler:
         self.mix_mode_combo = QComboBox()
         self.mix_mode_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mix_mode_combo.addItems([MixMode.MODE_A, MixMode.MODE_B, MixMode.MODE_C,
-                                      MixMode.MODE_D, MixMode.MODE_E])
+                                      MixMode.MODE_D, MixMode.MODE_E, MixMode.MODE_F])
         self.mix_mode_combo.currentIndexChanged.connect(self._refresh_mode_ui)
         mgl.addWidget(self.mix_mode_combo)
 
@@ -283,6 +288,7 @@ class MixHandler:
             ('head',   '固定开头', True),
             ('mid',    '固定中间', True),
             ('tail',   '固定结尾', True),
+            ('suffix', '固定后段', False),
         ]
         for role, label, is_fixed in configs:
             tab_w, table = self._build_mat_tab(role, is_fixed)
@@ -621,33 +627,44 @@ class MixHandler:
             MixMode.MODE_C: "全程随机拼接达到总时长，只需导入随机素材\n固定开头/中间/结尾 在此模式下禁用",
             MixMode.MODE_D: "前N秒 固定开头 → 剩余时长全部随机变换\n需要：固定开头×1、随机素材若干；直接填写总时长",
             MixMode.MODE_E: "前段全部随机变换 → 后K秒 固定结尾\n需要：固定结尾×1、随机素材若干；直接填写总时长",
+            MixMode.MODE_F: "按导入顺序逐条取每个视频的前4秒 → 后面统一接固定后段\n素材与成片一一对应：20个片头素材输出20条视频，只使用背景音频",
         }
         self.mix_mode_desc.setText(desc.get(mode, ""))
 
-        # Tab 启用/禁用：0=随机 1=固定开头 2=固定中间 3=固定结尾
+        # Tab 启用/禁用：0=随机 1=固定开头 2=固定中间 3=固定结尾 4=固定后段
         enabled_map = {
-            MixMode.MODE_A: [True, True,  False, True ],
-            MixMode.MODE_B: [True, False, True,  False],
-            MixMode.MODE_C: [True, False, False, False],
-            MixMode.MODE_D: [True, True,  False, False],
-            MixMode.MODE_E: [True, False, False, True ],
+            MixMode.MODE_A: [True, True,  False, True,  False],
+            MixMode.MODE_B: [True, False, True,  False, False],
+            MixMode.MODE_C: [True, False, False, False, False],
+            MixMode.MODE_D: [True, True,  False, False, False],
+            MixMode.MODE_E: [True, False, False, True,  False],
+            MixMode.MODE_F: [True, False, False, False, True ],
         }
-        for i, en in enumerate(enabled_map.get(mode, [True]*4)):
+        for i, en in enumerate(enabled_map.get(mode, [True]*5)):
             self.mix_mat_tabs.setTabEnabled(i, en)
             if not en:
-                role = ['random','head','mid','tail'][i]
+                role = ['random','head','mid','tail','suffix'][i]
                 self._mat_tables[role].setRowCount(0)
                 self._mix_materials[role] = []
 
-        # 片段时长：C/D/E 总时长可直接填写；A/B 自动计算只读
+        # 片段时长：C/D/E/F 总时长可填写/显示；A/B 自动计算只读
         is_c = mode == MixMode.MODE_C
         is_d = mode == MixMode.MODE_D
         is_e = mode == MixMode.MODE_E
-        self.spin_head.setVisible(not is_c and not is_e)
-        self.spin_mid.setVisible(not is_c and not is_d and not is_e)
-        self.spin_tail.setVisible(not is_c and not is_d)
+        is_f = mode == MixMode.MODE_F
+        self.mix_mat_tabs.setTabText(0, "顺序片头素材" if is_f else "随机素材")
+        self.mix_count_input.setReadOnly(is_f)
+        self.spin_head.setVisible(not is_c and not is_e and not is_f)
+        self.spin_mid.setVisible(not is_c and not is_d and not is_e and not is_f)
+        self.spin_tail.setVisible(not is_c and not is_d and not is_f)
         self.spin_total.setReadOnly(not is_c and not is_d and not is_e)
-        if is_c:
+        if is_f:
+            self.spin_total.setStyleSheet(
+                "background:#1a1a1a; color:#00eaff; font-weight:bold;")
+            self.lbl_seg_hint.setText(
+                "顺序片头模式：每条素材取前4秒 + 固定后段，输出数量等于片头素材数")
+            self._sync_total_f()  # 计算 4s + 后段总时长
+        elif is_c:
             self.spin_total.setStyleSheet("")
             self.lbl_seg_hint.setText("模式C：直接设置总时长即可")
         elif is_d:
@@ -676,6 +693,23 @@ class MixHandler:
             self.spin_total.setValue(total)
             self.spin_total.blockSignals(False)
         self._update_combo_analysis()
+
+    def _sync_total_f(self):
+        """模式F：总时长 = 4s片头 + 后段各素材可用时长之和"""
+        if not hasattr(self, 'mix_mode_combo'):
+            return
+        suffix_dur = sum(
+            m.usable_duration for m in self._mix_materials.get('suffix', []))
+        total = 4.0 + suffix_dur
+        self.spin_total.blockSignals(True)
+        self.spin_total.setValue(total)
+        self.spin_total.blockSignals(False)
+        self._update_combo_analysis()
+
+    def _maybe_sync_total_f(self):
+        """仅在模式F时触发总时长同步"""
+        if hasattr(self, 'mix_mode_combo') and self.mix_mode_combo.currentText() == MixMode.MODE_F:
+            self._sync_total_f()
 
     # ------------------------------------------------------------------ #
     #  尺寸 / 数量工具
@@ -768,6 +802,11 @@ class MixHandler:
 
         self._update_combo_analysis()
 
+        # 模式F：后段素材导入/删除后更新总时长
+        if role == 'suffix' and hasattr(self, 'mix_mode_combo'):
+            if self.mix_mode_combo.currentText() == MixMode.MODE_F:
+                self._sync_total_f()
+
     def _on_mix_range_changed(self, mat: ClipMaterial, rw: RangeWidget, role: str):
         s, e = rw.get_range()
         mat.start = s
@@ -777,6 +816,10 @@ class MixHandler:
             if table.cellWidget(r, 2) is rw:
                 table.setItem(r, 3, QTableWidgetItem(f"{mat.usable_duration:.1f}s"))
                 break
+        # 模式F：后段时长变化时更新总时长
+        if role == 'suffix' and hasattr(self, 'mix_mode_combo'):
+            if self.mix_mode_combo.currentText() == MixMode.MODE_F:
+                self._sync_total_f()
         self._update_combo_analysis()
 
     # ------------------------------------------------------------------ #
@@ -790,11 +833,15 @@ class MixHandler:
             if r < len(self._mix_materials[role]):
                 self._mix_materials[role].pop(r)
         self._update_combo_analysis()
+        if role == 'suffix':
+            self._maybe_sync_total_f()
 
     def _mix_clear_mat(self, role: str):
         self._mat_tables[role].setRowCount(0)
         self._mix_materials[role] = []
         self._update_combo_analysis()
+        if role == 'suffix':
+            self._maybe_sync_total_f()
 
     # ------------------------------------------------------------------ #
     #  预览播放
@@ -900,6 +947,18 @@ class MixHandler:
         if not hasattr(self, 'mix_analysis_label'):
             return
         mode   = self.mix_mode_combo.currentText()
+        if mode == MixMode.MODE_F:
+            head_count = len(self._mix_materials['random'])
+            self.mix_count_input.blockSignals(True)
+            self.mix_count_input.setText(str(head_count))
+            self.mix_count_input.blockSignals(False)
+            suffix = self._mix_materials.get('suffix', [])
+            suffix_total = sum(m.usable_duration for m in suffix)
+            self.mix_analysis_label.setText(
+                f"顺序片头素材：{head_count} 条 → 输出 {head_count} 条视频\n"
+                f"每条取前4秒，按导入顺序处理，不随机、不重复\n"
+                f"固定后段：{len(suffix)} 个片段，共 {suffix_total:.1f}s")
+            return
         target = self._get_mix_count()
         head_s = self.spin_head.value()
         mid_s  = self.spin_mid.value()
@@ -921,6 +980,11 @@ class MixHandler:
         )
         lines = [info['message'],
                  f"当前随机素材: {len(self._mix_materials['random'])} 条  |  每条最多使用 2 次"]
+        # 模式F：显示后段信息
+        if mode == MixMode.MODE_F:
+            suffix_count = len(self._mix_materials.get('suffix', []))
+            suffix_total = sum(m.usable_duration for m in self._mix_materials.get('suffix', []))
+            lines.append(f"固定后段: {suffix_count} 个片段  |  后段总时长: {suffix_total:.1f}s")
         if not info['is_feasible'] and info['need_random_mats'] > 0:
             lines.append(f"建议补充到 {info['need_random_mats']} 条随机素材")
         self.mix_analysis_label.setText("\n".join(lines))
@@ -938,7 +1002,8 @@ class MixHandler:
         tw, th = self._get_mix_size()
 
         if not self._mix_materials['random']:
-            QMessageBox.warning(self, "提醒", "请先在「随机素材」标签页导入素材！")
+            source_label = "顺序片头素材" if mode == MixMode.MODE_F else "随机素材"
+            QMessageBox.warning(self, "提醒", f"请先在「{source_label}」标签页导入素材！")
             return
         if mode == MixMode.MODE_A:
             if not self._mix_materials['head']:
@@ -954,6 +1019,18 @@ class MixHandler:
         elif mode == MixMode.MODE_E:
             if not self._mix_materials['tail']:
                 QMessageBox.warning(self, "提醒", "模式E 需要「固定结尾」素材！"); return
+        elif mode == MixMode.MODE_F:
+            suffix = self._mix_materials.get('suffix', [])
+            if not suffix:
+                QMessageBox.warning(self, "提醒", "模式F 需要「固定后段」素材（至少1个片段）！"); return
+            # 过滤掉时长≤0的后段素材，确保至少有一个有效
+            valid_suffix = [m for m in suffix if m.usable_duration > 0.1]
+            if not valid_suffix:
+                QMessageBox.warning(self, "提醒", "固定后段素材的可用时长不足！请检查区间设置。"); return
+            # 顺序片头模式：每个片头素材的前4秒分别接同一套固定后段。
+            # 输出数量始终等于片头素材数量，不使用普通模式的手填数量。
+            count = len(self._mix_materials['random'])
+            self.mix_count_input.setText(str(count))
 
         out_dir = QFileDialog.getExistingDirectory(self, "选择输出文件夹")
         if not out_dir:
@@ -971,6 +1048,7 @@ class MixHandler:
             seg_a=(head_s, mid_s, tail_s),
             seg_b=(head_s, mid_s, tail_s),
             total=total,
+            suffix_materials=self._mix_materials.get('suffix', []) if mode == MixMode.MODE_F else None,
         )
         self._mix_tasks = gen.generate(count, max_reuse=2)
         self._mix_log(f"已生成 {len(self._mix_tasks)} 个任务，开始渲染...")

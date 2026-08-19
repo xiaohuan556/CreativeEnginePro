@@ -222,7 +222,6 @@ class ScriptGenerator:
         resp = client.chat.completions.create(
             model=LLM_MODEL_NAME,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.9,
         )
         return resp.choices[0].message.content
 

@@ -4,13 +4,13 @@ scrape_panel.py — 扒取面板
 输入账号/频道/合辑链接 → 扒取视频列表 → 选择数量 → 批量下载
 """
 from __future__ import annotations
-import os, json, re, logging, random
+import os, json, re, logging, random, uuid
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QSpinBox, QScrollArea, QFrame,
-    QSizePolicy, QApplication, QMessageBox,
+    QSizePolicy, QApplication, QMessageBox, QComboBox,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QSettings
 
 # 项目内白色 ✓ 复选框
 from ui.widgets import CheckMarkBox
@@ -193,6 +193,7 @@ class ScrapePanel(QWidget):
     - download_requested(list[DownloadTask]) — 用户确认下载一批视频
     """
     download_requested = pyqtSignal(list)
+    tail_settings_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -340,6 +341,44 @@ class ScrapePanel(QWidget):
 
         root.addWidget(input_section)
 
+        # ── 下载后动作：这里只选择去向，具体尾页预设统一在尾页处理页维护 ──
+        auto_box = QFrame()
+        auto_box.setStyleSheet(
+            "QFrame{background:#171a20;border:1px solid #303641;border-radius:5px;}"
+            "QLabel{border:none;background:transparent;}"
+            "QComboBox{background:#111;color:#ddd;border:1px solid #3b414d;"
+            "border-radius:3px;padding:3px 5px;font-size:10px;}"
+        )
+        auto_lay = QVBoxLayout(auto_box)
+        auto_lay.setContentsMargins(7, 6, 7, 7)
+        auto_lay.setSpacing(5)
+        title_row = QHBoxLayout()
+        auto_title = QLabel("⚡ 下载后处理")
+        auto_title.setStyleSheet("color:#7db3ff;font-size:11px;font-weight:600;")
+        title_row.addWidget(auto_title)
+        title_row.addStretch()
+        auto_lay.addLayout(title_row)
+
+        action_row = QHBoxLayout()
+        self._post_dest = QComboBox()
+        self._post_dest.addItem("只进入素材库", "library")
+        self._post_dest.addItem("使用尾页处理页预设", "tail")
+        action_row.addWidget(self._post_dest, 1)
+        self._tail_settings_btn = QPushButton("去尾页设置")
+        self._tail_settings_btn.setStyleSheet(BTN_STYLE)
+        self._tail_settings_btn.clicked.connect(self.tail_settings_requested.emit)
+        action_row.addWidget(self._tail_settings_btn)
+        auto_lay.addLayout(action_row)
+        self._auto_summary = QLabel("")
+        self._auto_summary.setWordWrap(True)
+        self._auto_summary.setStyleSheet("color:#777;font-size:9px;")
+        auto_lay.addWidget(self._auto_summary)
+        root.addWidget(auto_box)
+
+        self._load_postprocess_preset()
+        self._post_dest.currentIndexChanged.connect(self._on_postprocess_changed)
+        self._on_postprocess_changed()
+
         # ── 分隔线 ──
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
@@ -405,6 +444,64 @@ class ScrapePanel(QWidget):
         self._update_dl_btn_text()
 
     # ─── 逻辑 ───
+    def _load_postprocess_preset(self):
+        s = QSettings("CreativeEnginePro", "ScrapeAutomation")
+        dest = str(s.value("destination", "library"))
+        idx = self._post_dest.findData(dest)
+        self._post_dest.setCurrentIndex(max(0, idx))
+
+    def _save_postprocess_preset(self, *_args):
+        if not hasattr(self, "_post_dest"):
+            return
+        s = QSettings("CreativeEnginePro", "ScrapeAutomation")
+        s.setValue("destination", self._post_dest.currentData())
+        self._update_dl_btn_text()
+
+    def _on_postprocess_changed(self, *_args):
+        is_tail = self._post_dest.currentData() == "tail"
+        self._tail_settings_btn.setEnabled(is_tail)
+        self._refresh_tail_preset_summary()
+        self._save_postprocess_preset()
+
+    @staticmethod
+    def _settings_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _tail_preset_from_settings(self):
+        s = QSettings("CreativeEnginePro", "TailAutomation")
+        return {
+            "destination": "tail",
+            "tail_mode": str(s.value("tail_mode", "append")),
+            "tail_path": str(s.value("tail_path", "")),
+            "ratio": str(s.value("ratio", "保持原样 (极速模式 - 不重编码)")),
+            "rename": str(s.value("rename", "")),
+            "output_dir": str(s.value("output_dir", "")),
+            "auto_export": self._settings_bool(s.value("auto_export", True), True),
+        }
+
+    def _refresh_tail_preset_summary(self):
+        if self._post_dest.currentData() != "tail":
+            self._auto_summary.setText("下载完成后自动进入剪辑素材库")
+            return
+        preset = self._tail_preset_from_settings()
+        mode = "智能替换旧尾页" if preset["tail_mode"] == "smart_replace" else "直接追加"
+        tail = os.path.basename(preset["tail_path"]) if preset["tail_path"] else "未设置尾页"
+        export = "自动导出" if preset["auto_export"] else "仅进入尾页队列"
+        self._auto_summary.setText(f"当前尾页预设：{mode} · {tail} · {export}")
+
+    def _postprocess_preset(self):
+        if self._post_dest.currentData() == "tail":
+            return self._tail_preset_from_settings()
+        return {"destination": "library"}
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._refresh_tail_preset_summary()
+
     def _scrape(self):
         url = self._url_input.text().strip()
         if not url or not url.startswith("http"):
@@ -500,11 +597,24 @@ class ScrapePanel(QWidget):
         self._update_dl_btn_text()
 
     def _update_dl_btn_text(self):
+        if not hasattr(self, "_dl_btn"):
+            return
         sel = sum(1 for i in self._items if i.checked)
         if sel > 0:
-            self._dl_btn.setText(f"⬇ 下载勾选的 {sel} 个视频")
+            if hasattr(self, "_post_dest") and self._post_dest.currentData() == "tail":
+                self._dl_btn.setText(f"⚡ 下载并自动加尾页（{sel} 个）")
+            else:
+                self._dl_btn.setText(f"⬇ 下载勾选的 {sel} 个视频")
         else:
             self._dl_btn.setText("⬇ 下载勾选的视频")
+
+    def set_postprocess_status(self, text: str, error: bool = False):
+        """供主窗口的自动化编排器回写批次状态。"""
+        self._status.setText(text)
+        color = "#e05555" if error else "#4caf50"
+        self._status.setStyleSheet(f"color:{color};font-size:10px;border:none;")
+        if text.startswith(("✅", "❌")):
+            self._dl_btn.setEnabled(True)
 
     def _set_all_checked(self, val: bool):
         for item in self._items:
@@ -512,6 +622,18 @@ class ScrapePanel(QWidget):
         self._update_selection_label()
 
     def _download_selected(self):
+        preset = self._postprocess_preset()
+        if preset["destination"] == "tail":
+            if not preset["tail_path"] or not os.path.isfile(preset["tail_path"]):
+                self._status.setText("请先选择有效的预设尾页视频")
+                self._status.setStyleSheet("color:#e0a040;font-size:10px;border:none;")
+                return
+            if preset["auto_export"] and not os.path.isdir(preset["output_dir"]):
+                self._status.setText("请先选择有效的自动导出目录")
+                self._status.setStyleSheet("color:#e0a040;font-size:10px;border:none;")
+                return
+        self._save_postprocess_preset()
+        batch_id = uuid.uuid4().hex
         tasks = []
         for item in self._items:
             if item.checked and item.url:
@@ -519,6 +641,8 @@ class ScrapePanel(QWidget):
                 t.title = ""
                 t.media_type = "video"
                 t.output_dir = self._scrape_dir
+                t.batch_id = batch_id
+                t.postprocess = dict(preset)
                 tasks.append(t)
 
         if not tasks:
@@ -527,7 +651,9 @@ class ScrapePanel(QWidget):
             return
 
         self.download_requested.emit(tasks)
-        self._status.setText(f"✅ 已添加 {len(tasks)} 个视频到下载队列")
+        self._dl_btn.setEnabled(False)
+        action = "下载并自动加尾页" if preset["destination"] == "tail" else "下载"
+        self._status.setText(f"✅ 已提交 {len(tasks)} 个视频：{action}")
         self._status.setStyleSheet("color:#4caf50; font-size:10px; border:none;")
 
     def _change_dir(self):

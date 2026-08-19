@@ -8,9 +8,9 @@ import os
 import logging
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QSlider,
-    QPushButton, QComboBox, QColorDialog, QSpinBox,
+    QPushButton, QComboBox, QColorDialog, QSpinBox, QTabWidget,
     QDoubleSpinBox, QTextEdit, QGroupBox, QFormLayout, QScrollArea,
-    QSizePolicy, QFrame, QDialog
+    QSizePolicy, QFrame, QDialog, QGridLayout, QButtonGroup
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QFont, QWheelEvent, QPainter, QPen, QBrush, QPainterPath
@@ -94,6 +94,7 @@ class NoWheelSlider(QSlider):
 from core.edit_engine import VideoClip, AudioClip, SubtitleBlock, EditTimeline, interpolate_keyframes
 from core.slideshow_engine import TRANSITIONS, TRANS_DESCS
 from ui.replace_video_dialog import ReplaceVideoDialog
+from ui.dubbing_panel import DubbingPanel
 
 
 def _color_btn(color_hex: str) -> QPushButton:
@@ -158,7 +159,8 @@ class ClipPropertiesPanel(QWidget):
     property_changed = pyqtSignal()  # 任何属性变更后发出
     seek_requested = pyqtSignal(float)  # 请求跳转到指定时间（秒）
 
-    def __init__(self, timeline: EditTimeline, parent=None):
+    def __init__(self, timeline: EditTimeline, parent=None, add_audio_cb=None,
+                 get_subtitles_cb=None):
         super().__init__(parent)
         self.tl = timeline
         self._clip = None
@@ -212,8 +214,7 @@ class ClipPropertiesPanel(QWidget):
         self._sync_cb.toggled.connect(self._on_sync_cb_toggled)
         sl.addWidget(self._sync_cb)
         sl.addStretch()
-        self._sync_bar.setVisible(False)  # 默认隐藏，选中字幕时显示
-        root.addWidget(self._sync_bar)
+        self._sync_bar.setVisible(False)  # 默认隐藏，选中字幕时显示（放在「属性」页内部）
 
         # 滚动内容区
         self._scroll = QScrollArea()
@@ -237,7 +238,31 @@ class ClipPropertiesPanel(QWidget):
         self._content_layout.addStretch()
 
         scroll.setWidget(self._content)
-        root.addWidget(scroll, 1)
+
+        # ── 双 Tab：属性 / 配音 ──
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet("""
+            QTabWidget::pane { border:none; }
+            QTabBar::tab {
+                background:#1e1e1e; color:#888; border:none;
+                padding:6px 14px; font-size:12px;
+            }
+            QTabBar::tab:selected { color:#fff; border-bottom:2px solid #3d8ef8; }
+            QTabBar::tab:hover { color:#ccc; }
+        """)
+        # 属性页 = 字幕同步条 + 滚动内容区
+        props_page = QWidget()
+        pp = QVBoxLayout(props_page)
+        pp.setContentsMargins(0, 0, 0, 0)
+        pp.setSpacing(0)
+        pp.addWidget(self._sync_bar)
+        pp.addWidget(scroll, 1)
+        self._tabs.addTab(props_page, "属性")
+        self.dubbing_panel = DubbingPanel(add_audio_cb=add_audio_cb,
+                                           get_subtitles_cb=get_subtitles_cb)
+        self._tabs.addTab(self.dubbing_panel, "配音")
+        self._tabs.setTabVisible(1, False)  # 默认隐藏，仅选中字幕 clip 时显示
+        root.addWidget(self._tabs, 1)
 
     def eventFilter(self, obj, event):
         """拦截 Delete/Backspace 键防止误删轨道片段"""
@@ -260,6 +285,8 @@ class ClipPropertiesPanel(QWidget):
     def set_selection(self, clip, track: str):
         self._clip = clip
         self._track = track
+        # 配音 tab：仅选中字幕 clip 时显示，并自动切换过去
+        self._update_dubbing_tab(clip, track)
         # 切换片段时取消待处理的字幕同步（避免泄漏到新片段）
         self._pending_sync_attrs.clear()
         self._sync_debounce.stop()
@@ -294,7 +321,20 @@ class ClipPropertiesPanel(QWidget):
         self._clip = None
         self._track = ""
         self._sync_bar.setVisible(False)
+        self._tabs.setTabVisible(1, False)
+        self._tabs.setCurrentIndex(0)
         self._rebuild_ui()
+
+    def _update_dubbing_tab(self, clip, track: str):
+        """配音 tab 仅在选中字幕 clip 时出现，并预填字幕文本。"""
+        is_sub = (track == "subtitle")
+        self._tabs.setTabVisible(1, is_sub)
+        if is_sub:
+            self._tabs.setCurrentIndex(1)
+            if self.dubbing_panel is not None:
+                self.dubbing_panel.set_subtitle(clip)
+        else:
+            self._tabs.setCurrentIndex(0)
 
     @staticmethod
     def _get_video_duration(path: str) -> float:
@@ -439,6 +479,90 @@ class ClipPropertiesPanel(QWidget):
         op_slider.valueChanged.connect(lambda v: self._set(clip, "opacity", v / 100))
         form_op.addRow(self._lbl("不透明度:"), op_row)
         self._content_layout.addWidget(grp_op)
+
+        # 蒙版
+        grp_mask = self._make_group("蒙版")
+        mask_layout = QVBoxLayout(grp_mask)
+        mask_layout.setContentsMargins(8, 8, 8, 8)
+        mask_layout.setSpacing(7)
+        mask_enable = CheckMarkBox("启用蒙版")
+        mask_enable.setChecked(getattr(clip, "mask_enabled", False))
+        mask_enable.setStyleSheet(CHECK_STYLE)
+        mask_enable.toggled.connect(
+            lambda value: self._undo_set(clip, "mask_enabled", value))
+        mask_layout.addWidget(mask_enable)
+
+        shape_grid = QGridLayout()
+        shape_grid.setSpacing(5)
+        shape_group = QButtonGroup(grp_mask)
+        shape_group.setExclusive(True)
+        mask_types = [
+            ("linear", "▤\n线性"), ("mirror", "▥\n镜面"),
+            ("circle", "◯\n圆形"), ("rectangle", "▣\n矩形"),
+            ("star", "☆\n星形"), ("heart", "♡\n爱心"),
+        ]
+        current_mask_type = getattr(clip, "mask_type", "rectangle")
+        for index, (mask_type, text) in enumerate(mask_types):
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setChecked(mask_type == current_mask_type)
+            button.setFixedHeight(48)
+            button.setStyleSheet(
+                "QPushButton{background:#292929;color:#aaa;border:1px solid #3c3c3c;"
+                "border-radius:5px;font-size:11px;padding:2px;}"
+                "QPushButton:hover{background:#353535;color:#fff;}"
+                "QPushButton:checked{background:#173842;color:#79d8e8;border:1px solid #20b9cf;}")
+            button.clicked.connect(
+                lambda _checked, kind=mask_type: self._set_mask_type(clip, kind))
+            shape_group.addButton(button)
+            shape_grid.addWidget(button, index // 3, index % 3)
+        mask_layout.addLayout(shape_grid)
+
+        mask_form = QFormLayout()
+        mask_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        mx = int(float(getattr(clip, "mask_x", 0.0)) * 100)
+        _mx_s, _mx_v, mx_row = self._slider_row(-100, 100, mx, " %", "mask_x")
+        _mx_s.valueChanged.connect(lambda value: self._set(clip, "mask_x", value / 100))
+        my = int(float(getattr(clip, "mask_y", 0.0)) * 100)
+        _my_s, _my_v, my_row = self._slider_row(-100, 100, my, " %", "mask_y")
+        _my_s.valueChanged.connect(lambda value: self._set(clip, "mask_y", value / 100))
+        mw = int(float(getattr(clip, "mask_width", 0.65)) * 100)
+        _mw_s, _mw_v, mw_row = self._slider_row(1, 200, mw, " %", "mask_width")
+        _mw_s.valueChanged.connect(lambda value: self._set(clip, "mask_width", value / 100))
+        mh = int(float(getattr(clip, "mask_height", 0.65)) * 100)
+        _mh_s, _mh_v, mh_row = self._slider_row(1, 200, mh, " %", "mask_height")
+        _mh_s.valueChanged.connect(lambda value: self._set(clip, "mask_height", value / 100))
+        mr = int(float(getattr(clip, "mask_rotation", 0.0)))
+        _mr_s, _mr_v, mr_row = self._slider_row(-180, 180, mr, " °", "mask_rotation")
+        _mr_s.valueChanged.connect(lambda value: self._set(clip, "mask_rotation", float(value)))
+        mf = int(float(getattr(clip, "mask_feather", 0.0)) * 100)
+        _mf_s, _mf_v, mf_row = self._slider_row(0, 100, mf, " %", "mask_feather")
+        _mf_s.valueChanged.connect(lambda value: self._set(clip, "mask_feather", value / 100))
+        mask_form.addRow(self._lbl("位置 X:"), mx_row)
+        mask_form.addRow(self._lbl("位置 Y:"), my_row)
+        mask_form.addRow(self._lbl("宽度:"), mw_row)
+        mask_form.addRow(self._lbl("高度:"), mh_row)
+        mask_form.addRow(self._lbl("旋转:"), mr_row)
+        mask_form.addRow(self._lbl("羽化:"), mf_row)
+        mask_layout.addLayout(mask_form)
+
+        mask_bottom = QHBoxLayout()
+        mask_invert = CheckMarkBox("反转蒙版")
+        mask_invert.setChecked(getattr(clip, "mask_inverted", False))
+        mask_invert.setStyleSheet(CHECK_STYLE)
+        mask_invert.toggled.connect(
+            lambda value: self._undo_set(clip, "mask_inverted", value))
+        mask_bottom.addWidget(mask_invert)
+        mask_bottom.addStretch()
+        mask_reset = QPushButton("重置")
+        mask_reset.setFixedSize(52, 23)
+        mask_reset.setStyleSheet(
+            "QPushButton{background:#292929;color:#888;border:1px solid #3c3c3c;border-radius:3px;}"
+            "QPushButton:hover{color:#fff;border-color:#666;}")
+        mask_reset.clicked.connect(lambda: self._reset_video_mask(clip))
+        mask_bottom.addWidget(mask_reset)
+        mask_layout.addLayout(mask_bottom)
+        self._content_layout.addWidget(grp_mask)
 
         # 绿幕抠像（Chroma Key）
         grp_ck = self._make_group("绿幕抠像")
@@ -927,6 +1051,32 @@ class ClipPropertiesPanel(QWidget):
         form_op.addRow(self._lbl("不透明度:"), op_row)
         self._content_layout.addWidget(grp_op)
 
+    def _set_mask_type(self, clip: VideoClip, mask_type: str):
+        if (getattr(clip, "mask_type", "rectangle") == mask_type
+                and getattr(clip, "mask_enabled", False)):
+            return
+        self.tl._save_history()
+        clip.mask_type = mask_type
+        clip.mask_enabled = True
+        self.property_changed.emit()
+        self._rebuild_ui()
+
+    def _reset_video_mask(self, clip: VideoClip):
+        self.tl._save_history()
+        clip.mask_x = 0.0
+        clip.mask_y = 0.0
+        clip.mask_width = 0.65
+        clip.mask_height = 0.65
+        clip.mask_rotation = 0.0
+        clip.mask_feather = 0.0
+        clip.mask_inverted = False
+        for prop in (
+                "mask_x", "mask_y", "mask_width", "mask_height",
+                "mask_rotation", "mask_feather"):
+            clip.keyframes.pop(prop, None)
+        self.property_changed.emit()
+        self._rebuild_ui()
+
     # ─── 工具方法 ───
     def _set(self, clip, attr: str, value):
         """设置属性并触发预览刷新。
@@ -1310,4 +1460,3 @@ class ClipPropertiesPanel(QWidget):
 
 
 # ── 字幕批量编辑对话框已移除（与字幕同步功能重复） ──
-

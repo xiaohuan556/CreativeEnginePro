@@ -5,8 +5,9 @@ preview_player.py — OpenCV 帧预览播放器
 from __future__ import annotations
 from core.clip_decoder import DecoderManager
 from PyQt6.QtGui import (QPixmap, QImage, QColor, QPainter, QPen, QFont,
-                         QFontMetrics, QBrush, QPainterPath, QTextOption)
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QSize, QUrl, QRect, QRectF, QPoint
+                         QFontMetrics, QBrush, QPainterPath, QTextOption, QPolygonF)
+from PyQt6.QtCore import (Qt, QTimer, pyqtSignal, QSize, QUrl, QRect, QRectF,
+                          QPoint, QPointF)
 from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QApplication,
                              QPushButton, QSizePolicy, QFrame)
 from typing import Optional, Tuple
@@ -451,6 +452,7 @@ class PreviewPlayer(QWidget):
     # (VideoClip, kind:"video"/"subtitle")
     video_selected = pyqtSignal(object, str)
     pause_requested = pyqtSignal()  # 右键画布时请求暂停播放
+    audio_extract_ready = pyqtSignal(str)  # 后台音频转码完成（source_path）
 
     def __init__(self, timeline: EditTimeline, parent=None):
         super().__init__(parent)
@@ -568,6 +570,8 @@ class PreviewPlayer(QWidget):
         # 向后兼容：保留 _audio_player 指向第0个 player
         self._audio_player = None
         self._audio_output = None
+        # MP3/M4A 等首次播放需后台转码；完成后只补启尚未启动的对应 slot。
+        self.audio_extract_ready.connect(self._retry_ready_audio)
         # 音频提取缓存：视频文件 → 提取后的 WAV 路径
         self._audio_extract_cache: dict = {}
         self._audio_extract_lock = threading.Lock()
@@ -589,6 +593,12 @@ class PreviewPlayer(QWidget):
         self._rotation_start_rot = 0.0
         self._rotation_start_angle = 0.0
         self._rotation_center_xy = (0, 0)
+        self._mask_interaction = None
+        self._mask_drag_saved = False
+        self._mask_start_xy = (0, 0)
+        self._mask_start_values = {}
+        self._mask_center_xy = (0.0, 0.0)
+        self._mask_start_angle = 0.0
         self._sub_interaction = None
         self._last_frame_image = None
         self._last_frame_no_subs = None  # 无字幕合成帧缓存（视频+背景+叠加轨，供字幕重绘避免残影）
@@ -879,6 +889,11 @@ class PreviewPlayer(QWidget):
                 with self._audio_extract_lock:
                     self._audio_extract_cache[source_path] = wav_path
                     self._audio_extracting.discard(source_path)
+                try:
+                    self.audio_extract_ready.emit(source_path)
+                except RuntimeError:
+                    # 窗口已关闭时后台线程可能晚一步完成，不再触碰已销毁的 Qt 对象。
+                    pass
                 return  # 成功，保留 wav_path
             else:
                 # 无音频流或提取失败 → 清理
@@ -908,18 +923,18 @@ class PreviewPlayer(QWidget):
         duration_sec=0 表示播放到文件末尾；>0 则限播指定秒数的源音频。"""
         if not os.path.exists(source_path):
             logging.debug("play_audio: source not found %s", source_path)
-            return
+            return False
         player, _ = self._ensure_audio_player(slot)
         if player is None:
             logging.debug("play_audio: no player available (slot=%d)", slot)
-            return
+            return False
 
         # 视频文件 → 提取音频为 WAV
         actual_source = self._ensure_audio_for_video(source_path)
         if not actual_source:
             logging.debug("play_audio: no audio stream in %s",
                           os.path.basename(source_path))
-            return  # 视频无音频流或提取失败，跳过
+            return False  # 后台转码尚未完成；audio_extract_ready 会补播
 
         # 应用音量（clip.volume 范围 0~2，限制到播放器 0~1）
         vol = max(0.0, min(2.0, float(volume)))
@@ -971,9 +986,11 @@ class PreviewPlayer(QWidget):
                     except Exception:
                         pass
                 QTimer.singleShot(100, _retry_seek)
+            return True
         except Exception as e:
             logging.debug("play_audio failed slot=%d path=%s: %s",
                           slot, source_path, e, exc_info=True)
+            return False
 
     def _cleanup_extracted_audio(self):
         """进程退出时清理所有提取的临时音频文件"""
@@ -990,6 +1007,7 @@ class PreviewPlayer(QWidget):
     def stop_audio(self, slot: int = -1):
         """停止音频。slot=-1 停止所有，否则停止指定 slot"""
         if slot == -1:
+            self._audio_pending.clear()
             for player, _ in self._audio_players:
                 if player:
                     try:
@@ -1002,6 +1020,7 @@ class PreviewPlayer(QWidget):
                     try:
                         player.stop()
                     except Exception: import traceback; traceback.print_exc()
+            self._audio_pending.pop(slot, None)
 
     def clear_file_cache(self, path: str):
         """清除指定文件的缓存，当素材库删除文件时调用"""
@@ -1035,13 +1054,8 @@ class PreviewPlayer(QWidget):
                 import traceback
                 traceback.print_exc()
 
-    def play_all_audio(self, sec: float):
-        """
-        在当前播放头位置，同时播放所有非静音音频轨道。
-        视频轨的原声通过 slot 0..N-1，音频轨通过 slot N..N+M-1。
-        每个轨道的 slot 由 track index 固定，静音不改序号避免串扰。
-        """
-        # ── 第一阶段：收集需要播放的 slot → (source, src_sec, rate, volume, duration, fade_in, fade_out) ──
+    def _collect_active_audio(self, sec: float) -> tuple[dict, int]:
+        """收集当前播放头应发声的 slot，并返回 ``(active_slots, total_slots)``。"""
         # active_slots: {slot: (source_path, src_sec, rate, volume, duration_sec, fade_in, fade_out)}
         # duration_sec = 源音频剩余秒数，0=不限（播到文件末尾）
         active_slots: dict = {}
@@ -1098,22 +1112,54 @@ class PreviewPlayer(QWidget):
                             c.source_path, src_sec, 1.0, c.volume, dur, fi, fo)
                     break
 
+        return active_slots, n_video + n_audio
+
+    def play_all_audio(self, sec: float):
+        """
+        在当前播放头位置，同时播放所有非静音音频轨道。
+        视频轨的原声通过 slot 0..N-1，音频轨通过 slot N..N+M-1。
+        每个轨道的 slot 由 track index 固定，静音不改序号避免串扰。
+
+        MP3/M4A/AAC 等首次需要后台转码的音频会登记到 ``_audio_pending``；
+        转码完成后 ``audio_extract_ready`` 会从当前播放头自动补启，无需用户再点轨道。
+        """
+        active_slots, total_slots = self._collect_active_audio(sec)
+
         # ── 第二阶段：播放活跃 slot，停止非活跃 slot ──
-        total_slots = n_video + n_audio
         max_slot = max(total_slots, max(active_slots.keys()) + \
                        1) if active_slots else total_slots
         for s in range(max_slot):
             if s in active_slots:
                 src, offset, rate, vol, dur, fi, fo = active_slots[s]
-                self.play_audio(src, offset, s, rate=rate,
-                                volume=vol, duration_sec=dur,
-                                fade_in=fi, fade_out=fo)
+                started = self.play_audio(
+                    src, offset, s, rate=rate, volume=vol,
+                    duration_sec=dur, fade_in=fi, fade_out=fo)
+                if started:
+                    self._audio_pending.pop(s, None)
+                else:
+                    self._audio_pending[s] = src
             else:
                 self.stop_audio(s)
+                self._audio_pending.pop(s, None)
 
         # 停止超出最大范围的 slot（防止旧的播放器泄漏）
         for s in range(max_slot, len(self._audio_players)):
             self.stop_audio(s)
+            self._audio_pending.pop(s, None)
+
+    def _retry_ready_audio(self, source_path: str):
+        """后台转码完成后，从当前播放头补启该素材对应的未启动音轨。"""
+        if not self._playing or not self._audio_pending:
+            return
+        active_slots, _ = self._collect_active_audio(self._current_sec)
+        for slot, args in active_slots.items():
+            if self._audio_pending.get(slot) != source_path or args[0] != source_path:
+                continue
+            src, offset, rate, vol, dur, fi, fo = args
+            if self.play_audio(
+                    src, offset, slot, rate=rate, volume=vol,
+                    duration_sec=dur, fade_in=fi, fade_out=fo):
+                self._audio_pending.pop(slot, None)
 
     def seek_audio(self, sec: float):
         """播放头跳转时同步所有音频（重新调用 play_all_audio）"""
@@ -1147,9 +1193,13 @@ class PreviewPlayer(QWidget):
         for s in range(1, n_video):
             if s in active_slots:
                 src, offset, rate, vol, dur, fi, fo = active_slots[s]
-                self.play_audio(src, offset, s, rate=rate,
-                                volume=vol, duration_sec=dur,
-                                fade_in=fi, fade_out=fo)
+                started = self.play_audio(
+                    src, offset, s, rate=rate, volume=vol,
+                    duration_sec=dur, fade_in=fi, fade_out=fo)
+                if started:
+                    self._audio_pending.pop(s, None)
+                else:
+                    self._audio_pending[s] = src
             else:
                 self.stop_audio(s)
 
@@ -1475,6 +1525,21 @@ class PreviewPlayer(QWidget):
             logging.debug("alpha frame read failed", exc_info=True)
             return None
 
+    @staticmethod
+    def _clip_uses_alpha_decoder(clip) -> bool:
+        """Only send genuinely transparent MOV/WebM clips to raw BGRA decode.
+
+        Ordinary phone MOV files may carry rotation metadata. Treating all MOV
+        files as alpha can reshape decoded bytes using storage dimensions rather
+        than display dimensions, producing horizontal tearing and repetition.
+        """
+        if (not _HAS_ALPHA or
+                os.path.splitext(clip.source_path)[1].lower() not in _ALPHA_EXTS):
+            return False
+        # EditorTab probes alpha when the clip is imported and persists this
+        # flag in the project. Do not reclassify a normal MOV by extension.
+        return bool(getattr(clip, "has_alpha", False))
+
     def _fetch_alpha_overlay_frame(self, oc, src_o):
         """取叠加轨 alpha 视频在 src_o 处的 RGBA 帧（含 alpha，绝不失透）。
 
@@ -1488,7 +1553,7 @@ class PreviewPlayer(QWidget):
         _ensure_alpha_decoded 的 QTimer.singleShot 自动刷新当前帧，
         透明通道立即生效，无需手动拖动播放头。
         """
-        if not (_HAS_ALPHA and os.path.splitext(oc.source_path)[1].lower() in _ALPHA_EXTS):
+        if not self._clip_uses_alpha_decoder(oc):
             return "USE_CV2"  # 非 alpha 视频，调用方走原 cv2 路径
         import cv2
         # 1) 整段预解码文件缓存（解码完成后最快、零阻塞、绝对稳定）
@@ -1803,7 +1868,7 @@ class PreviewPlayer(QWidget):
                 _pending_raw_is_image_val = False
 
                 # ── MOV/WebM：从整段预解码缓存读取（后台线程已解码，绝不阻塞）──
-                if _HAS_ALPHA and ext in _ALPHA_EXTS:
+                if self._clip_uses_alpha_decoder(clip):
                     bgra = self._get_alpha_frame(clip, src_sec)
                     if bgra is not None:
                         frame_rgb = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
@@ -2233,6 +2298,13 @@ class PreviewPlayer(QWidget):
     def _draw_video_layer(self, painter, clip, scaled_img, ox, oy):
         """绘制单个视频片段到 canvas（含整体不透明度），并绘制选中框/手柄。
         绿幕（chroma_key）片段延迟到最后调用本方法，使其透明区露出下层所有轨道。"""
+        if getattr(clip, 'mask_enabled', False):
+            try:
+                from utils.video_mask import apply_video_mask
+                scaled_img = apply_video_mask(
+                    scaled_img, clip, self._current_sec - clip.timeline_start)
+            except Exception:
+                logging.debug("video mask preview failed", exc_info=True)
         _op = self._clip_opacity(clip)
         if _op < 1.0:
             painter.save()
@@ -2267,6 +2339,153 @@ class PreviewPlayer(QWidget):
             painter.drawLine(rcx, oy, rcx, rcy + 8)
             painter.setBrush(QBrush(QColor("#1a1a2e")))
             painter.drawEllipse(QPoint(rcx, rcy), 6, 6)
+            if getattr(clip, "mask_enabled", False):
+                self._draw_mask_controls(
+                    painter, clip, ox, oy, scaled_img.width(), scaled_img.height())
+
+    def _mask_geometry(self, clip, rect=None):
+        if clip is None or not getattr(clip, "mask_enabled", False):
+            return None
+        if rect is None:
+            rect = self._video_screen_rect(clip)
+        if rect is None:
+            return None
+        ox, oy, width, height = rect
+        try:
+            from utils.video_mask import evaluate_mask_values
+            values = evaluate_mask_values(
+                clip, self._current_sec - clip.timeline_start)
+        except Exception:
+            values = {
+                "mask_type": getattr(clip, "mask_type", "rectangle"),
+                "mask_x": getattr(clip, "mask_x", 0.0),
+                "mask_y": getattr(clip, "mask_y", 0.0),
+                "mask_width": getattr(clip, "mask_width", 0.65),
+                "mask_height": getattr(clip, "mask_height", 0.65),
+                "mask_rotation": getattr(clip, "mask_rotation", 0.0),
+            }
+        cx = ox + width * (0.5 + float(values.get("mask_x", 0.0)) * 0.5)
+        cy = oy + height * (0.5 + float(values.get("mask_y", 0.0)) * 0.5)
+        half_w = max(8.0, width * float(values.get("mask_width", 0.65)) * 0.5)
+        half_h = max(8.0, height * float(values.get("mask_height", 0.65)) * 0.5)
+        rotation = float(values.get("mask_rotation", 0.0))
+        return {
+            "rect": rect, "values": values, "cx": cx, "cy": cy,
+            "half_w": half_w, "half_h": half_h, "rotation": rotation,
+        }
+
+    @staticmethod
+    def _mask_local_to_screen(geometry, local_x: float, local_y: float):
+        import math
+        angle = math.radians(geometry["rotation"])
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        return (
+            geometry["cx"] + cos_a * local_x - sin_a * local_y,
+            geometry["cy"] + sin_a * local_x + cos_a * local_y,
+        )
+
+    @staticmethod
+    def _mask_screen_to_local(geometry, x: float, y: float):
+        import math
+        dx, dy = x - geometry["cx"], y - geometry["cy"]
+        angle = math.radians(geometry["rotation"])
+        cos_a, sin_a = math.cos(angle), math.sin(angle)
+        return cos_a * dx + sin_a * dy, -sin_a * dx + cos_a * dy
+
+    def _draw_mask_controls(self, painter: QPainter, clip, ox: int, oy: int,
+                            width: int, height: int):
+        geometry = self._mask_geometry(clip, (ox, oy, width, height))
+        if geometry is None:
+            return
+        half_w, half_h = geometry["half_w"], geometry["half_h"]
+        mask_type = geometry["values"].get("mask_type", "rectangle")
+        painter.save()
+        painter.translate(geometry["cx"], geometry["cy"])
+        painter.rotate(geometry["rotation"])
+        pen = QPen(QColor("#18d5eb"), 1.6, Qt.PenStyle.DashLine)
+        pen.setDashPattern([4, 3])
+        painter.setPen(pen)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        bounds = QRectF(-half_w, -half_h, half_w * 2, half_h * 2)
+        if mask_type == "circle":
+            painter.drawEllipse(bounds)
+        elif mask_type == "linear":
+            painter.drawLine(QPointF(-half_w, 0), QPointF(half_w, 0))
+        elif mask_type == "star":
+            import math
+            points = []
+            for index in range(10):
+                theta = -math.pi / 2 + index * math.pi / 5
+                radius = 1.0 if index % 2 == 0 else 0.43
+                points.append(QPointF(
+                    math.cos(theta) * half_w * radius,
+                    math.sin(theta) * half_h * radius))
+            painter.drawPolygon(QPolygonF(points))
+        elif mask_type == "heart":
+            path = QPainterPath(QPointF(0, half_h * 0.88))
+            path.cubicTo(QPointF(-half_w * 1.15, half_h * 0.15),
+                         QPointF(-half_w, -half_h * 0.82),
+                         QPointF(-half_w * 0.48, -half_h * 0.88))
+            path.cubicTo(QPointF(-half_w * 0.15, -half_h * 0.92),
+                         QPointF(0, -half_h * 0.55), QPointF(0, -half_h * 0.35))
+            path.cubicTo(QPointF(0, -half_h * 0.55),
+                         QPointF(half_w * 0.15, -half_h * 0.92),
+                         QPointF(half_w * 0.48, -half_h * 0.88))
+            path.cubicTo(QPointF(half_w, -half_h * 0.82),
+                         QPointF(half_w * 1.15, half_h * 0.15),
+                         QPointF(0, half_h * 0.88))
+            painter.drawPath(path)
+        else:
+            painter.drawRect(bounds)
+
+        # 四角缩放点；线性蒙版只显示两端点。
+        if mask_type == "linear":
+            handles = [(-half_w, 0), (half_w, 0)]
+        else:
+            handles = [(-half_w, -half_h), (half_w, -half_h),
+                       (-half_w, half_h), (half_w, half_h)]
+        painter.setPen(QPen(QColor("#18d5eb"), 1.4))
+        painter.setBrush(QColor("#102b31"))
+        for hx, hy in handles:
+            painter.drawEllipse(QPointF(hx, hy), 5, 5)
+        control_top = 0 if mask_type == "linear" else -half_h
+        rotate_y = control_top - 24
+        painter.drawLine(QPointF(0, control_top), QPointF(0, rotate_y + 6))
+        painter.setBrush(QColor("#f4fbfc"))
+        painter.drawEllipse(QPointF(0, rotate_y), 6, 6)
+        painter.restore()
+
+    def _hit_mask_controls(self, x: float, y: float):
+        clip = self._selected_video_clip
+        geometry = self._mask_geometry(clip)
+        if geometry is None:
+            return None
+        half_w, half_h = geometry["half_w"], geometry["half_h"]
+        mask_type = geometry["values"].get("mask_type", "rectangle")
+        rotate_y = -24 if mask_type == "linear" else -half_h - 24
+        rotate_point = self._mask_local_to_screen(geometry, 0, rotate_y)
+        if (x - rotate_point[0]) ** 2 + (y - rotate_point[1]) ** 2 <= 13 ** 2:
+            return ("rotate", None, geometry)
+        corners = {
+            "NW": (-half_w, -half_h), "NE": (half_w, -half_h),
+            "SW": (-half_w, half_h), "SE": (half_w, half_h),
+        }
+        if mask_type == "linear":
+            corners = {"W": (-half_w, 0), "E": (half_w, 0)}
+        for name, local in corners.items():
+            point = self._mask_local_to_screen(geometry, *local)
+            if (x - point[0]) ** 2 + (y - point[1]) ** 2 <= 12 ** 2:
+                return ("resize", name, geometry)
+        local_x, local_y = self._mask_screen_to_local(geometry, x, y)
+        if mask_type == "linear":
+            inside = abs(local_y) <= 12 and abs(local_x) <= half_w
+        elif mask_type == "circle":
+            inside = (local_x / half_w) ** 2 + (local_y / half_h) ** 2 <= 1.0
+        else:
+            inside = abs(local_x) <= half_w and abs(local_y) <= half_h
+        if inside:
+            return ("move", None, geometry)
+        return None
 
     def _subtitle_base_canvas(self, cw: int, ch: int):
         """返回不含任何字幕的干净底图（视频+背景+叠加轨），供字幕重绘，避免旧字幕残影。
@@ -2371,6 +2590,8 @@ class PreviewPlayer(QWidget):
         self._dragging_video = None
         self._resize_handle = None
         self._rotation_active = False
+        self._mask_interaction = None
+        self._mask_drag_saved = False
         self._sub_interaction = None
         self._editing_sub = None
         self._seq_state = None
@@ -2398,6 +2619,8 @@ class PreviewPlayer(QWidget):
             self._dragging_video = None
             self._resize_handle = None
             self._rotation_active = False
+            self._mask_interaction = None
+            self._mask_drag_saved = False
         if (self._selected_sub is not None
                 and not self._clip_in_timeline(self._selected_sub)):
             self._selected_sub = None
@@ -3940,6 +4163,34 @@ class PreviewPlayer(QWidget):
             elif event.type() == QEvent.Type.MouseMove:
                 self._on_screen_move(event)
             elif event.type() == QEvent.Type.MouseButtonRelease:
+                if self._mask_interaction is not None:
+                    clip = self._selected_video_clip
+                    mode, _handle = self._mask_interaction
+                    if clip is not None and self._mask_drag_saved:
+                        if mode == "move":
+                            synced_props = ["mask_x", "mask_y"]
+                        elif mode == "resize":
+                            synced_props = ["mask_width"]
+                            if getattr(clip, "mask_type", "rectangle") != "linear":
+                                synced_props.append("mask_height")
+                        else:
+                            synced_props = ["mask_rotation"]
+                        keyframes = getattr(clip, "keyframes", None) or {}
+                        rel_time = max(0.0, self._current_sec - clip.timeline_start)
+                        if 0 <= rel_time <= getattr(clip, "duration", 9999):
+                            for prop in synced_props:
+                                if prop in keyframes and keyframes[prop]:
+                                    keyframes[prop] = [
+                                        (time_value, value) for time_value, value in keyframes[prop]
+                                        if abs(time_value - rel_time) > 0.05]
+                                    keyframes[prop].append(
+                                        (float(rel_time), float(getattr(clip, prop))))
+                                    keyframes[prop].sort(key=lambda item: item[0])
+                        self.tl.changed.emit()
+                        self.video_selected.emit(clip, "video")
+                    self._mask_interaction = None
+                    self._mask_drag_saved = False
+                    self._async_fetch(self._current_sec)
                 if self._sub_interaction is not None:
                     block = self._selected_sub
                     _sub_mode = self._sub_interaction
@@ -4254,6 +4505,37 @@ class PreviewPlayer(QWidget):
             self._show_canvas_context_menu(event)
             return
 
+        # ── 蒙版画布交互优先于视频本体拖拽 ──
+        mask_hit = self._hit_mask_controls(x, y)
+        if mask_hit is not None:
+            mode, handle, geometry = mask_hit
+            clip = self._selected_video_clip
+            self._selected_sub = None
+            self._dragging_video = None
+            self._resize_handle = None
+            self._rotation_active = False
+            self._mask_interaction = (mode, handle)
+            self._mask_drag_saved = False
+            self._mask_start_xy = (x, y)
+            self._mask_center_xy = (geometry["cx"], geometry["cy"])
+            current_values = geometry["values"]
+            self._mask_start_values = {
+                "mask_x": float(current_values.get("mask_x", 0.0)),
+                "mask_y": float(current_values.get("mask_y", 0.0)),
+                "mask_width": float(current_values.get("mask_width", 0.65)),
+                "mask_height": float(current_values.get("mask_height", 0.65)),
+                "mask_rotation": float(current_values.get("mask_rotation", 0.0)),
+                "rect_width": float(geometry["rect"][2]),
+                "rect_height": float(geometry["rect"][3]),
+            }
+            if mode == "rotate":
+                import math
+                self._mask_start_angle = math.atan2(
+                    y - geometry["cy"], x - geometry["cx"])
+            self.video_selected.emit(clip, "video")
+            self._flush_frame(force=True)
+            return
+
         # ── 字幕命中检测 ──
         hit_result = self._hit_test_subtitle(x, y)
         if hit_result is not None:
@@ -4374,6 +4656,8 @@ class PreviewPlayer(QWidget):
         self._dragging_video = None
         self._resize_handle = None
         self._rotation_active = False
+        self._mask_interaction = None
+        self._mask_drag_saved = False
         self._drag_snap_saved = False
         if self._selected_sub is not None:
             self._selected_sub = None
@@ -4404,6 +4688,72 @@ class PreviewPlayer(QWidget):
         from PyQt6.QtCore import Qt as _Qt
         x = event.pos().x()
         y = event.pos().y()
+
+        # ── 蒙版移动 / 缩放 / 旋转 ──
+        if self._mask_interaction is not None and self._selected_video_clip is not None:
+            if not (event.buttons() & _Qt.MouseButton.LeftButton):
+                self._mask_interaction = None
+                return
+            if not self._mask_drag_saved:
+                self.tl._save_history()
+                self._mask_drag_saved = True
+            clip = self._selected_video_clip
+            mode, _handle = self._mask_interaction
+            start = self._mask_start_values
+            if mode == "move":
+                dx = x - self._mask_start_xy[0]
+                dy = y - self._mask_start_xy[1]
+                rw = max(1.0, start.get("rect_width", 1.0))
+                rh = max(1.0, start.get("rect_height", 1.0))
+                clip.mask_x = max(-1.5, min(1.5, start["mask_x"] + dx / rw * 2.0))
+                clip.mask_y = max(-1.5, min(1.5, start["mask_y"] + dy / rh * 2.0))
+            elif mode == "resize":
+                import math
+                dx = x - self._mask_center_xy[0]
+                dy = y - self._mask_center_xy[1]
+                angle = math.radians(start["mask_rotation"])
+                local_x = math.cos(angle) * dx + math.sin(angle) * dy
+                local_y = -math.sin(angle) * dx + math.cos(angle) * dy
+                rw = max(1.0, start.get("rect_width", 1.0))
+                rh = max(1.0, start.get("rect_height", 1.0))
+                clip.mask_width = max(0.02, min(2.5, abs(local_x) * 2.0 / rw))
+                if getattr(clip, "mask_type", "rectangle") != "linear":
+                    clip.mask_height = max(0.02, min(2.5, abs(local_y) * 2.0 / rh))
+            elif mode == "rotate":
+                import math
+                current_angle = math.atan2(
+                    y - self._mask_center_xy[1], x - self._mask_center_xy[0])
+                rotation = start["mask_rotation"] + math.degrees(
+                    current_angle - self._mask_start_angle)
+                while rotation > 180:
+                    rotation -= 360
+                while rotation < -180:
+                    rotation += 360
+                for snap in (-180, -90, -45, 0, 45, 90, 180):
+                    if abs(rotation - snap) < 3:
+                        rotation = snap
+                        break
+                clip.mask_rotation = round(rotation, 1)
+            # 已有关键帧时实时更新当前时间点，避免拖动过程中被插值值覆盖而看似不动。
+            changed_props = {
+                "move": ("mask_x", "mask_y"),
+                "resize": ("mask_width", "mask_height"),
+                "rotate": ("mask_rotation",),
+            }[mode]
+            keyframes = getattr(clip, "keyframes", None) or {}
+            rel_time = max(0.0, self._current_sec - clip.timeline_start)
+            for prop in changed_props:
+                if prop == "mask_height" and getattr(clip, "mask_type", "") == "linear":
+                    continue
+                if prop in keyframes and keyframes[prop]:
+                    keyframes[prop] = [
+                        (time_value, value) for time_value, value in keyframes[prop]
+                        if abs(time_value - rel_time) > 0.05]
+                    keyframes[prop].append(
+                        (float(rel_time), float(getattr(clip, prop))))
+                    keyframes[prop].sort(key=lambda item: item[0])
+            self._flush_frame(force=True)
+            return
 
         # ── 视频旋转 ──
         if self._rotation_active and self._selected_video_clip is not None:
@@ -4602,6 +4952,15 @@ class PreviewPlayer(QWidget):
 
     def _update_hover_cursor(self, x: int, y: int):
         """鼠标悬浮时根据手柄区域更新光标样式"""
+        if self._mask_interaction is not None:
+            mode = self._mask_interaction[0]
+            cursor = {
+                "move": Qt.CursorShape.ClosedHandCursor,
+                "resize": Qt.CursorShape.SizeFDiagCursor,
+                "rotate": Qt.CursorShape.CrossCursor,
+            }.get(mode, Qt.CursorShape.ArrowCursor)
+            self._screen.setCursor(cursor)
+            return
         if self._sub_interaction is not None:
             # 拖拽/缩放中，光标由交互模式决定，不重新 hit test
             cursor_map = {
@@ -4615,6 +4974,21 @@ class PreviewPlayer(QWidget):
             }
             self._screen.setCursor(cursor_map.get(
                 self._sub_interaction, Qt.CursorShape.ArrowCursor))
+            return
+
+        # 蒙版把手优先于视频本体把手。
+        mask_hit = self._hit_mask_controls(x, y)
+        if mask_hit is not None:
+            mode, handle, _geometry = mask_hit
+            if mode == "rotate":
+                cursor = Qt.CursorShape.CrossCursor
+            elif mode == "resize":
+                cursor = (Qt.CursorShape.SizeFDiagCursor
+                          if handle in ("NW", "SE", "W", "E")
+                          else Qt.CursorShape.SizeBDiagCursor)
+            else:
+                cursor = Qt.CursorShape.OpenHandCursor
+            self._screen.setCursor(cursor)
             return
 
         # ── 1. 视频把手（优先于字幕，因为把手更小更精确）──

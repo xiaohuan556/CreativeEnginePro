@@ -1,0 +1,4 @@
+interface:
+  display_name: "视觉审片与局部修复"
+  short_description: "Audit media and reroute only failed shot branches"
+  default_prompt: "Use $vision-qc-repair to audit these shots and produce a minimal repair plan."

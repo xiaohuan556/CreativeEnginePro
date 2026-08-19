@@ -17,6 +17,7 @@ import logging
 import traceback
 import shutil
 import subprocess
+import uuid
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -27,12 +28,14 @@ from PyQt6.QtWidgets import (
     QHeaderView, QDoubleSpinBox, QLineEdit,
     QStackedWidget, QGroupBox, QTextEdit, QSpinBox, QTabWidget,
     QColorDialog, QApplication, QCheckBox, QSlider,
+    QProgressDialog,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer
 from PyQt6.QtGui import QColor, QFont, QShortcut, QKeySequence
 
 from core.edit_engine import (
-    EditTimeline, VideoClip, AudioClip, SubtitleBlock,
+    EditTimeline, VideoClip, AudioClip, SubtitleBlock, TrackInfo,
+    rebase_clip_keyframes,
     FFmpegDirectExportWorker,
 )
 from ui.export_dialogs import ExportDialog, AudioExportDialog, _ProgressDialog, _AudioExportWorker
@@ -42,6 +45,9 @@ from ui.clip_properties import ClipPropertiesPanel
 from ui.media_library import MediaLibrary
 from ui.download_panel import DownloadPanel
 from ui.scrape_panel import ScrapePanel
+from ui.openverse_panel import OpenversePanel
+from ui.widgets import CheckMarkBox
+from ui.scene_detect_dialog import SceneDetectDialog
 
 # ══ 模块常量 ══
 PROP_DEBOUNCE_MS = 30       # 属性滑块 debounce
@@ -103,6 +109,17 @@ class ThumbnailWorker(QThread):
         from utils.ffmpeg_utils import get_ffmpeg_path
 
         try:
+            # 静态图片没有持续的视频帧流，不能按视频用 fps 滤镜抽帧。
+            # 直接读取一次并复用，时间线绘制时会按片段宽度平铺。
+            image_exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+            if Path(self._clip.source_path).suffix.lower() in image_exts:
+                px = QPixmap(self._clip.source_path)
+                if not px.isNull():
+                    self.finished.emit(self._clip, [px])
+                else:
+                    self.finished.emit(self._clip, [])
+                return
+
             ffmpeg = get_ffmpeg_path()
             if not ffmpeg or not os.path.exists(ffmpeg):
                 self.finished.emit(self._clip, [])
@@ -184,6 +201,50 @@ class ThumbnailWorker(QThread):
             self.finished.emit(self._clip, [])
 
 
+class WaveformWorker(QThread):
+    """后台把音频解码为低采样率单声道，并压缩成时间线绘制用峰值。"""
+    finished = pyqtSignal(object, list)
+
+    def __init__(self, clip, bins: int = 1600):
+        super().__init__()
+        self._clip = clip
+        self._bins = max(200, min(4000, bins))
+
+    def run(self):
+        from array import array
+        from utils.ffmpeg_utils import get_ffmpeg_path
+        try:
+            ffmpeg = get_ffmpeg_path()
+            if not ffmpeg or not os.path.exists(ffmpeg):
+                self.finished.emit(self._clip, [])
+                return
+            cmd = [
+                ffmpeg, "-v", "error", "-i", self._clip.source_path,
+                "-map", "0:a:0", "-ac", "1", "-ar", "8000",
+                "-f", "s16le", "pipe:1",
+            ]
+            result = subprocess.run(
+                cmd, capture_output=True, timeout=FFMPEG_TIMEOUT_MEDIUM,
+                stdin=subprocess.DEVNULL,
+            )
+            samples = array("h")
+            samples.frombytes(result.stdout)
+            if not samples:
+                self.finished.emit(self._clip, [])
+                return
+            step = max(1, len(samples) // self._bins)
+            peaks = []
+            for start in range(0, len(samples), step):
+                block = samples[start:start + step]
+                peaks.append(min(1.0, max(abs(v) for v in block) / 32768.0))
+                if len(peaks) >= self._bins:
+                    break
+            self.finished.emit(self._clip, peaks)
+        except Exception:
+            logging.debug("WaveformWorker failed", exc_info=True)
+            self.finished.emit(self._clip, [])
+
+
 class _SepWorker(QThread):
     progress = pyqtSignal(int, str)  # pct, msg
     finished = pyqtSignal(str, str)
@@ -226,6 +287,40 @@ class _ASRWorker(QThread):
             self.error.emit(f"{e}\n{traceback.format_exc()}")
 
 
+class _SceneDetectWorker(QThread):
+    progress = pyqtSignal(int, str)
+    finished = pyqtSignal(list)
+    error = pyqtSignal(str)
+
+    def __init__(self, clip: VideoClip, threshold: float,
+                 min_length: float, filter_flashes: bool):
+        super().__init__()
+        self._clip = clip
+        self._threshold = threshold
+        self._min_length = min_length
+        self._filter_flashes = filter_flashes
+
+    def run(self):
+        try:
+            from core.scene_detector import detect_scene_changes
+            from utils.ffmpeg_utils import get_ffmpeg_path
+            self.progress.emit(8, "正在分析画面跳变…")
+            cuts = detect_scene_changes(
+                self._clip.source_path,
+                ffmpeg_path=get_ffmpeg_path(),
+                source_start=self._clip.trim_start,
+                source_end=self._clip.trim_end,
+                threshold=self._threshold,
+                min_length=self._min_length,
+                filter_flashes=self._filter_flashes,
+                cancel_check=self.isInterruptionRequested,
+            )
+            self.progress.emit(95, "正在生成分镜片段…")
+            self.finished.emit(cuts)
+        except Exception as exc:
+            self.error.emit(f"{exc}\n{traceback.format_exc()}")
+
+
 class _SubTransWorker(QThread):
     finished = pyqtSignal(list)
     error    = pyqtSignal(str)
@@ -259,11 +354,14 @@ CANVAS_RATIOS = {
 # ══ 字幕管理弹窗 ══
 class SubtitleManagerDialog(QDialog):
     sync_to_timeline = pyqtSignal(list)  # list of {start, end, text}
+    rough_cut_requested = pyqtSignal(list, float, bool, bool)
+    preview_requested = pyqtSignal(float)
 
-    def __init__(self, orig_subs: list, trans_subs: list, parent=None):
+    def __init__(self, orig_subs: list, trans_subs: list, parent=None,
+                 rough_cut_enabled: bool = False):
         super().__init__(parent)
-        self.setWindowTitle("字幕管理")
-        self.resize(620, 480)
+        self.setWindowTitle("AI 文字粗剪 / 字幕管理" if rough_cut_enabled else "字幕管理")
+        self.resize(780, 620 if rough_cut_enabled else 500)
         self.setStyleSheet("""
             QDialog { background:#1a1a1a; color:#ccc; }
             QLabel { color:#ccc; }
@@ -278,6 +376,11 @@ class SubtitleManagerDialog(QDialog):
         self._orig = orig_subs
         self._trans = trans_subs
         self._show_orig = True
+        self._rough_cut_enabled = rough_cut_enabled
+        for sub in self._orig:
+            sub.setdefault("_keep", True)
+        for sub in self._trans:
+            sub.setdefault("_keep", True)
         self._build()
         self._fill_table()
 
@@ -324,23 +427,75 @@ class SubtitleManagerDialog(QDialog):
         trans_row.addStretch()
         lay.addLayout(trans_row)
 
+        if self._rough_cut_enabled:
+            cut_tools = QHBoxLayout()
+            cut_tools.setSpacing(6)
+            for text, slot in [
+                ("全选", lambda: self._set_all(True)),
+                ("全不选", lambda: self._set_all(False)),
+                ("反选", self._invert_selection),
+                ("去口癖", self._remove_fillers),
+                ("智能选重点", self._smart_highlights),
+            ]:
+                button = QPushButton(text)
+                button.setStyleSheet(
+                    "QPushButton{background:#252525;color:#aaa;border:1px solid #3a3a3a;}"
+                    "QPushButton:hover{background:#333;color:#fff;}")
+                button.clicked.connect(slot)
+                cut_tools.addWidget(button)
+            cut_tools.addStretch()
+            cut_tools.addWidget(QLabel("目标时长"))
+            self._target_seconds = QDoubleSpinBox()
+            self._target_seconds.setRange(3, 3600)
+            self._target_seconds.setValue(30)
+            self._target_seconds.setSuffix(" 秒")
+            self._target_seconds.setFixedWidth(92)
+            cut_tools.addWidget(self._target_seconds)
+            lay.addLayout(cut_tools)
+
+            cut_options = QHBoxLayout()
+            cut_options.addWidget(QLabel("句子边缘保留"))
+            self._cut_padding = QDoubleSpinBox()
+            self._cut_padding.setRange(0, 1.5)
+            self._cut_padding.setSingleStep(0.05)
+            self._cut_padding.setValue(0.15)
+            self._cut_padding.setSuffix(" 秒")
+            self._cut_padding.setFixedWidth(90)
+            cut_options.addWidget(self._cut_padding)
+            self._compact_cut = CheckMarkBox("删除未选内容并自动压紧")
+            self._compact_cut.setChecked(True)
+            cut_options.addWidget(self._compact_cut)
+            self._add_cut_subtitles = CheckMarkBox("粗剪后生成字幕")
+            self._add_cut_subtitles.setChecked(True)
+            cut_options.addWidget(self._add_cut_subtitles)
+            cut_options.addStretch()
+            lay.addLayout(cut_options)
+
         # 进度/状态
         self._ai_status = QLabel("")
         self._ai_status.setStyleSheet("color:#888; font-size:11px;")
         lay.addWidget(self._ai_status)
 
         # 表格
-        self._table = QTableWidget(0, 3)
-        self._table.setHorizontalHeaderLabels(["#", "时间", "文本"])
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["保留", "#", "时间", "文本"])
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
-        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
-        self._table.setColumnWidth(0, 32)
-        self._table.setColumnWidth(1, 130)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        self._table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self._table.setColumnWidth(0, 48)
+        self._table.setColumnWidth(1, 32)
+        self._table.setColumnWidth(2, 135)
         self._table.verticalHeader().setVisible(False)
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.cellChanged.connect(self._on_edit)
+        self._table.cellClicked.connect(self._on_cell_clicked)
+        self._table.cellDoubleClicked.connect(self._on_cell_double_clicked)
         lay.addWidget(self._table, 1)
+
+        self._selection_status = QLabel("")
+        self._selection_status.setStyleSheet("color:#7f9fbd;font-size:11px;")
+        lay.addWidget(self._selection_status)
 
         # 底部
         bot = QHBoxLayout()
@@ -350,6 +505,12 @@ class SubtitleManagerDialog(QDialog):
             "QPushButton{background:#2a5fa8;color:#fff;border:none;font-weight:bold;}"
             "QPushButton:hover{background:#3d8ef8;}")
         btn_sync.clicked.connect(self._do_sync)
+        if self._rough_cut_enabled:
+            btn_cut = QPushButton("✂ 按勾选内容粗剪")
+            btn_cut.setStyleSheet(
+                "QPushButton{background:#d06b28;color:#fff;border:none;font-weight:bold;}"
+                "QPushButton:hover{background:#e77c35;}")
+            btn_cut.clicked.connect(self._do_rough_cut)
         btn_close = QPushButton("关闭")
         btn_close.setStyleSheet(
             "QPushButton{background:#252525;color:#aaa;border:1px solid #444;}"
@@ -357,6 +518,8 @@ class SubtitleManagerDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         bot.addWidget(btn_close)
         bot.addWidget(btn_sync)
+        if self._rough_cut_enabled:
+            bot.addWidget(btn_cut)
         lay.addLayout(bot)
 
         self._ai_worker = None
@@ -377,24 +540,98 @@ class SubtitleManagerDialog(QDialog):
         for i, s in enumerate(subs):
             row = self._table.rowCount()
             self._table.insertRow(row)
+            s.setdefault("_keep", True)
+            keep = QTableWidgetItem("☑" if s["_keep"] else "☐")
+            keep.setFlags(keep.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            keep.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            keep.setForeground(QColor("#64b5f6" if s["_keep"] else "#666666"))
+            self._table.setItem(row, 0, keep)
             i0 = QTableWidgetItem(str(i+1))
             i0.setFlags(i0.flags() & ~Qt.ItemFlag.ItemIsEditable)
             i0.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._table.setItem(row, 0, i0)
+            self._table.setItem(row, 1, i0)
             i1 = QTableWidgetItem(f"{_fmt_s(s['start'])} → {_fmt_s(s['end'])}")
             i1.setFlags(i1.flags() & ~Qt.ItemFlag.ItemIsEditable)
             i1.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._table.setItem(row, 1, i1)
-            self._table.setItem(row, 2, QTableWidgetItem(s["text"]))
+            self._table.setItem(row, 2, i1)
+            self._table.setItem(row, 3, QTableWidgetItem(s["text"]))
         self._table.blockSignals(False)
+        self._update_selection_status()
 
     def _on_edit(self, row, col):
-        if col != 2: return
+        if col != 3: return
         item = self._table.item(row, col)
         if not item: return
         subs = self._orig if self._show_orig else self._trans
         if 0 <= row < len(subs):
             subs[row]["text"] = item.text()
+
+    def _on_cell_clicked(self, row: int, col: int):
+        if col != 0:
+            return
+        subs = self._current_subs()
+        if 0 <= row < len(subs):
+            subs[row]["_keep"] = not subs[row].get("_keep", True)
+            self._refresh_keep_cell(row)
+            self._update_selection_status()
+
+    def _on_cell_double_clicked(self, row: int, _col: int):
+        subs = self._current_subs()
+        if 0 <= row < len(subs):
+            self.preview_requested.emit(float(subs[row].get("start", 0.0)))
+
+    def _current_subs(self) -> list:
+        return self._orig if self._show_orig else self._trans
+
+    def _selected_subs(self) -> list:
+        return [dict(s) for s in self._current_subs() if s.get("_keep", True)]
+
+    def _refresh_keep_cell(self, row: int):
+        subs = self._current_subs()
+        if not (0 <= row < len(subs)):
+            return
+        item = self._table.item(row, 0)
+        if item is not None:
+            kept = subs[row].get("_keep", True)
+            item.setText("☑" if kept else "☐")
+            item.setForeground(QColor("#64b5f6" if kept else "#666666"))
+
+    def _set_all(self, keep: bool):
+        for sub in self._current_subs():
+            sub["_keep"] = keep
+        self._fill_table()
+
+    def _invert_selection(self):
+        for sub in self._current_subs():
+            sub["_keep"] = not sub.get("_keep", True)
+        self._fill_table()
+
+    def _remove_fillers(self):
+        from core.text_rough_cut import is_filler_sentence
+        removed = 0
+        for sub in self._current_subs():
+            if sub.get("_keep", True) and is_filler_sentence(sub.get("text", "")):
+                sub["_keep"] = False
+                removed += 1
+        self._fill_table()
+        self._ai_status.setText(f"已取消 {removed} 条独立口癖/空句")
+
+    def _smart_highlights(self):
+        from core.text_rough_cut import choose_highlight_indices
+        subs = self._current_subs()
+        selected = set(choose_highlight_indices(subs, self._target_seconds.value()))
+        for index, sub in enumerate(subs):
+            sub["_keep"] = index in selected
+        self._fill_table()
+        self._ai_status.setText(f"已按 {self._target_seconds.value():.0f} 秒目标选出 {len(selected)} 条重点")
+
+    def _update_selection_status(self):
+        subs = self._current_subs()
+        selected = [s for s in subs if s.get("_keep", True)]
+        duration = sum(max(0.0, float(s.get("end", 0)) - float(s.get("start", 0)))
+                       for s in selected)
+        self._selection_status.setText(
+            f"已保留 {len(selected)} / {len(subs)} 句，语句总时长约 {duration:.1f} 秒；双击句子可定位预览")
 
     def _request_translate(self, code: str):
         self._target_lang = code
@@ -418,7 +655,15 @@ class SubtitleManagerDialog(QDialog):
             self._request_translate(lang.strip())
 
     def _on_trans_done(self, entries):
-        self._trans = [{"start": e.start, "end": e.end, "text": e.text} for e in entries]
+        self._trans = []
+        for index, entry in enumerate(entries):
+            source = self._orig[index] if index < len(self._orig) else {}
+            self._trans.append({
+                "start": entry.start, "end": entry.end, "text": entry.text,
+                "source_start": source.get("source_start"),
+                "source_end": source.get("source_end"),
+                "_keep": source.get("_keep", True),
+            })
         self._show_orig = False
         self._fill_table()
         self._ai_status.setText(f"翻译完成 {len(entries)} 条 ✓")
@@ -427,9 +672,21 @@ class SubtitleManagerDialog(QDialog):
         self._ai_status.setText(f"翻译失败: {e[:80]}")
 
     def _do_sync(self):
-        subs = self._orig if self._show_orig else self._trans
+        subs = self._selected_subs()
+        if not subs:
+            self._ai_status.setText("请至少勾选一条字幕")
+            return
         self.sync_to_timeline.emit(subs)
         self._ai_status.setText(f"已同步 {len(subs)} 条到时间线 ✓")
+
+    def _do_rough_cut(self):
+        subs = self._selected_subs()
+        if not subs:
+            self._ai_status.setText("请至少勾选一句后再粗剪")
+            return
+        self.rough_cut_requested.emit(
+            subs, self._cut_padding.value(), self._compact_cut.isChecked(),
+            self._add_cut_subtitles.isChecked())
 
     def set_orig_subs(self, subs: list):
         self._orig = subs
@@ -457,6 +714,7 @@ class EditorTab(QWidget):
         self._trans_subs = []
         self._vocals_path = ""
         self._bgm_path = ""
+        self._separated_vocals: dict[str, str] = {}
         self._canvas_ratio = None  # 默认跟随视频尺寸
         self._custom_size = None   # (w, h) 用户自定义的实际像素尺寸
         self._project_path: str | None = None  # 当前工程文件路径（None=从未保存）
@@ -466,6 +724,7 @@ class EditorTab(QWidget):
         self._separated_state: dict = {}  # {clip_id: extracted_audio_path}, toggle Ctrl+Shift+S
         self._thumb_workers: list = []  # 保持引用防止 GC
         self._thumb_pending: list = []   # 缩略图待处理队列 (clip, dur)
+        self._waveform_workers: list = []  # 音频波形后台任务
 
         # 属性面板 debounce：快速拖拽滑块时避免每 tick 都 seek，防止卡死闪退
         self._prop_debounce = QTimer(self)
@@ -548,13 +807,15 @@ class EditorTab(QWidget):
         self._top_splitter.setOpaqueResize(True)
         self._top_splitter.setChildrenCollapsible(False)
 
-        # 左：素材库 + 下载 + 扒取（QTabWidget）
+        # 左：素材库 + 下载 + 扒取 + Openverse（QTabWidget）
         self.media_lib = MediaLibrary()
         self.media_lib.setMinimumWidth(150)
         self.download_panel = DownloadPanel()
         self.download_panel.setMinimumWidth(150)
         self.scrape_panel = ScrapePanel()
         self.scrape_panel.setMinimumWidth(150)
+        self.openverse_panel = OpenversePanel()
+        self.openverse_panel.setMinimumWidth(260)
         self._left_tabs = QTabWidget()
         self._left_tabs.setStyleSheet("""
             QTabWidget::pane { border:none; }
@@ -568,6 +829,7 @@ class EditorTab(QWidget):
         self._left_tabs.addTab(self.media_lib, "📁 素材库")
         self._left_tabs.addTab(self.download_panel, "📥 下载")
         self._left_tabs.addTab(self.scrape_panel, "📡 扒取")
+        self._left_tabs.addTab(self.openverse_panel, "🎵 音乐音效")
         self._top_splitter.addWidget(self._left_tabs)
 
         # 中：预览播放器
@@ -580,7 +842,7 @@ class EditorTab(QWidget):
         right_panel.setMinimumWidth(200)
         self._top_splitter.addWidget(right_panel)
 
-        self._top_splitter.setSizes([200, 500, 260])
+        self._top_splitter.setSizes([280, 480, 260])
 
         # ══ 时间线标签栏 ══
         self._tl_tab_bar = QWidget()
@@ -683,16 +945,6 @@ class EditorTab(QWidget):
         self._ratio_combo.currentTextChanged.connect(self._on_ratio_changed)
         lay.addWidget(self._ratio_combo)
 
-        # 字幕管理
-        btn_sub_mgr = QPushButton("📝 字幕")
-        btn_sub_mgr.setFixedSize(90, 28)
-        btn_sub_mgr.setStyleSheet(
-            "QPushButton{background:#252525;color:#aaa;border:1px solid #3a3a3a;"
-            "border-radius:3px;padding:2px 8px;font-size:12px;}"
-            "QPushButton:hover{background:#333;color:#fff;border-color:#555;}")
-        btn_sub_mgr.clicked.connect(self._open_subtitle_dialog)
-        lay.addWidget(btn_sub_mgr)
-
         lay.addSpacing(8)
 
         # 导出按钮
@@ -767,26 +1019,259 @@ class EditorTab(QWidget):
         return w
 
     def _build_right_panel(self) -> QWidget:
-        """右侧属性面板（仅属性，不含AI工具）"""
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setStyleSheet(
+        """右侧只保留剪辑属性；AI 生成统一回到制片画布。"""
+        # 顶部小标签切换
+        bar = QWidget()
+        bar.setFixedHeight(28)
+        bar.setStyleSheet("background:#141414; border-bottom:1px solid #2a2a2a;")
+        blay = QHBoxLayout(bar)
+        blay.setContentsMargins(6, 0, 6, 0)
+        blay.setSpacing(4)
+
+        self._right_tabs = QTabWidget()
+        self._right_tabs.setStyleSheet("""
+            QTabWidget::pane { border:none; }
+            QTabBar::tab {
+                background:#1e1e1e; color:#888; border:none;
+                padding:4px 12px; font-size:11px; min-width:50px;
+            }
+            QTabBar::tab:selected { color:#fff; border-bottom:2px solid #3d8ef8; }
+            QTabBar::tab:hover { color:#ccc; }
+        """)
+        self._right_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self._right_tabs.setDocumentMode(True)
+
+        # 页 0：属性面板（保留原 ClipPropertiesPanel 的滚动容器）
+        props_scroll = QScrollArea()
+        props_scroll.setWidgetResizable(True)
+        props_scroll.setStyleSheet(
             "QScrollArea{background:#1a1a1a;border:none;}"
             "QScrollBar:vertical{background:#141414;width:6px;}"
-            "QScrollBar::handle:vertical{background:#3a3a3a;border-radius:3px;}")
-
+            "QScrollBar::handle:vertical{background:#3a3a3a;border-radius:3px;}"
+        )
         container = QWidget()
         container.setStyleSheet("background:#1a1a1a;")
         lay = QVBoxLayout(container)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-
-        self.props_panel = ClipPropertiesPanel(self.timeline)
+        self.props_panel = ClipPropertiesPanel(
+            self.timeline, add_audio_cb=self._dubbing_add_audio,
+            get_subtitles_cb=self._get_selected_subtitles)
         lay.addWidget(self.props_panel, 1)
-
         lay.addStretch()
-        scroll.setWidget(container)
-        return scroll
+        props_scroll.setWidget(container)
+        self._right_tabs.addTab(props_scroll, "📋 属性")
+
+        # 栈容器（预留扩展位）
+        self._right_stack = QStackedWidget()
+        self._right_stack.addWidget(self._right_tabs)
+
+        wrap = QWidget()
+        wraplay = QVBoxLayout(wrap)
+        wraplay.setContentsMargins(0, 0, 0, 0)
+        wraplay.setSpacing(0)
+        wraplay.addWidget(self._right_stack)
+        return wrap
+
+    # ── AI 助手入口 ──
+    def open_ai_assistant(self, tab: str = "video", reference_image: str | None = None):
+        """旧入口兼容：剪辑台不再承担 AI 生成。"""
+        self.status_msg.emit("请在 AI 制片画布中使用视频节点生成", "info")
+
+    def open_storyboard_video_generator(self, prompt: str, ratio: str, duration: int):
+        """旧入口兼容：视频生成已统一由画布节点执行。"""
+        self.status_msg.emit("视频生成已迁移到 AI 制片画布", "info")
+
+    def import_storyboard(self, board: dict, audio_policy: str = "replace"):
+        """把已定稿素材的分镜按时间顺序追加到当前时间线。
+
+        每个镜头优先导入定稿视频；没有视频时才使用定稿图片。当前预览结果
+        不参与导入，避免为了导入视频而破坏关键帧选择。存在外部 TTS 时，
+        replace 会静音生成视频的混合原声；duck 会把它压到 12%。
+        """
+        def final_path(shot: dict) -> str:
+            chosen = str(shot.get("selected_video_asset") or
+                         shot.get("selected_image_asset") or
+                         shot.get("anchor_frame_id") or "")
+            if chosen:
+                return chosen
+            if ("selected_video_asset" in shot or
+                    "selected_image_asset" in shot):
+                return ""
+            return str(shot.get("selected_asset") or "")
+
+        shots = [s for s in (board or {}).get("shots", []) if final_path(s)]
+        if not shots:
+            return 0
+        tl = self.timeline
+        if not tl.video_tracks:
+            tl.video_tracks = [[]]
+            tl.video_track_info = [TrackInfo("主轨道")]
+        base = max((c.timeline_end for c in tl.video_tracks[0]), default=0.0)
+        first_start = min(float(s.get("start", 0.0)) for s in shots)
+        imported = 0
+        slowed = 0
+        dialogue_track_idx = None
+
+        def ensure_dialogue_track():
+            nonlocal dialogue_track_idx
+            if dialogue_track_idx is not None:
+                return dialogue_track_idx
+            for index, info in enumerate(tl.audio_track_info):
+                if str(getattr(info, "name", "")) == "AI 对白":
+                    dialogue_track_idx = index
+                    return index
+            if (len(tl.audio_tracks) == 1 and not tl.audio_tracks[0] and
+                    tl.audio_track_info):
+                tl.audio_track_info[0].name = "AI 对白"
+                dialogue_track_idx = 0
+            else:
+                dialogue_track_idx = tl.add_audio_track()
+                tl.audio_track_info[dialogue_track_idx].name = "AI 对白"
+            return dialogue_track_idx
+
+        for shot in sorted(shots, key=lambda s: float(s.get("start", 0.0))):
+            path = final_path(shot)
+            if not path or not os.path.exists(path):
+                continue
+            duration = max(0.5, float(shot.get("duration", 3.0)))
+            start = base + float(shot.get("start", 0.0)) - first_start
+            selected_meta = next(
+                (asset for asset in shot.get("assets", [])
+                 if isinstance(asset, dict) and asset.get("path") == path), {})
+            asset_kind = str(selected_meta.get("kind") or shot.get("asset_type") or "image")
+            performance = shot.get("performance") or {}
+            pause_before = max(0.0, float(performance.get("pause_before", 0) or 0))
+            dialogue_audio = str(shot.get("dialogue_audio") or "")
+            has_dialogue_audio = bool(
+                dialogue_audio and os.path.exists(dialogue_audio))
+            source_duration = duration
+            trim_start = 0.0
+            trim_end = duration
+            speed = 1.0
+            if asset_kind == "video":
+                trim_start = max(0.0, float(
+                    shot.get("video_segment_offset") or 0.0))
+                actual_duration = float(selected_meta.get("actual_duration", 0) or 0)
+                if actual_duration <= 0:
+                    try:
+                        from ui.media_library import _get_duration
+                        actual_duration = float(_get_duration(path, "video") or 0)
+                    except Exception:
+                        actual_duration = 0.0
+                if actual_duration > 0:
+                    source_duration = actual_duration
+                    available = max(0.0, actual_duration - trim_start)
+                    if available >= duration:
+                        # 生成档位通常比目标镜头长：精确裁掉尾部。
+                        trim_end = trim_start + duration
+                    else:
+                        # 服务偶尔返回略短视频：用轻微慢放补齐，时间线时长仍严格等于目标。
+                        trim_end = actual_duration
+                        speed = available / duration if available > 0 else 1.0
+                        slowed += 1
+            clip = VideoClip(
+                source_path=path,
+                source_duration=source_duration,
+                trim_start=trim_start,
+                trim_end=trim_end,
+                timeline_start=start,
+                speed=speed,
+                volume=(0.12 if has_dialogue_audio and audio_policy == "duck" else 1.0),
+                mute=(has_dialogue_audio and audio_policy != "duck"),
+                has_alpha=(asset_kind == "video" and
+                           self._detect_video_alpha(path)),
+                out_transition=shot.get("transition") or None,
+            )
+            tl.add_video_clip(clip, track_idx=0, skip_overlap=True)
+            self.media_lib.add_file(path)
+            count, th = self._thumb_params(duration)
+            self._start_thumbnail_worker(clip, count, th)
+            voiceover = str(
+                performance.get("dialogue") or shot.get("voiceover") or "").strip()
+            if voiceover:
+                subtitle_start = min(start + pause_before, start + duration - 0.1)
+                tl.add_subtitle(SubtitleBlock(
+                    text=voiceover,
+                    timeline_start=subtitle_start,
+                    timeline_end=start + duration,
+                ))
+            if has_dialogue_audio:
+                try:
+                    from ui.media_library import _get_duration
+                    audio_duration = float(
+                        _get_duration(dialogue_audio, "audio") or 0.0)
+                except Exception:
+                    audio_duration = 0.0
+                if audio_duration > 0:
+                    tl.add_audio_clip(AudioClip(
+                        source_path=dialogue_audio,
+                        source_duration=audio_duration,
+                        trim_start=0.0,
+                        trim_end=audio_duration,
+                        timeline_start=min(
+                            start + pause_before, start + duration - 0.1),
+                        volume=1.0,
+                        fade_in=0.03,
+                        fade_out=0.08,
+                        label="AI 对白",
+                    ), track_idx=ensure_dialogue_track(), skip_overlap=True)
+                    self.media_lib.add_file(dialogue_audio)
+            imported += 1
+        if imported:
+            self._mark_dirty()
+            note = f"；{slowed} 个短素材已轻微慢放补齐" if slowed else ""
+            self.status_msg.emit(
+                (f"AI 分镜已按目标秒数导入：{imported} 个镜头{note}；"
+                 f"外部 TTS 已进入独立对白轨，VEO 原声"
+                 f"{'压到 12%' if audio_policy == 'duck' else '已替换'} ✓"), "success")
+        return imported
+
+    def import_canvas_media(self, payload: dict):
+        """把画布上的单个生成结果追加到当前剪辑时间线。"""
+        path = str((payload or {}).get("path") or "")
+        media_type = str((payload or {}).get("media_type") or "")
+        if not path or not os.path.exists(path) or media_type not in ("image", "video", "audio"):
+            return False
+        try:
+            from ui.media_library import _get_duration
+            duration = float(_get_duration(path, media_type) or 0.0)
+        except Exception:
+            duration = 0.0
+        self.media_lib.add_file(path)
+        self._add_to_timeline(path, media_type, duration,
+                              track_idx=-1, timeline_start=-1)
+        self._mark_dirty()
+        self.status_msg.emit(
+            f"{payload.get('title') or Path(path).stem} 已送到剪辑台 ✓", "success")
+        return True
+
+    def _on_ai_video_to_timeline(self, path: str):
+        """AI 视频 → 加入时间线。"""
+        if not path or not os.path.exists(path):
+            return
+        duration = 0.0
+        try:
+            from utils.ffmpeg_utils import get_ffmpeg_path
+            import re as _re
+            ffmpeg = get_ffmpeg_path()
+            probe = subprocess.run([ffmpeg, "-i", path], capture_output=True, text=True)
+            m = _re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", probe.stderr or "")
+            if m:
+                h, mi, s = int(m.group(1)), int(m.group(2)), float(m.group(3))
+                duration = h * 3600 + mi * 60 + s
+        except Exception:
+            duration = 0.0
+        self.media_lib.add_file(path)
+        self._add_to_timeline(path, "video", duration, track_idx=-1, timeline_start=-1)
+        self.status_msg.emit("AI 生成视频已添加到时间线 ✓", "success")
+
+    def _on_ai_video_to_library(self, path: str):
+        """AI 视频生成完成 → 直接加入素材库（不再显示生成结果页）。"""
+        if not path or not os.path.exists(path):
+            return
+        self.media_lib.add_file(path)
+        self.status_msg.emit("AI 生成视频已加入素材库 ✓", "success")
 
     # ─────────────────────────────────────────
     # 键盘快捷键
@@ -922,6 +1407,8 @@ class EditorTab(QWidget):
         self.media_lib.file_removed.connect(self._on_file_removed)
         # 下载完成 → 自动加入素材库
         self.download_panel.download_finished.connect(self._on_download_finished)
+        # Openverse 下载完成 → 按页面开关自动加入素材库
+        self.openverse_panel.download_finished.connect(self._on_openverse_download_finished)
         # 扒取面板 → 批量下载 + 去重
         self.scrape_panel.download_requested.connect(self.download_panel.add_tasks)
         self.download_panel.url_downloaded.connect(self.scrape_panel.mark_downloaded)
@@ -946,9 +1433,13 @@ class EditorTab(QWidget):
         tw.playhead_moved.connect(self._on_playhead_moved)
         tw.ai_separate_requested.connect(self._do_separate_clip)
         tw.ai_asr_requested.connect(self._do_asr_clip)
+        tw.scene_detect_requested.connect(self._start_scene_detection)
         tw.replace_video_requested.connect(self._on_replace_video_requested)
         tw.drop_media_requested.connect(self._on_drop_media)
         tw.new_timeline_requested.connect(self._on_new_timeline)
+        tw.scene_detect_selected_requested.connect(
+            self._start_scene_detection_for_selection)
+        tw.text_rough_cut_requested.connect(self._start_text_rough_cut)
         tw.freeze_requested.connect(self._on_freeze_frame)
         tw.extract_frame_requested.connect(self._on_extract_frame_to_image_editor)
         tw.reverse_requested.connect(self._on_reverse)
@@ -970,9 +1461,13 @@ class EditorTab(QWidget):
             (tw.playhead_moved, self._on_playhead_moved),
             (tw.ai_separate_requested, self._do_separate_clip),
             (tw.ai_asr_requested, self._do_asr_clip),
+            (tw.scene_detect_requested, self._start_scene_detection),
             (tw.replace_video_requested, self._on_replace_video_requested),
             (tw.drop_media_requested, self._on_drop_media),
             (tw.new_timeline_requested, self._on_new_timeline),
+            (tw.scene_detect_selected_requested,
+             self._start_scene_detection_for_selection),
+            (tw.text_rough_cut_requested, self._start_text_rough_cut),
             (tw.freeze_requested, self._on_freeze_frame),
             (tw.extract_frame_requested, self._on_extract_frame_to_image_editor),
             (tw.reverse_requested, self._on_reverse),
@@ -1025,7 +1520,7 @@ class EditorTab(QWidget):
     def _add_timeline(self, is_first: bool = False, name: str = ""):
         """创建新时间线并添加到 UI"""
         tl = EditTimeline() if not is_first else self._timelines[0]
-        tw = TimelineWidget(tl)
+        tw = TimelineWidget(tl, dubbing_config_provider=self._dubbing_cfg_provider)
         tw.setMinimumHeight(100)
 
         idx = len(self._tl_widgets)
@@ -1467,6 +1962,12 @@ class EditorTab(QWidget):
         self.media_lib.add_file(path)
         print(f"[editor_tab] 已调用 media_lib.add_file({path!r})")
 
+    def _on_openverse_download_finished(self, path: str):
+        """Openverse 音频下载完成 → 加入素材库并给出工作台反馈。"""
+        self._on_download_finished(path)
+        if path and os.path.exists(path):
+            self.status_msg.emit("Openverse 音频已下载并加入素材库 ✓", "success")
+
     # ─────────────────────────────────────────
     # 画布比例
     # ─────────────────────────────────────────
@@ -1683,6 +2184,30 @@ class EditorTab(QWidget):
             return
         self._start_thumbnail_worker(clip, count, thumb_h)
 
+    def _start_waveform_worker(self, clip):
+        if not getattr(clip, "source_path", "") or not os.path.exists(clip.source_path):
+            return
+        worker = WaveformWorker(clip)
+        worker.finished.connect(self._on_waveform_ready)
+        self._waveform_workers.append(worker)
+        worker.start()
+
+    def _on_waveform_ready(self, clip, peaks):
+        clip_id = getattr(clip, "id", "")
+        target = clip
+        for tl in self._timelines:
+            for track in tl.audio_tracks:
+                found = next((c for c in track if getattr(c, "id", "") == clip_id), None)
+                if found is not None:
+                    target = found
+                    break
+        target.waveform = peaks
+        self.timeline_widget.refresh_canvas()
+        worker = self.sender()
+        if worker in self._waveform_workers:
+            self._waveform_workers.remove(worker)
+            worker.deleteLater()
+
     def _regenerate_thumbnails(self, clip):
         """截断/分割后重新生成缩略图（以当前 trim_start/trim_end 为准）"""
         dur = getattr(clip, 'source_duration', 0) or clip.duration
@@ -1781,14 +2306,45 @@ class EditorTab(QWidget):
         elif media_type == "audio":
             if duration <= 0:
                 duration = 0.0
+            # MP3/M4A/AAC 等需先转成 WAV；拖入即预热，避免首次按空格才开始转码。
+            try:
+                self.preview._ensure_audio_for_video(path)
+            except Exception:
+                logging.debug("audio prewarm failed for %s", path, exc_info=True)
             if track_idx < 0:
                 track_idx = 0
             if timeline_start < 0:
+                # 未指定起点（双击素材库）→ 追加到该轨末尾
                 track_clips = tl.audio_tracks[track_idx] if track_idx < len(tl.audio_tracks) else []
                 timeline_start = max((c.timeline_end for c in track_clips), default=0.0)
-            clip = AudioClip(source_path=path, source_duration=duration,
-                             trim_start=0.0, trim_end=duration, timeline_start=timeline_start)
-            tl.add_audio_clip(clip, track_idx=track_idx)
+                clip = AudioClip(source_path=path, source_duration=duration,
+                                 trim_start=0.0, trim_end=duration, timeline_start=timeline_start)
+                tl.add_audio_clip(clip, track_idx=track_idx)
+            else:
+                # 指定起点（配音对齐字幕 / 拖拽）→ 精确落在指定时间，选不冲突轨
+                clip = AudioClip(source_path=path, source_duration=duration,
+                                 trim_start=0.0, trim_end=duration, timeline_start=timeline_start)
+                target = track_idx
+                while target >= len(tl.audio_tracks):
+                    tl.add_audio_track()
+                for i in range(track_idx, len(tl.audio_tracks)):
+                    conflict = any(
+                        c.timeline_start < timeline_start + duration
+                        and (c.timeline_start + c.duration) > timeline_start
+                        for c in tl.audio_tracks[i]
+                    )
+                    if not conflict:
+                        target = i
+                        break
+                # 选定轨道仍冲突（所有轨都占满）→ 新建轨道放最上层
+                if any(
+                    c.timeline_start < timeline_start + duration
+                    and (c.timeline_start + c.duration) > timeline_start
+                    for c in tl.audio_tracks[target]
+                ):
+                    target = tl.add_audio_track()
+                tl.add_audio_clip(clip, track_idx=target, skip_overlap=True)
+            self._start_waveform_worker(clip)
         # 标记素材已加入轨道（素材库状态角标）
         try:
             self.media_lib.mark_on_track(path, True)
@@ -1798,6 +2354,50 @@ class EditorTab(QWidget):
         # 导入素材后立即触发首帧提取，避免预览一直黑屏
         if media_type in ("video", "image"):
             self.preview._async_fetch(self.preview._current_sec)
+
+    def _dubbing_add_audio(self, path: str, duration: float, timeline_start: float,
+                           subtitle_end=None):
+        """配音面板生成完成后的落轨回调：配音按字幕起点对齐，追加到音频轨。
+
+        timeline_start 由配音面板传入（字幕 clip 的起始时间），使配音与字幕对齐。
+        使用完整配音时长落轨（不截断到字幕段，也不加入素材库）。
+
+        subtitle_end 仅用于起点对齐参考，不再用于截断音频时长。
+        """
+        # 按字幕起点对齐落轨，使用完整配音时长（避免「一丁点 / 无声」）
+        self._add_to_timeline(path, "audio", duration, timeline_start=timeline_start)
+
+    def _dubbing_cfg_provider(self) -> dict:
+        """供轨道多选字幕朗读复用：取配音面板当前引擎/音色/语速/音量配置。"""
+        dp = getattr(self, "props_panel", None)
+        dp = getattr(dp, "dubbing_panel", None) if dp is not None else None
+        if dp is not None:
+            try:
+                return dp.get_config()
+            except Exception:
+                pass
+        return {"engine": "edge", "voice": "", "rate": "+0%", "volume": 1.0}
+
+    def _get_selected_subtitles(self) -> list:
+        """返回当前时间线画布上选中的全部字幕 clip（框选多选 + 单条选中），按时间排序。
+
+        供配音面板批量生成使用：框选多条字幕后点「生成配音」可逐条生成并各自落轨。
+        """
+        try:
+            canvas = self.timeline_widget._canvas
+        except Exception:
+            return []
+        subs = []
+        for c, t in getattr(canvas, "_marquee_selected", []) or []:
+            if getattr(t, "kind", "") == "subtitle":
+                subs.append(c)
+        sel = getattr(canvas, "_selected_clip", None)
+        std = getattr(canvas, "_selected_td", None)
+        if sel is not None and std is not None and getattr(std, "kind", "") == "subtitle":
+            if sel not in subs:
+                subs.append(sel)
+        subs.sort(key=lambda c: getattr(c, "timeline_start", 0.0))
+        return subs
 
     def _snap_canvas_to_loaded_media(self):
         """工程加载后，画布比例未显式保存时，从已加载时间线首个视频/图片自动磁吸"""
@@ -2216,20 +2816,11 @@ class EditorTab(QWidget):
             latter_src_start = src_time  # 后半段从定格帧的源位置开始
             latter_src_end = clip.trim_end  # 到原片段结束
             latter_timeline_start = playhead_pos + freeze_dur  # 时间线起点后移 3s
-            latter = VideoClip(
-                source_path=clip.source_path,
-                source_duration=clip.source_duration,
-                trim_start=latter_src_start,
-                trim_end=latter_src_end,
-                timeline_start=latter_timeline_start,
-                speed=clip.speed,
-                volume=clip.volume,
-                pos_x=clip.pos_x, pos_y=clip.pos_y,
-                scale=clip.scale, rotation=clip.rotation,
-                keyframes=clip.keyframes.copy(),
-                has_alpha=getattr(clip, 'has_alpha', False),
-                opacity=getattr(clip, 'opacity', 1.0),
-            )
+            latter = VideoClip.from_dict(clip.to_dict())
+            latter.id = str(uuid.uuid4())[:8]
+            latter.trim_start = latter_src_start
+            latter.trim_end = latter_src_end
+            latter.timeline_start = latter_timeline_start
 
             # ── 截断原片段（结束于定格点） ──
             self.timeline._save_history()
@@ -2239,16 +2830,17 @@ class EditorTab(QWidget):
             rebase_clip_keyframes(latter, orig_trim_start, orig_trim_end)
 
             # ── 创建定格帧 VideoClip ──
-            freeze_clip = VideoClip(
-                source_path=os.path.abspath(vid_path),
-                source_duration=freeze_dur,
-                trim_start=0.0,
-                trim_end=freeze_dur,
-                timeline_start=playhead_pos,
-                speed=1.0,
-                volume=clip.volume,
-                has_alpha=False,  # 定格帧是截取的 JPEG，无 alpha
-            )
+            freeze_clip = VideoClip.from_dict(clip.to_dict())
+            freeze_clip.id = str(uuid.uuid4())[:8]
+            freeze_clip.source_path = os.path.abspath(vid_path)
+            freeze_clip.source_duration = freeze_dur
+            freeze_clip.trim_start = 0.0
+            freeze_clip.trim_end = freeze_dur
+            freeze_clip.timeline_start = playhead_pos
+            freeze_clip.speed = 1.0
+            freeze_clip.has_alpha = False  # 定格帧是截取的 JPEG，无源 alpha
+            freeze_clip.keyframes = {}
+            freeze_clip.out_transition = None
 
             # ── 插入：原片段后 → 定格帧 → 后半段 ──
             insert_idx = idx_in_track + 1
@@ -2408,6 +3000,113 @@ class EditorTab(QWidget):
         except Exception as e:
             QMessageBox.warning(self, "错误", f"倒放异常：{e}")
 
+    # ── AI 生成视频（时间线右键）──
+    def _on_ai_video_gen(self, clip):
+        """旧信号兼容：剪辑台不再发起视频生成。"""
+        self.status_msg.emit("请把视频送回 AI 制片画布后使用视频节点", "info")
+
+    def _extract_clip_frame(self, clip, rel_time: float) -> str | None:
+        """在 clip 内部 rel_time（时间线秒）处抽一帧 PNG 到 work_temp/，返回路径；失败返回 None。"""
+        try:
+            from utils.ffmpeg_utils import get_ffmpeg_path
+            import time as _time
+
+            ffmpeg = get_ffmpeg_path()
+            src = getattr(clip, "source_path", None)
+            if not src or not os.path.exists(src):
+                return None
+            rel_time = max(0.0, min(rel_time, clip.duration * 0.999))
+            src_time = clip.trim_start + rel_time * clip.speed
+
+            stamp = str(int(_time.time() * 1000))
+            os.makedirs("work_temp", exist_ok=True)
+            out = os.path.abspath(os.path.join("work_temp", f"aiframe_{stamp}.png"))
+            subprocess.run(
+                [ffmpeg, "-y", "-ss", str(src_time), "-i", src,
+                 "-vframes", "1", "-pix_fmt", "rgb24", out],
+                capture_output=True, check=True, timeout=30)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                return out
+        except Exception:
+            pass
+        return None
+
+    def _extract_clip_frame_at_playhead(self, clip) -> str | None:
+        """在当前播放头位置抽一帧 PNG 到 work_temp/，返回路径；失败返回 None。"""
+        playhead = self.timeline_widget.get_playhead()
+        rel_time = playhead - clip.timeline_start
+        return self._extract_clip_frame(clip, rel_time)
+
+    def _clip_at_playhead(self, ph: float):
+        """返回播放头 ph 所在的视频/叠加轨片段；不在任何片段上则返回 None。"""
+        canvas = self.timeline_widget._canvas
+        for td in canvas._tracks:
+            if td.kind != "video":
+                continue
+            for c in canvas._clips_of(td):
+                start = c.timeline_start
+                end = start + c.duration
+                if start <= ph < end:
+                    return c
+        return None
+
+    def _detect_cut_at_playhead(self, ph: float, thresh: float = 0.1):
+        """检测播放头是否落在「某视频片段结束 → 紧接另一视频片段开始」的截断点。
+
+        返回 (preceding_clip, following_clip)；否则 (None, None)。
+        """
+        canvas = self.timeline_widget._canvas
+        for td in canvas._tracks:
+            if td.kind != "video":
+                continue
+            clips = sorted(canvas._clips_of(td), key=lambda c: c.timeline_start)
+            for i, c in enumerate(clips):
+                c_end = c.timeline_start + c.duration
+                if abs(c_end - ph) <= thresh:
+                    nxt = clips[i + 1] if i + 1 < len(clips) else None
+                    if nxt is not None and abs(nxt.timeline_start - ph) <= thresh:
+                        return c, nxt
+        return None, None
+
+    def _on_capture_frame_for_ai(self, slot: int = 1):
+        """📷 截取帧 → 填到视频生成参考图 slot。
+
+        首尾帧模式：若播放头在 A片段末尾→B片段开头 的截断点，
+        slot=1 截 A末帧（首帧）、slot=2 截 B首帧（尾帧）。
+        非首尾帧模式 / 未在截断点：截当前帧。
+        """
+        self.status_msg.emit("截帧生成已迁移到 AI 制片画布", "info")
+        return
+        ph = self.timeline_widget.get_playhead()
+        vp = self._ai_assistant._video_panel
+        is_first_last = vp._first_last_toggle.isChecked()
+
+        ref = None
+        label = {1: "参考图 1", 2: "参考图 2"}.get(slot, f"参考图 {slot}")
+
+        if is_first_last:
+            preceding, following = self._detect_cut_at_playhead(ph)
+            if slot == 1 and preceding is not None:
+                ref = self._extract_clip_frame(preceding, max(0, preceding.duration - 0.05))
+                label = "参考图 1（首帧）"
+            elif slot == 2 and following is not None:
+                ref = self._extract_clip_frame(following, 0.0)
+                label = "参考图 2（尾帧）"
+
+        if ref is None:
+            clip = self._clip_at_playhead(ph)
+            if clip is not None:
+                ref = self._extract_clip_frame_at_playhead(clip)
+
+        if ref:
+            vp.set_ref(slot, ref)
+            self.open_ai_assistant("video")
+            self.status_msg.emit(f"已截取当前帧作为{label} ✓", "info")
+            return
+
+        self.open_ai_assistant("video")
+        self.status_msg.emit("播放头未落在视频片段上，请先移动到片段内再截取", "warn")
+
     # ── 查找片段在时间线中的位置 ──
     def _find_clip_in_timeline(self, clip):
         """返回 (TrackDesc, index_in_track) 或 (None, -1)"""
@@ -2486,6 +3185,7 @@ class EditorTab(QWidget):
         except (TypeError, RuntimeError, AttributeError):
             pass
         if w.isRunning():
+            w.requestInterruption()
             w.quit()
             if not w.wait(3000):
                 w.terminate()
@@ -2629,6 +3329,8 @@ class EditorTab(QWidget):
         except Exception:
             self._vocals_path = vocals_wav
             self._bgm_path = bgm_wav
+        if self._vocals_path:
+            self._separated_vocals[os.path.abspath(src_path)] = self._vocals_path
 
         self._clear_ai_progress()
         self.status_msg.emit("人声分离完成 ✓", "success")
@@ -2670,17 +3372,141 @@ class EditorTab(QWidget):
         _add_audio_track(self._vocals_path, 0, "人声")
         _add_audio_track(self._bgm_path,    1, "背景音")
 
+    def _selected_video_clip(self):
+        clip = self.props_panel.current_clip()
+        if not isinstance(clip, VideoClip):
+            clip = getattr(self.timeline_widget._canvas, "_selected_clip", None)
+        return clip if isinstance(clip, VideoClip) else None
+
+    def _start_scene_detection_for_selection(self):
+        clip = self._selected_video_clip()
+        if not isinstance(clip, VideoClip):
+            QMessageBox.information(self, "智能分镜", "请先在时间线中选中一个视频片段。")
+            return
+        self._start_scene_detection(clip)
+
+    def _start_scene_detection(self, clip: VideoClip):
+        if self._ai_busy():
+            QMessageBox.information(self, "智能分镜", "另一个 AI/分析任务正在运行，请稍候。")
+            return
+        if not clip.source_path or not os.path.exists(clip.source_path):
+            QMessageBox.warning(self, "智能分镜", "找不到该视频的源文件。")
+            return
+        if clip.duration < 0.6:
+            QMessageBox.information(self, "智能分镜", "片段太短，无需继续截开。")
+            return
+        dialog = SceneDetectDialog(clip.duration, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        config = dialog.config()
+        self._scene_detect_clip = clip
+        self._stop_ai_worker()
+        worker = _SceneDetectWorker(clip, **config)
+        worker.progress.connect(self._on_ai_progress)
+        worker.finished.connect(lambda cuts, source=clip: self._on_scene_detect_done(source, cuts))
+        worker.error.connect(self._on_scene_detect_error)
+        self._ai_worker = worker
+        self.status_msg.emit(
+            f"智能分镜：正在分析 {Path(clip.source_path).name}…", "info")
+        worker.start()
+
+    def _on_scene_detect_error(self, error: str):
+        self._clear_ai_progress()
+        logging.error("scene detection failed: %s", error)
+        QMessageBox.warning(self, "智能分镜失败", error.splitlines()[0][:240])
+        self.status_msg.emit("智能分镜检测失败", "error")
+
+    def _on_scene_detect_done(self, clip: VideoClip, cuts: list):
+        self._clear_ai_progress()
+        track = next((candidate for candidate in self.timeline.video_tracks
+                      if any(item is clip for item in candidate)), None)
+        if track is None:
+            self.status_msg.emit("检测完成，但原视频片段已被修改或删除", "warn")
+            return
+        if not cuts:
+            QMessageBox.information(
+                self, "智能分镜", "没有检测到足够明显的画面跳变。\n\n"
+                "可以重新检测并选择“灵敏”，或降低自定义阈值。")
+            self.status_msg.emit("智能分镜：未检测到有效切点", "info")
+            return
+        if len(cuts) > 100:
+            answer = QMessageBox.question(
+                self, "智能分镜",
+                f"检测到 {len(cuts)} 个切点，将生成 {len(cuts) + 1} 个片段。\n"
+                "结果可能比较碎，仍要继续吗？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No)
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        self._apply_scene_cuts(clip, track, cuts)
+
+    def _apply_scene_cuts(self, clip: VideoClip, track: list, cuts: list):
+        speed = max(clip.speed, 0.01)
+        source_boundaries = [clip.trim_start]
+        source_boundaries.extend(
+            clip.trim_start + float(row["time"]) for row in cuts)
+        source_boundaries.append(clip.trim_end)
+        source_boundaries = sorted(set(round(value, 6) for value in source_boundaries))
+        if len(source_boundaries) < 3:
+            return
+
+        self.timeline._save_history()
+        new_clips = []
+        for index, (source_start, source_end) in enumerate(
+                zip(source_boundaries, source_boundaries[1:])):
+            if source_end - source_start < 0.03:
+                continue
+            clone = VideoClip.from_dict(clip.to_dict())
+            clone.id = str(uuid.uuid4())[:8]
+            old_trim_start, old_trim_end = clone.trim_start, clone.trim_end
+            clone.trim_start = source_start
+            clone.trim_end = source_end
+            clone.timeline_start = (
+                clip.timeline_start + (source_start - clip.trim_start) / speed)
+            rebase_clip_keyframes(clone, old_trim_start, old_trim_end)
+            clone.out_transition = (
+                clip.out_transition if index == len(source_boundaries) - 2 else None)
+            if hasattr(clip, "thumbnail"):
+                clone.thumbnail = clip.thumbnail
+            if hasattr(clip, "thumbnails"):
+                clone.thumbnails = clip.thumbnails
+            new_clips.append(clone)
+
+        if len(new_clips) < 2:
+            return
+        track[:] = [item for item in track if item is not clip]
+        track.extend(new_clips)
+        track.sort(key=lambda item: item.timeline_start)
+        self.timeline.changed.emit()
+        self.timeline_widget.rebuild_canvas()
+        self.timeline_widget._canvas._selected_clip = new_clips[0]
+        self.timeline_widget.set_playhead(new_clips[0].timeline_start)
+        self.props_panel.set_selection(new_clips[0], "video")
+        self.preview.seek(new_clips[0].timeline_start, force=True)
+        for new_clip in new_clips:
+            self._regenerate_thumbnails(new_clip)
+        self.status_msg.emit(
+            f"智能分镜完成：检测到 {len(new_clips) - 1} 个切点，生成 {len(new_clips)} 个片段 ✓",
+            "success")
+
+    def _start_text_rough_cut(self):
+        clip = self._selected_video_clip()
+        if not isinstance(clip, VideoClip):
+            QMessageBox.information(self, "文字粗剪", "请先在时间线中选中一个视频片段。")
+            return
+        self._do_asr_clip(clip)
+
     def _do_asr_clip(self, clip):
         if self._ai_busy():
             QMessageBox.information(self, "提示", "AI 工作中，请稍候。"); return
         # 记录偏移量：ASR时间戳需要加上此值才能映射到时间线位置
         self._asr_offset = clip.timeline_start - clip.trim_start
         self._asr_clip = clip
-        # 优先用分离后的人声
-        if self._vocals_path and Path(self._vocals_path).exists():
-            audio = self._vocals_path
-        else:
-            audio = self._get_clip_path(clip)
+        # 只复用“当前源视频”对应的人声文件，避免误拿上一次分离的其他视频。
+        from core.edit_engine import VideoClip
+        source_audio = self._get_clip_path(clip)
+        separated = self._separated_vocals.get(os.path.abspath(source_audio)) if source_audio else None
+        audio = separated if separated and Path(separated).exists() else source_audio
         if not audio:
             QMessageBox.warning(self, "错误", "找不到音频文件"); return
 
@@ -2699,15 +3525,60 @@ class EditorTab(QWidget):
         offset = getattr(self, '_asr_offset', 0.0)
         # 去除标点符号（中文+英文标点，保留空格和字母数字）
         _strip_punct = str.maketrans('', '', '，。！？、；：""''（）【】《》…—·,.:;!?\"\'()[]{}<>…—–-')
-        self._orig_subs = [{"start": e.start + offset, "end": e.end + offset,
-                            "text": e.text.translate(_strip_punct).strip()} for e in entries]
-        self._trans_subs = []
-        self.status_msg.emit(f"识别完成：{len(entries)} 条字幕 ✓", "success")
 
-        # 自动同步到字幕轨道
-        if entries:
+        # 收集轨道上已有字幕（叠加不清除，保留原有样式）
+        existing = []
+        for track in self.timeline.subtitle_tracks:
+            for b in track:
+                d = b.to_dict()
+                existing.append({
+                    "start": d["timeline_start"], "end": d["timeline_end"], "text": d["text"],
+                    "from_asr": d["from_asr"], "word_animation": d["word_animation"],
+                    "fill_enabled": d["fill_enabled"], "background_color": d["background_color"],
+                    "color": d["color"], "outline_color": d["outline_color"],
+                    "outline_width": d["outline_width"], "font_family": d["font_family"],
+                    "font_size": d["font_size"], "font_bold": d["font_bold"],
+                    "font_italic": d["font_italic"], "position": d["position"],
+                    "margin_v": d["margin_v"], "align": d["align"],
+                    "pos_x": d["pos_x"], "pos_y": d["pos_y"], "scale": d["scale"],
+                    "rotation": d["rotation"], "opacity": d["opacity"],
+                    "word_timings": d["word_timings"],
+                })
+
+        # 文字粗剪只处理当前视频的有效源区间；Whisper 返回的是整个源文件时间戳。
+        clip = getattr(self, "_asr_clip", None)
+        is_video_cut = isinstance(clip, VideoClip)
+        trim_start = float(getattr(clip, "trim_start", 0.0))
+        trim_end = float(getattr(clip, "trim_end", float("inf")))
+        new_subs = []
+        for entry in entries:
+            source_start = max(trim_start, float(entry.start)) if is_video_cut else float(entry.start)
+            source_end = min(trim_end, float(entry.end)) if is_video_cut else float(entry.end)
+            text = entry.text.translate(_strip_punct).strip()
+            if source_end - source_start < 0.03 or not text:
+                continue
+            timeline_start = (
+                clip.timeline_start + (source_start - clip.trim_start) / max(clip.speed, 0.01)
+                if is_video_cut else source_start + offset)
+            timeline_end = (
+                clip.timeline_start + (source_end - clip.trim_start) / max(clip.speed, 0.01)
+                if is_video_cut else source_end + offset)
+            new_subs.append({
+                "start": timeline_start,
+                "end": timeline_end,
+                "source_start": source_start,
+                "source_end": source_end,
+                "text": text,
+                "_keep": True,
+            })
+        self._orig_subs = new_subs if is_video_cut else existing + new_subs
+        self._trans_subs = []
+        self.status_msg.emit(f"识别完成：{len(new_subs)} 条有效语句 ✓", "success")
+
+        # 音频片段仍沿用原来的识别即加字幕；视频片段先交给文字粗剪弹窗选择。
+        if new_subs and not is_video_cut:
             self._sync_subs_to_timeline(self._orig_subs)
-            self.status_msg.emit(f"识别完成，已同步 {len(entries)} 条字幕到轨道 ✓", "success")
+            self.status_msg.emit(f"识别完成，已同步 {len(new_subs)} 条字幕到轨道 ✓", "success")
 
         # 打开字幕管理弹窗（供预览/翻译）
         self._open_subtitle_dialog()
@@ -2723,14 +3594,28 @@ class EditorTab(QWidget):
         self.preview._sub_interaction = None
         self.preview._seq_state = None
         self.preview._async_fetch(self.preview._current_sec)
-        dlg = SubtitleManagerDialog(self._orig_subs, self._trans_subs, self)
+        active_clip = getattr(self, "_asr_clip", None)
+        rough_cut_enabled = isinstance(active_clip, VideoClip) and any(
+            active_clip is clip for track in self.timeline.video_tracks for clip in track)
+        dlg = SubtitleManagerDialog(
+            self._orig_subs, self._trans_subs, self,
+            rough_cut_enabled=rough_cut_enabled)
         dlg.sync_to_timeline.connect(self._sync_subs_to_timeline)
+        dlg.rough_cut_requested.connect(self._apply_text_rough_cut)
+        dlg.preview_requested.connect(self._preview_rough_cut_sentence)
         dlg.exec()
-        # 同步可能修改的数据
-        self._orig_subs = dlg._orig
-        self._trans_subs = dlg._trans
+        # 粗剪会替换原 clip，并在槽函数里写入重排后的字幕；此时不要再被弹窗旧数据覆盖。
+        source_clip_still_exists = any(
+            active_clip is clip for track in self.timeline.video_tracks for clip in track)
+        if not rough_cut_enabled or source_clip_still_exists:
+            self._orig_subs = dlg._orig
+            self._trans_subs = dlg._trans
 
-    def _sync_subs_to_timeline(self, subs: list):
+    def _preview_rough_cut_sentence(self, sec: float):
+        self.timeline_widget.set_playhead(sec)
+        self.preview.seek(sec, force=True)
+
+    def _sync_subs_to_timeline(self, subs: list, save_history: bool = True):
         # 先清理画布上内联编辑/选中状态，避免 rebuild 后 _editing_sub/_selected_sub 变成野指针
         if getattr(self.preview, '_editing_sub', None) is not None:
             self.preview._hide_sub_editor(save=False)
@@ -2738,25 +3623,123 @@ class EditorTab(QWidget):
         self.preview._sub_interaction = None
         self.preview._seq_state = None
 
-        self.timeline._save_history()  # 保存 undo 快照
+        if save_history:
+            self.timeline._save_history()  # 保存 undo 快照
         for track in self.timeline.subtitle_tracks:
             track.clear()
+        if not self.timeline.subtitle_tracks:
+            self.timeline.subtitle_tracks.append([])
+            self.timeline.subtitle_track_info.append(TrackInfo("字幕1"))
         for s in subs:
             block = SubtitleBlock(
-                text=s["text"],
-                timeline_start=s["start"],
-                timeline_end=s["end"],
-                from_asr=True,
-                word_animation=True,
-                fill_enabled=False,
-                background_color="",
-                color="#FFFFFF",
-                outline_color="#000000",
-                outline_width=0,
+                text=s.get("text", ""),
+                timeline_start=s.get("start", s.get("timeline_start", 0.0)),
+                timeline_end=s.get("end", s.get("timeline_end", s.get("start", 0.0) + 3.0)),
+                from_asr=s.get("from_asr", True),
+                word_animation=s.get("word_animation", True),
+                fill_enabled=s.get("fill_enabled", False),
+                background_color=s.get("background_color", ""),
+                color=s.get("color", "#FFFFFF"),
+                outline_color=s.get("outline_color", "#000000"),
+                outline_width=s.get("outline_width", 0),
+                font_family=s.get("font_family", "Microsoft YaHei"),
+                font_size=s.get("font_size", 15),
+                font_bold=s.get("font_bold", False),
+                font_italic=s.get("font_italic", False),
+                position=s.get("position", "bottom"),
+                margin_v=s.get("margin_v", 60),
+                align=s.get("align", "center"),
+                pos_x=s.get("pos_x"),
+                pos_y=s.get("pos_y"),
+                scale=s.get("scale", 1.0),
+                rotation=s.get("rotation", 0.0),
+                opacity=s.get("opacity", 1.0),
+                word_timings=s.get("word_timings", []),
             )
-            self.timeline.add_subtitle(block)
+            self.timeline.subtitle_tracks[0].append(block)
+        self.timeline.changed.emit()
         self.timeline_widget.rebuild_canvas()
         self.status_msg.emit(f"已同步 {len(subs)} 条字幕到时间线", "success")
+
+    def _apply_text_rough_cut(self, selected_subs: list, padding: float,
+                              compact: bool, add_subtitles: bool):
+        clip = getattr(self, "_asr_clip", None)
+        track = None
+        for candidate_track in self.timeline.video_tracks:
+            if any(clip is item for item in candidate_track):
+                track = candidate_track
+                break
+        if not isinstance(clip, VideoClip) or track is None:
+            QMessageBox.warning(self, "文字粗剪", "原视频片段已不存在，请重新选中视频并识别。")
+            return
+
+        from core.text_rough_cut import build_cut_plan
+        ranges, remapped_subs = build_cut_plan(
+            selected_subs,
+            source_offset=clip.timeline_start - clip.trim_start / max(clip.speed, 0.01),
+            trim_start=clip.trim_start,
+            trim_end=clip.trim_end,
+            timeline_start=clip.timeline_start,
+            speed=clip.speed,
+            padding=padding,
+            compact=compact,
+        )
+        if not ranges:
+            QMessageBox.information(self, "文字粗剪", "勾选内容没有形成有效剪辑区间。")
+            return
+
+        old_end = clip.timeline_end
+        old_duration = clip.duration
+        self.timeline._save_history()
+        new_clips = []
+        for index, cut_range in enumerate(ranges):
+            clone = VideoClip.from_dict(clip.to_dict())
+            clone.id = str(uuid.uuid4())[:8]
+            old_trim_start, old_trim_end = clone.trim_start, clone.trim_end
+            clone.trim_start = cut_range["source_start"]
+            clone.trim_end = cut_range["source_end"]
+            clone.timeline_start = cut_range["timeline_start"]
+            rebase_clip_keyframes(clone, old_trim_start, old_trim_end)
+            clone.out_transition = clip.out_transition if index == len(ranges) - 1 else None
+            if hasattr(clip, "thumbnail"):
+                clone.thumbnail = clip.thumbnail
+            if hasattr(clip, "thumbnails"):
+                clone.thumbnails = clip.thumbnails
+            new_clips.append(clone)
+
+        track[:] = [item for item in track if item is not clip]
+        track.extend(new_clips)
+        track.sort(key=lambda item: item.timeline_start)
+
+        # 压紧时同时把同轨后续素材整体左移，避免只压紧当前片段内部却留下尾部空洞。
+        new_duration = sum(item.duration for item in new_clips)
+        removed_duration = max(0.0, old_duration - new_duration)
+        if compact and removed_duration > 0.001:
+            for other in track:
+                if other not in new_clips and other.timeline_start >= old_end - 0.001:
+                    other.timeline_start = max(0.0, other.timeline_start - removed_duration)
+
+        if add_subtitles:
+            self._orig_subs = remapped_subs
+            self._trans_subs = []
+            self._sync_subs_to_timeline(remapped_subs, save_history=False)
+        else:
+            self.timeline.changed.emit()
+            self.timeline_widget.rebuild_canvas()
+
+        canvas = self.timeline_widget._canvas
+        canvas._selected_clip = new_clips[0]
+        self.timeline_widget.set_playhead(new_clips[0].timeline_start)
+        self.props_panel.set_selection(new_clips[0], "video")
+        self.preview.seek(new_clips[0].timeline_start, force=True)
+        for new_clip in new_clips:
+            self._regenerate_thumbnails(new_clip)
+        self.status_msg.emit(
+            f"文字粗剪完成：生成 {len(new_clips)} 个片段，删除约 {removed_duration:.1f} 秒 ✓",
+            "success")
+        sender = self.sender()
+        if isinstance(sender, SubtitleManagerDialog):
+            sender.accept()
 
     # ─────────────────────────────────────────
     # 工程保存/加载 (.cep JSON)
@@ -2870,7 +3853,7 @@ class EditorTab(QWidget):
         for i, td in enumerate(tl_dicts):
             tl = EditTimeline.from_dict(td)
             self._timelines.append(tl)
-            tw = TimelineWidget(tl)
+            tw = TimelineWidget(tl, dubbing_config_provider=self._dubbing_cfg_provider)
             tw.setMinimumHeight(100)
             self._tl_widgets.append(tw)
             self._tl_stack.addWidget(tw)
@@ -2885,7 +3868,7 @@ class EditorTab(QWidget):
             # 无内容时创建默认时间线
             tl = EditTimeline()
             self._timelines.append(tl)
-            tw = TimelineWidget(tl)
+            tw = TimelineWidget(tl, dubbing_config_provider=self._dubbing_cfg_provider)
             tw.setMinimumHeight(100)
             self._tl_widgets.append(tw)
             self._tl_stack.addWidget(tw)
@@ -2945,6 +3928,10 @@ class EditorTab(QWidget):
                     if clip.source_path and os.path.exists(clip.source_path):
                         cnt, th = self._thumb_params(clip.source_duration)
                         self._start_thumbnail_worker(clip, cnt, th)
+            for track in tl.audio_tracks:
+                for clip in track:
+                    if clip.source_path and os.path.exists(clip.source_path):
+                        self._start_waveform_worker(clip)
 
     def _load_project(self):
         """从 .cep JSON 文件加载工程"""
@@ -2962,6 +3949,10 @@ class EditorTab(QWidget):
             if w.isRunning():
                 w.wait(3000)
         self._thumb_workers.clear()
+        for w in list(self._waveform_workers):
+            if w.isRunning():
+                w.wait(3000)
+        self._waveform_workers.clear()
         self._stop_ai_worker()
         # 停止当前播放
         self.preview.stop_audio()
@@ -3154,7 +4145,18 @@ class EditorTab(QWidget):
         fps = cfg["fps"]
         crf = cfg.get("crf", 18)
 
-        worker = FFmpegDirectExportWorker(self.timeline, cfg["path"], (W, H), fps, crf)
+        # 字幕预览实际绘制在工作台当前可见画布（通常约 640×360）上，
+        # font_size 也是基于这个画布调出来的。导出时必须以该可见画布为
+        # 参考缩放到输出分辨率，才能保持字幕在画面中的相对大小一致。
+        preview_w = int(getattr(self.preview, "_canvas_w", 0) or 0)
+        preview_h = int(getattr(self.preview, "_canvas_h", 0) or 0)
+        reference_size = ((preview_w, preview_h)
+                          if preview_w > 0 and preview_h > 0
+                          else (canvas_size or (W, H)))
+        worker = FFmpegDirectExportWorker(
+            self.timeline, cfg["path"], (W, H), fps, crf,
+            reference_resolution=reference_size,
+        )
 
         self._export_worker = worker
 
@@ -3188,6 +4190,10 @@ class EditorTab(QWidget):
             if w.isRunning():
                 w.wait(3000)   # 最多等 3 秒让线程自然结束
         self._thumb_workers.clear()
+        for w in list(self._waveform_workers):
+            if w.isRunning():
+                w.wait(3000)
+        self._waveform_workers.clear()
 
         # 停止 AI worker（使用安全停止方法）
         self._stop_ai_worker()

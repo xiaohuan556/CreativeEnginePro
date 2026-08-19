@@ -41,10 +41,16 @@ class VideoCompositor:
     """
 
     def __init__(self, timeline: EditTimeline, resolution: Tuple[int, int],
-                 fps: float = 30.0):
+                 fps: float = 30.0,
+                 subtitle_reference_resolution: Tuple[int, int] | None = None):
         self.tl = timeline
         self.W, self.H = resolution
         self.fps = fps
+        ref_w, ref_h = subtitle_reference_resolution or resolution
+        self._subtitle_scale = min(
+            self.W / max(float(ref_w), 1.0),
+            self.H / max(float(ref_h), 1.0),
+        )
 
         # 状态机解码器（替代原始 cv2.VideoCapture：连续 read 替代每帧 seek ~200ms）
         from core.clip_decoder import DecoderManager, ClipDecoder
@@ -270,6 +276,14 @@ class VideoCompositor:
             except Exception:
                 logging.debug("compositor chroma key failed", exc_info=True)
 
+        if getattr(clip, 'mask_enabled', False):
+            try:
+                from utils.video_mask import apply_video_mask
+                scaled_img = apply_video_mask(
+                    scaled_img, clip, sec - clip.timeline_start)
+            except Exception:
+                logging.debug("compositor video mask failed", exc_info=True)
+
         painter.save()
         # 视频整体不透明度（含 alpha 视频：setOpacity 会乘到源 alpha 上）
         _op = self._clip_opacity(clip, sec)
@@ -456,9 +470,11 @@ class VideoCompositor:
 
     def _paint_subtitles(self, painter: QPainter, canvas: QImage, sec: float):
         """渲染所有活跃字幕块"""
-        for track in self.tl.subtitle_tracks:
-            info_list = getattr(self.tl, 'subtitle_track_info', [])
-            # 无法确定 track index，简化处理
+        info_list = getattr(self.tl, 'subtitle_track_info', [])
+        for track_idx, track in enumerate(self.tl.subtitle_tracks):
+            info = info_list[track_idx] if track_idx < len(info_list) else None
+            if info and getattr(info, 'muted', False):
+                continue
             for b in track:
                 if not getattr(b, 'visible', True):
                     continue
@@ -489,21 +505,21 @@ class VideoCompositor:
             py = float(pos_y)
 
         # ── 样式 ──
-        fs = getattr(block, 'font_size', 15) or 15
+        fs = (getattr(block, 'font_size', 15) or 15) * self._subtitle_scale
         fc = getattr(block, 'color', '#ffffff') or '#ffffff'
         family = getattr(block, 'font_family', 'Microsoft YaHei') or 'Microsoft YaHei'
         bold = getattr(block, 'font_bold', False)
         italic = getattr(block, 'font_italic', False)
         underline = getattr(block, 'font_underline', False)
-        letter_sp = getattr(block, 'letter_spacing', 0) or 0
-        line_sp = getattr(block, 'line_spacing', 0) or 0
-        ow = getattr(block, 'outline_width', 0) or 0
+        letter_sp = int(round((getattr(block, 'letter_spacing', 0) or 0) * self._subtitle_scale))
+        line_sp = int(round((getattr(block, 'line_spacing', 0) or 0) * self._subtitle_scale))
+        ow = int(round((getattr(block, 'outline_width', 0) or 0) * self._subtitle_scale))
         oc = getattr(block, 'outline_color', '#000000') or '#000000'
 
         # ── 背景填充 ──
         has_fill = getattr(block, 'fill_enabled', False)
         bg_color = getattr(block, 'background_color', '#000000') or '#000000'
-        border_radius = getattr(block, 'border_radius', 4) or 4
+        border_radius = int(round((getattr(block, 'border_radius', 4) or 4) * self._subtitle_scale))
 
         # ── 逐词动画 ──
         word_anim = getattr(block, 'word_animation', False)
@@ -533,7 +549,7 @@ class VideoCompositor:
             fs = max(6, int(fs * sc))
 
         # ── custom_width 实时换行 ──
-        cw_custom = getattr(block, 'custom_width', 0) or 0
+        cw_custom = int(round((getattr(block, 'custom_width', 0) or 0) * self._subtitle_scale))
         if cw_custom > 0:
             flat = text.replace('\n', '')
             wrap_font = QFont(family, fs)

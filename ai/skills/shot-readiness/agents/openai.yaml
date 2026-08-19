@@ -1,0 +1,4 @@
+interface:
+  display_name: "镜头就绪检查"
+  short_description: "Validate every shot before advancing production"
+  default_prompt: "Use $shot-readiness to validate whether these shots can enter the next production stage."

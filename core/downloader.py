@@ -3,7 +3,7 @@ downloader.py — 内置下载引擎
 
 - yt-dlp 子进程封装（视频/音频下载）
 - 格式探测与选择
-- 免版权音乐搜索（Pixabay / Mixkit / Freesound）
+- 视频和音频链接下载
 """
 from __future__ import annotations
 
@@ -111,6 +111,8 @@ class DownloadTask:
     media_type: str = "video"  # video / audio
     video_only: bool = False   # 仅下载视频流（不含音频）
     cookies_browser: str = ""  # 指定用于 cookies 的浏览器（""=自动）
+    batch_id: str = ""         # 批次标识；扒取自动化用来等待整批完成
+    postprocess: dict = field(default_factory=dict)  # 下载后自动处理预设
 
 
 # ─── yt-dlp 可用性检测 ───
@@ -288,14 +290,19 @@ BROWSER_LABELS = {
     "brave": "Brave", "opera": "Opera", "vivaldi": "Vivaldi", "whale": "Whale",
     "ghostery": "Ghostery", "safari": "Safari",
 }
+_BROWSER_CACHE: Optional[tuple[str, ...]] = None
 
 
-def get_available_browsers() -> list[str]:
+def get_available_browsers(force_refresh: bool = False) -> list[str]:
     """返回本机已安装、可被 yt-dlp 用作 cookies 来源的浏览器名列表（按优先级）。
 
     跨平台扫描常见安装位置（含用户态目录 %LOCALAPPDATA%），
     并补充 PATH 兜底，确保任意品牌 / 任意系统的浏览器都能被识别。
     """
+    global _BROWSER_CACHE
+    if _BROWSER_CACHE is not None and not force_refresh:
+        return list(_BROWSER_CACHE)
+
     found: list[str] = []
     if os.name == "nt":
         for name, paths in _BROWSER_PATHS.items():
@@ -313,18 +320,26 @@ def get_available_browsers() -> list[str]:
                 if p and os.path.exists(p):
                     found.append(name)
                     break
-    # PATH 兜底（跨平台）：覆盖 yt-dlp 支持的全部浏览器可执行名
-    import shutil as _sh
-    for name in ("firefox", "edge", "msedge", "chrome", "chromium",
-                 "brave", "opera", "vivaldi", "whale", "ghostery", "safari"):
-        if name in found:
-            continue
-        found_path = _sh.which(name) or _sh.which(name + ".exe")
-        if found_path:
-            found.append("edge" if name == "msedge" else name)
+    # Windows 上不要调用 shutil.which：Microsoft Store 的 WindowsApps PATH
+    # 在部分机器上会发生极慢/阻塞访问，直接拖死整个 GUI 启动。常见 Windows
+    # 浏览器已经由上面的固定安装路径（含 LOCALAPPDATA）完整覆盖。
+    if os.name != "nt":
+        import shutil as _sh
+        for name in ("firefox", "edge", "msedge", "chrome", "chromium",
+                     "brave", "opera", "vivaldi", "whale", "ghostery", "safari"):
+            if name in found:
+                continue
+            try:
+                found_path = _sh.which(name) or _sh.which(name + ".exe")
+            except (OSError, PermissionError):
+                found_path = None
+            if found_path:
+                found.append("edge" if name == "msedge" else name)
     # 去重保序
     seen = set()
-    return [b for b in found if not (b in seen or seen.add(b))]
+    result = [b for b in found if not (b in seen or seen.add(b))]
+    _BROWSER_CACHE = tuple(result)
+    return result
 
 
 def _find_browser_for_cookies() -> Optional[str]:
@@ -924,57 +939,11 @@ def _find_output(directory: str, title_hint: str) -> str:
         return ""
 
 
-# ─── 免版权音乐搜索 ───
-FREESOUND_CLIENT_ID = "freesound_client_id"      # 用户替换为注册的 client_id
-FREESOUND_CLIENT_SECRET = "freesound_client_secret"  # 用户替换为注册的 client_secret
-FREESOUND_TOKEN_URL = "https://freesound.org/apiv2/oauth2/access_token/"
-FREESOUND_SEARCH_URL = "https://freesound.org/apiv2/search/text/"
-FREESOUND_DOWNLOAD_URL = "https://freesound.org/apiv2/sounds/{id}/download/"
-
-# Freesound token 缓存
-_freesound_token: Optional[str] = None
-_freesound_token_expiry: float = 0
-
-
-def _freesound_auth(client_id: str = "", client_secret: str = "") -> Optional[str]:
-    """获取 Freesound OAuth2 access token（client credentials grant）"""
-    global _freesound_token, _freesound_token_expiry
-    cid = client_id or FREESOUND_CLIENT_ID
-    csec = client_secret or FREESOUND_CLIENT_SECRET
-    if not cid or cid == "freesound_client_id":
-        return None
-    # 缓存复用（1小时内有效）
-    if _freesound_token and time.time() < _freesound_token_expiry:
-        return _freesound_token
-    try:
-        import urllib.request, urllib.parse
-        data = urllib.parse.urlencode({
-            "client_id": cid, "client_secret": csec,
-            "grant_type": "client_credentials",
-        }).encode()
-        req = urllib.request.Request(FREESOUND_TOKEN_URL, data=data)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            token_data = json.loads(resp.read().decode())
-        _freesound_token = token_data.get("access_token", "")
-        expires_in = token_data.get("expires_in", 3600)
-        _freesound_token_expiry = time.time() + expires_in - 60
-        return _freesound_token
-    except Exception:
-        logging.debug("Freesound auth failed", exc_info=True)
-        return None
-
-
-def freesound_configured() -> bool:
-    """检查 Freesound 密钥是否已配置"""
-    return bool(_freesound_auth())
-
-
 class MusicSearcher:
     """免版权音乐搜索
 
-    🥇 Freesound API：直接搜索可下载的 mp3/wav 音频（需注册免费密钥）
-    🥈 YouTube 搜索：通过 yt-dlp 搜索 royalty free music（需代理）
-    🥉 精选网站链接：无需代理，直接浏览器打开
+    YouTube 搜索与精选网站链接的旧兼容入口。
+    Openverse 搜索已迁移到 ``core.openverse_api`` 与剪辑工作台独立页面。
     """
 
     _instance: Optional[MusicSearcher] = None
@@ -984,7 +953,6 @@ class MusicSearcher:
         ("Pixabay Music", "https://pixabay.com/music/", "免费商用音乐"),
         ("Mixkit Music", "https://mixkit.co/free-stock-music/", "高质量免版权音乐"),
         ("Uppbeat", "https://uppbeat.io/browse/music", "免费音乐（需署名）"),
-        ("Freesound", "https://freesound.org/search/?q=music", "社区音效与音乐"),
         ("YouTube 音频库", "https://www.youtube.com/audiolibrary/music", "YouTube 官方免费音乐"),
         ("Bensound", "https://www.bensound.com/royalty-free-music", "免版权背景音乐"),
     ]
@@ -1006,15 +974,11 @@ class MusicSearcher:
 
         results: list[dict] = []
 
-        # 1. Freesound 直接音乐搜索（无需代理，真实 mp3/wav 下载）
-        fs_results = self.search_freesound(query, max_results=min(per_page, 15))
-        results.extend(fs_results)
-
-        # 2. yt-dlp YouTube 搜索（需代理）
-        yt_results = self.search_youtube(query, max_results=min(per_page - len(results), 10))
+        # yt-dlp YouTube 搜索（需代理）
+        yt_results = self.search_youtube(query, max_results=min(per_page, 10))
         results.extend(yt_results)
 
-        # 3. 精选网站链接（始终显示在最后）
+        # 精选网站链接（始终显示在最后）
         curated = self._curated_links(query)
         results.extend(curated)
 
@@ -1080,50 +1044,4 @@ class MusicSearcher:
             return results
         except Exception:
             logging.debug("yt-dlp YouTube music search failed", exc_info=True)
-            return []
-
-    def search_freesound(self, query: str, max_results: int = 15) -> list[dict]:
-        """通过 Freesound API 搜索真实可下载音频（需注册免费密钥）。
-        返回 [{title, url, preview_url, download_url, duration, source: 'Freesound'}, ...]
-        未配置密钥时返回空列表。
-        """
-        token = _freesound_auth()
-        if not token:
-            return []
-        try:
-            import urllib.request, urllib.parse
-            params = urllib.parse.urlencode({
-                "query": query, "page_size": max_results,
-                "fields": "id,name,duration,previews,license,username",
-                "token": token,
-            })
-            url = f"{FREESOUND_SEARCH_URL}?{params}"
-            req = urllib.request.Request(url, headers={"User-Agent": "CreativeEnginePro/1.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-            results = []
-            for sound in data.get("results", []):
-                sid = sound.get("id")
-                dur = float(sound.get("duration", 0) or 0)
-                dur_str = ""
-                if dur > 0:
-                    m, s = divmod(int(dur), 60)
-                    dur_str = f"{m}:{s:02d}"
-                preview = ""
-                previews = sound.get("previews", {})
-                if isinstance(previews, dict):
-                    preview = previews.get("preview-lq-mp3", "")
-                results.append({
-                    "title": sound.get("name", ""),
-                    "url": f"https://freesound.org/s/{sid}/",
-                    "download_url": FREESOUND_DOWNLOAD_URL.format(id=sid),
-                    "preview_url": preview,
-                    "duration": dur,
-                    "duration_str": dur_str,
-                    "source": f"Freesound · {dur_str}" if dur_str else "Freesound",
-                    "freesound_id": sid,
-                })
-            return results
-        except Exception:
-            logging.debug("Freesound search failed", exc_info=True)
             return []

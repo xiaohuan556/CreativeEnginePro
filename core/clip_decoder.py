@@ -20,6 +20,13 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "threads;1")
 
 import cv2
 
+# 解码器缓冲大小可由 config.DECODER_BUFFER 调整（性能与缓存设置）
+try:
+    import config as _cfg
+    _RING_DEFAULT = getattr(_cfg, "DECODER_BUFFER", 24)
+except Exception:
+    _RING_DEFAULT = 24
+
 # 读超时保护（秒）：单帧 read/seek 超过此值判定 cap 卡死，标记重建
 _READ_TIMEOUT = 2.0
 # 连续读与 seek 的阈值：gap <= 此值向前顺序读；gap 更大（如播放起点/大跳）则 seek 一次
@@ -34,8 +41,8 @@ _FILL_BACK = 8
 class RingBuffer:
     """按 frame_idx 有序滑动的帧窗口缓存。pop 旧帧而非 hash 查找。"""
 
-    def __init__(self, maxlen=_RING_MAX):
-        self._max = maxlen
+    def __init__(self, maxlen=None):
+        self._max = maxlen if maxlen is not None else _RING_DEFAULT
         self._data = OrderedDict()  # frame_idx -> (rgb_frame, w, h)
 
     def has(self, idx):

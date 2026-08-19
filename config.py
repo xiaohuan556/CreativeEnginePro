@@ -53,34 +53,32 @@ def _get_ffprobe_bin() -> str:
 FFMPEG_BIN = _get_ffmpeg_bin()
 FFPROBE_BIN = _get_ffprobe_bin()
 
-# ── API Key 配置 ──
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
-ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY", "")
-FISH_AUDIO_KEY = os.getenv("FISH_AUDIO_KEY", "")
-SILICONFLOW_KEY = os.getenv("SILICONFLOW_KEY", "")
-DEEPGRAM_KEY = os.getenv("DEEPGRAM_KEY", "")
-CUSTOM_TTS_KEY = os.getenv("CUSTOM_TTS_KEY", "")
-CUSTOM_TTS_VOICES_URL = os.getenv("CUSTOM_TTS_VOICES_URL", "")
-YOUTUBE_KEY = os.getenv("YOUTUBE_API_KEY", "")
-TMDB_KEY = os.getenv("TMDB_API_KEY", "")
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")
-TRENDMCP_KEY = os.getenv("TRENDMCP_KEY", "")
+# ── API 配置（统一容器：见 api_config.py，单一来源）──
+from api_config import ALL_APIS as _ALL_APIS
 
-# ── LLM 模式 ──
-LLM_MODE = os.getenv("LLM_MODE", "deepseek")
-CUSTOM_LLM_KEY = os.getenv("CUSTOM_LLM_KEY", "")
-CUSTOM_LLM_URL = os.getenv("CUSTOM_LLM_URL", "")
-CUSTOM_LLM_MODEL = os.getenv("CUSTOM_LLM_MODEL", "")
+# 自动导出所有纯 env 常量（保持向后兼容：其他模块仍 `from config import X`）
+for _api in _ALL_APIS:
+    if _api.const_name:
+        globals()[_api.const_name] = _api.value()
+
+# ── LLM 派生配置 ──
+LLM_MODEL = os.getenv("LLM_MODEL", "deepseek-chat")
+LLM_BASE_URL_OVERRIDE = os.getenv("LLM_BASE_URL", "")  # 自定义 base url（如 deepseek 官方地址）
+
+# 当前生效的「大模型 Key」单一变量：优先读 LLM_API_KEY，
+# 兼容旧配置里把 DeepSeek key 写在 OPENAI_API_KEY 的情况。
+LLM_API_KEY = os.getenv("LLM_API_KEY") or OPENAI_API_KEY
 
 if LLM_MODE == "custom_llm" and CUSTOM_LLM_KEY:
     LLM_API_KEY = CUSTOM_LLM_KEY
     LLM_BASE_URL = CUSTOM_LLM_URL or "https://api.openai.com/v1"
     LLM_MODEL_NAME = CUSTOM_LLM_MODEL or "gpt-3.5-turbo"
-else:
-    LLM_API_KEY = OPENAI_API_KEY
-    LLM_BASE_URL = OPENAI_BASE_URL
-    LLM_MODEL_NAME = os.getenv("LLM_MODEL", "deepseek-chat")
+elif LLM_MODE == "openai":
+    LLM_BASE_URL = LLM_BASE_URL_OVERRIDE or OPENAI_BASE_URL
+    LLM_MODEL_NAME = LLM_MODEL
+else:  # deepseek（默认）
+    LLM_BASE_URL = LLM_BASE_URL_OVERRIDE or "https://api.deepseek.com/v1"
+    LLM_MODEL_NAME = LLM_MODEL
 
 # ── Whisper ASR ──
 WHISPER_MODE = os.getenv("WHISPER_MODE", "local")
@@ -115,6 +113,11 @@ VOICE_VOLUME = float(os.getenv("VOICE_VOLUME", "0.7"))
 
 # ── 去重 ──
 DEDUP_THRESHOLD = float(os.getenv("DEDUP_THRESHOLD", "0.95"))
+
+# ── 性能与缓存 ──
+DECODER_BUFFER = int(os.getenv("DECODER_BUFFER", "24"))   # 解码器 RingBuffer 窗口帧数（越大越流畅越占内存）
+THUMB_SIZE = int(os.getenv("THUMB_SIZE", "320"))          # 素材库缩略图宽度(px)，高 = 宽 * 9/16
+CACHE_MAX_GB = float(os.getenv("CACHE_MAX_GB", "0"))      # 缓存自动清理阈值(GB)，0 = 关闭自动清理
 
 # ── 预设声线 ──
 VOICE_PRESETS = {

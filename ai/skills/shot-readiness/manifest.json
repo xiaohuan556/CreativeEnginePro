@@ -1,0 +1,9 @@
+{
+  "version": "1.1.0",
+  "handler": "ai.production_skills:evaluate_readiness",
+  "inputs": {"type": "object", "required": ["gate", "board"]},
+  "outputs": {"type": "object", "required": ["gate", "ready", "issues"]},
+  "requires": {"capabilities": [], "artifacts": ["storyboard"]},
+  "depends_on": [],
+  "migrations": [{"from": "1.0.0", "to": "1.1.0", "policy": "additive"}]
+}

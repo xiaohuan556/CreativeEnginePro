@@ -71,7 +71,6 @@ class SidebarGroup(QFrame):
 
 
 # ── 小欢语音 工作台 ──
-from .voice_workbench import VoiceWorkbench
 from .script_workbench import ScriptWorkbench
 from .editor_tab import EditorTab
 
@@ -225,6 +224,24 @@ class SmartTimeline(QWidget):
             self.update()
             self.cut_changed.emit(new_ratio)
 
+# ── 设置对话框（模块级，供 UltimateEngine.open_settings 使用）──
+class _SettingsDialog(QDialog):
+    """设置对话框：拦截 Enter/Esc，避免误触关闭。
+
+    - Enter：在设置页里不应触发保存或关闭（之前焦点落到按钮上按 Enter 会误关）。
+    - Esc：关闭对话框（标准行为）。
+    """
+
+    def keyPressEvent(self, ev):
+        if ev.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            ev.ignore()  # 不让 Enter 激活默认按钮，也不关闭
+            return
+        if ev.key() == Qt.Key.Key_Escape:
+            self.close()
+            return
+        super().keyPressEvent(ev)
+
+
 # ==================== 主工作站 ====================
 class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, ImageEditorHandler):
 
@@ -255,6 +272,8 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.init_style()
         self.init_ui()
         QApplication.instance().installEventFilter(self)
+        # 启动后延迟执行一次缓存自动清理（阈值见 config.CACHE_MAX_GB）
+        QTimer.singleShot(5000, self._auto_clean_cache)
 
     def init_style(self):
         self.setStyleSheet("""
@@ -570,10 +589,26 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         from PyQt6.QtCore import QEvent
         if event.type() == QEvent.Type.KeyPress:
             if self.stacked.currentIndex() == 2:
-                # Ctrl+Z 走全局 undo,不交给 mix_key_press
-                if (event.modifiers() == Qt.KeyboardModifier.ControlModifier
-                        and event.key() == Qt.Key.Key_Z):
-                    self.undo()
+                # 混剪页中的文本输入必须优先获得完整的原生编辑按键：
+                # Left/Right/Home/End、Ctrl+Z/Y、Ctrl+A/C/V/X 等。
+                # 全局过滤器此前抢走 Left/Right 和 Ctrl+Z，导致命名模板
+                # 无法移动光标，撤销还错误操作了“视频处理”页的撤销栈。
+                from PyQt6.QtWidgets import (
+                    QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox,
+                )
+                focus = QApplication.focusWidget()
+                editor = focus
+                while editor is not None:
+                    if isinstance(editor, (QLineEdit, QTextEdit,
+                                           QPlainTextEdit, QAbstractSpinBox)):
+                        return super().eventFilter(obj, event)
+                    editor = editor.parentWidget()
+
+                # 混剪页目前没有页面级撤销栈；不要误调用其他页面的 undo。
+                mods = event.modifiers()
+                if (mods & Qt.KeyboardModifier.ControlModifier
+                        and event.key() in (Qt.Key.Key_Z, Qt.Key.Key_Y)):
+                    event.accept()
                     return True
                 if self.mix_key_press(event):
                     return True
@@ -642,7 +677,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         btn_editor = QPushButton("  ✂ 剪辑工作台")
         btn_editor.setCheckable(True)
         btn_editor.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_editor.setProperty("tab_index", 6)
+        btn_editor.setProperty("tab_index", 5)
         btn_editor.setStyleSheet(
             "QPushButton[checkable=\"true\"] {"
             "text-align:left; padding:10px 12px; border:none; border-left:3px solid transparent;"
@@ -660,7 +695,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         btn_image_edit = QPushButton("  🎨 图片工作台")
         btn_image_edit.setCheckable(True)
         btn_image_edit.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn_image_edit.setProperty("tab_index", 7)
+        btn_image_edit.setProperty("tab_index", 6)
         btn_image_edit.setStyleSheet(
             "QPushButton[checkable=\"true\"] {"
             "text-align:left; padding:10px 12px; border:none; border-left:3px solid transparent;"
@@ -672,6 +707,25 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             + IMAGE_ACCENT + "; font-weight:bold; }"
         )
         side_lay.addWidget(btn_image_edit)
+        side_lay.addSpacing(6)
+
+        # ── 🤖 AI 制片画布 ──
+        AI_ACCENT = "#3d8ef8"
+        btn_ai = QPushButton("  🤖 AI 制片画布")
+        btn_ai.setCheckable(True)
+        btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_ai.setProperty("tab_index", 7)
+        btn_ai.setStyleSheet(
+            "QPushButton[checkable=\"true\"] {"
+            "text-align:left; padding:10px 12px; border:none; border-left:3px solid transparent;"
+            "font-size:12px; color:#999; background:transparent; }"
+            "QPushButton[checkable=\"true\"]:hover {"
+            "color:#ccc; background:rgba(255,255,255,0.05); border-left:3px solid #555; }"
+            "QPushButton[checkable=\"true\"]:checked {"
+            "color:#fff; background:rgba(255,255,255,0.08); border-left:3px solid "
+            + AI_ACCENT + "; font-weight:bold; }"
+        )
+        side_lay.addWidget(btn_ai)
         side_lay.addSpacing(6)
 
         # ── 📹 视频部分 ──
@@ -686,14 +740,9 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         btn_image = grp_image.add_button("图片处理", 1)
         side_lay.addWidget(grp_image)
 
-        # ── 🎤 语音部分 ──
-        grp_voice = SidebarGroup("语音部分")
-        btn_voice  = grp_voice.add_button("语音配音", 4)
-        btn_script = grp_voice.add_button("AI脚本", 5)
-        side_lay.addWidget(grp_voice)
-
+        # AI 脚本的口播文案功能已迁入 AI 制片画布；旧工作台仅保留后台兼容。
         # 注册所有按钮（剪辑工作台在最前）
-        for btn in [btn_editor, btn_tail, btn_image, btn_image_edit, btn_mix, btn_slide, btn_voice, btn_script]:
+        for btn in [btn_editor, btn_tail, btn_image, btn_image_edit, btn_mix, btn_slide, btn_ai]:
             if btn:
                 idx = btn.property("tab_index")
                 self._tab_index[btn] = idx
@@ -712,42 +761,97 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         btn_clean.clicked.connect(self._clean_cache)
         side_lay.addWidget(btn_clean)
 
+        # ── ⚙ 设置（API 总览 / 引擎密钥）──
+        btn_settings = QPushButton("  ⚙ 设置")
+        btn_settings.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_settings.setStyleSheet(
+            "QPushButton { text-align:left; padding:8px 12px; border:none; border-left:3px solid transparent;"
+            "font-size:12px; color:#888; background:transparent; }"
+            "QPushButton:hover { color:#3d8ef8; background:rgba(61,142,248,0.08); border-left:3px solid #3d8ef8; }"
+        )
+        btn_settings.clicked.connect(self.open_settings)
+        side_lay.addWidget(btn_settings)
+
         main_layout.addWidget(sidebar)
 
-        # ── 语音工作室 ──
-        self.voice_workbench = VoiceWorkbench()
         # ── AI脚本 ──
         self.script_workbench = ScriptWorkbench()
         # ── 剪辑工作台（index=7）──
         self.editor_tab = EditorTab()
+
+        # ── AI 制片画布：资源数据库、候选和分镜在同一空间（index=7）──
+        from ai.ui.production_canvas import ProductionCanvasTab
+        self.production_canvas = ProductionCanvasTab()
+        # 兼容尚未迁移的内部调用；用户界面不再显示独立资源中心。
+        self.resource_center = self.production_canvas
+        self.production_canvas.set_storyboard_provider(
+            lambda: self.script_workbench._storyboard)
+        self.production_canvas.set_task_provider(
+            lambda: list(self.script_workbench._asset_tasks.values()))
+        # The canvas owns the durable production checkpoint.  If the previous
+        # run ended unexpectedly, restore that board into the script workbench
+        # instead of letting its fresh empty state hide the recovered project.
+        recovered_board = self.production_canvas.current_storyboard()
+        if recovered_board and not self.script_workbench._storyboard:
+            self.script_workbench._storyboard = recovered_board
+            self.script_workbench._render_storyboard()
 
         self.stacked = QStackedWidget()
         self.stacked.addWidget(self.build_video_module())    # 0
         self.stacked.addWidget(self.build_image_module())    # 1
         self.stacked.addWidget(self.build_mix_module())      # 2
         self.stacked.addWidget(self.build_slideshow_module()) # 3
-        self.stacked.addWidget(self.voice_workbench)         # 4
-        self.stacked.addWidget(self.script_workbench)        # 5
-        self.stacked.addWidget(self.editor_tab)              # 6
-        self.stacked.addWidget(self.build_image_editor_module())  # 7 图片工作台
+        self.stacked.addWidget(self.script_workbench)        # 4
+        self.stacked.addWidget(self.editor_tab)              # 5
+        self.stacked.addWidget(self.build_image_editor_module())  # 6 图片工作台
+        self.stacked.addWidget(self.production_canvas)           # 7 AI 制片画布
         main_layout.addWidget(self.stacked)
         # 默认打开剪辑工作台
-        self.stacked.setCurrentIndex(6)
+        self.stacked.setCurrentIndex(5)
         btn_editor.setChecked(True)
 
         # ── 跨功能信号连接 ──
-        self.voice_workbench.script_to_polish.connect(self.script_workbench.load_raw_text)
-        self.script_workbench.polished_text.connect(self._on_script_to_voice)
-        self.voice_workbench.status_msg.connect(self._log_xh)
         self.script_workbench.status_msg.connect(self._log_xh)
+        self.script_workbench.ps_refine_requested.connect(
+            self._on_director_ps_refine_requested)
+        self.script_workbench.resource_center_requested.connect(
+            self._on_director_resource_requested)
+        self.production_canvas.assetChanged.connect(
+            self.script_workbench.refresh_resource_links)
+        self.script_workbench.storyboard_changed.connect(
+            self.production_canvas.refresh)
+        self.production_canvas.shotRequested.connect(
+            self._on_canvas_shot_requested)
+        self.production_canvas.generateShotRequested.connect(
+            self._on_canvas_generate_requested)
+        self.production_canvas.prepareShotAssetsRequested.connect(
+            self.script_workbench._prepare_assets_for_shot)
+        self.production_canvas.refineShotRequested.connect(
+            self.script_workbench._request_ps_refine_for_shot)
+        self.production_canvas.storyboardMutated.connect(
+            self._on_canvas_storyboard_mutated)
+        self.production_canvas.shotTakeAdopted.connect(
+            self.script_workbench._approve_storyboard_asset)
+        self.production_canvas.directorRequested.connect(
+            self._on_canvas_director_requested)
+        self.production_canvas.sendToEditorRequested.connect(
+            self._on_canvas_send_to_editor)
+        self.production_canvas.projectLoaded.connect(
+            self._on_canvas_project_loaded)
+        self.script_workbench.import_storyboard_requested.connect(
+            self._on_director_import_storyboard)
         self.editor_tab.status_msg.connect(self._log_xh)
-        # 语音配音 → 推送选中音频到剪辑工作台素材库
-        self.voice_workbench.voice_pushed.connect(
-            lambda path: self.editor_tab.media_lib.add_file(path))
         # 图层编辑 → 添加图层到视频素材库（保留透明通道）
         self.image_editor.add_layer_to_media_requested.connect(
             lambda path: (self.editor_tab.media_lib.add_file(path),
                           self.statusBar().showMessage("图层已添加到视频素材库", 3000)))
+        self.image_editor.storyboard_refined_ready.connect(
+            self._on_director_ps_refined)
+        # 扒取整批下载完成 → 按扒取页预设进入尾页处理/自动导出。
+        self.editor_tab.download_panel.batch_finished.connect(
+            self._on_scrape_download_batch_finished)
+        self.editor_tab.scrape_panel.tail_settings_requested.connect(
+            lambda: self._xh_jump_tab(0))
 
         # 恢复窗口几何
         s = QSettings("CreativeEnginePro", "MainWindow")
@@ -995,8 +1099,37 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         vgl.addWidget(QLabel("替换尾页:"), 1, 0)
         vgl.addWidget(self.btn_browse_tail, 1, 1, 1, 3) # 从1行1列开始,占据1行3列
 
+        # 4. 扒取/下载后的尾页自动化预设（尾页页是唯一设置来源）
+        self.tail_auto_mode = QComboBox()
+        self.tail_auto_mode.addItem("直接追加尾页", "append")
+        self.tail_auto_mode.addItem("智能识别旧尾页并替换", "smart_replace")
+        vgl.addWidget(QLabel("自动模式:"), 2, 0)
+        vgl.addWidget(self.tail_auto_mode, 2, 1)
+
+        self.tail_auto_export = CheckMarkBox("整批下载完成后自动处理并导出")
+        self.tail_auto_export.setChecked(True)
+        vgl.addWidget(self.tail_auto_export, 2, 2, 1, 2)
+
+        self.tail_auto_output = QLineEdit()
+        self.tail_auto_output.setPlaceholderText("选择自动导出目录…")
+        self.tail_auto_output.editingFinished.connect(self._save_tail_automation_preset)
+        self.btn_tail_auto_output = QPushButton("选择目录")
+        self.btn_tail_auto_output.clicked.connect(self._select_tail_auto_output)
+        vgl.addWidget(QLabel("自动输出:"), 3, 0)
+        vgl.addWidget(self.tail_auto_output, 3, 1, 1, 2)
+        vgl.addWidget(self.btn_tail_auto_output, 3, 3)
+
+        preset_hint = QLabel("以上参数同时供「扒取 → 下载后自动加尾页」调用")
+        preset_hint.setStyleSheet("color:#777;font-size:10px;")
+        vgl.addWidget(preset_hint, 4, 1, 1, 3)
+
         vg.setLayout(vgl)
         rl.addWidget(vg)
+        self._load_tail_automation_preset()
+        self.tail_auto_mode.currentIndexChanged.connect(self._save_tail_automation_preset)
+        self.tail_auto_export.stateChanged.connect(self._save_tail_automation_preset)
+        self.v_ratio.currentIndexChanged.connect(self._save_tail_automation_preset)
+        self.v_base_name.editingFinished.connect(self._save_tail_automation_preset)
 
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
@@ -1221,15 +1354,16 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
         self.run_export_process(tasks, is_single=True)
 
-    def run_export_process(self, tasks, is_single=False):
+    def run_export_process(self, tasks, is_single=False, out_dir=None, on_finished=None):
         # 如果线程正在运行,直接返回防止重复点击
         if getattr(self, 'export_thread_running', False):
-            return
+            return False
 
-        # 唯一弹出选择文件夹的地方
-        out_dir = QFileDialog.getExistingDirectory(self, "选择保存文件夹")
+        # 手动流程弹窗选择；自动化流程直接传入预设目录。
+        if out_dir is None:
+            out_dir = QFileDialog.getExistingDirectory(self, "选择保存文件夹")
         if not out_dir:
-            return # 用户取消,不锁定按钮,直接退出
+            return False # 用户取消,不锁定按钮,直接退出
         self._last_out_dir = out_dir
 
         # 锁定 UI 状态
@@ -1261,11 +1395,15 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             self.thread.log_signal.connect(self.update_log)
             self.thread.progress_signal.connect(self.update_progress)
             self.thread.finished_signal.connect(self.on_export_finished)
+            if on_finished is not None:
+                self.thread.finished_signal.connect(on_finished)
             self.thread.start()
+            return True
         except Exception as e:
             # 万一启动报错,立即恢复 UI,防止点不动
             self.on_export_finished()
             QMessageBox.critical(self, "错误", f"导出线程启动失败: {str(e)}")
+            return False
     def start_batch_export(self):
         row_count = self.v_table.rowCount()
         if row_count == 0: return
@@ -1384,8 +1522,20 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 self._execute_img_import(imgs)
             return
 
+        # 图片工作台：拖到画布、标签栏、属性栏或工作台空白处都能导入。
+        if tab == 6:
+            image_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.tif', '.gif')
+            images = [f for f in files if f.lower().endswith(image_exts)]
+            doc = self.image_editor.current_widget() if hasattr(self, "image_editor") else None
+            if doc is not None:
+                for path in images:
+                    doc.add_image_from_path(path)
+                if images:
+                    event.acceptProposedAction()
+            return
+
         # 剪辑工作台 Tab → 导入到素材库
-        if tab == 7:
+        if tab == 5:
             for f in files:
                 self.editor_tab.media_lib.add_file(f)
             return
@@ -1620,6 +1770,73 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             file_name = os.path.basename(file_path)
             self.btn_browse_tail.setText(f"已选: {file_name}")
             self.btn_browse_tail.setToolTip(file_path)
+            self._save_tail_automation_preset()
+
+    @staticmethod
+    def _tail_setting_bool(value, default=False):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+    def _load_tail_automation_preset(self):
+        """从共享设置恢复尾页预设；扒取页只读取这一份配置。"""
+        s = QSettings("CreativeEnginePro", "TailAutomation")
+        # 从旧版扒取页内嵌预设迁移一次，避免升级后用户设置丢失。
+        if not s.contains("tail_path"):
+            old = QSettings("CreativeEnginePro", "ScrapeAutomation")
+            for key in ("tail_mode", "tail_path", "ratio", "rename",
+                        "output_dir", "auto_export"):
+                if old.contains(key):
+                    s.setValue(key, old.value(key))
+        ratio = str(s.value("ratio", self.v_ratio.currentText()))
+        idx = self.v_ratio.findText(ratio)
+        if idx >= 0:
+            self.v_ratio.setCurrentIndex(idx)
+        self.v_base_name.setText(str(s.value("rename", "")))
+        tail_path = str(s.value("tail_path", ""))
+        if tail_path:
+            self.global_tail_path = tail_path
+            self.btn_browse_tail.setText(f"已选: {os.path.basename(tail_path)}")
+            self.btn_browse_tail.setToolTip(tail_path)
+        mode = str(s.value("tail_mode", "append"))
+        idx = self.tail_auto_mode.findData(mode)
+        self.tail_auto_mode.setCurrentIndex(max(0, idx))
+        self.tail_auto_output.setText(str(s.value("output_dir", "")))
+        self.tail_auto_export.setChecked(
+            self._tail_setting_bool(s.value("auto_export", True), True))
+
+    def _save_tail_automation_preset(self, *_args):
+        if not hasattr(self, "tail_auto_mode"):
+            return
+        s = QSettings("CreativeEnginePro", "TailAutomation")
+        s.setValue("tail_mode", self.tail_auto_mode.currentData())
+        s.setValue("tail_path", getattr(self, "global_tail_path", ""))
+        s.setValue("ratio", self.v_ratio.currentText())
+        s.setValue("rename", self.v_base_name.text().strip())
+        s.setValue("output_dir", self.tail_auto_output.text().strip())
+        s.setValue("auto_export", self.tail_auto_export.isChecked())
+
+    def _select_tail_auto_output(self):
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择尾页自动导出目录", self.tail_auto_output.text())
+        if directory:
+            self.tail_auto_output.setText(directory)
+            self._save_tail_automation_preset()
+
+    def get_tail_automation_preset(self):
+        """返回扒取自动化使用的唯一尾页预设。"""
+        self._save_tail_automation_preset()
+        return {
+            "destination": "tail",
+            "tail_mode": self.tail_auto_mode.currentData(),
+            "tail_path": getattr(self, "global_tail_path", ""),
+            "ratio": self.v_ratio.currentText(),
+            "rename": self.v_base_name.text().strip(),
+            "output_dir": self.tail_auto_output.text().strip(),
+            "auto_export": self.tail_auto_export.isChecked(),
+        }
 
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -1638,16 +1855,249 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 btn.setEnabled(True)
 
     # ═══════════ 小欢语音 跨Tab联动 ═══════════
+    def _on_director_ps_refine_requested(self, shot_id: str, path: str):
+        self._xh_jump_tab(6)
+        if not self.image_editor.open_storyboard_refine(path, shot_id):
+            self.statusBar().showMessage("无法打开这张分镜图片", 4000)
+
+    def _on_director_ps_refined(self, shot_id: str, path: str, make_video: bool):
+        self.script_workbench.attach_generated_asset(shot_id, path, "image")
+        self.production_canvas.set_storyboard(self.script_workbench._storyboard)
+        self.production_canvas.refresh()
+        self._xh_jump_tab(7)
+        self.production_canvas.focus_node(f"shot:{shot_id}")
+        if make_video:
+            QTimer.singleShot(
+                0, lambda sid=shot_id:
+                self.script_workbench._request_image_video_for_shot(sid))
+
+    def _on_director_resource_requested(self, kind: str):
+        """打开 AI 制片画布，并定位到对应资产类型。"""
+        self.production_canvas.set_storyboard(self.script_workbench._storyboard)
+        self._xh_jump_tab(7)
+        self.production_canvas.focus_kind(kind)
+
+    def _on_canvas_shot_requested(self, shot_id: str):
+        """镜头的查看和编辑留在制片画布，不再跳回旧分镜页。"""
+        self._xh_jump_tab(7)
+        node = self.production_canvas._nodes.get(f"shot:{shot_id}")
+        if node is not None:
+            self.production_canvas.focus_node(node.node_id)
+            self.production_canvas.show_inline_editor(node)
+
+    def _on_canvas_director_requested(self, page: str):
+        """兼容旧节点入口：统一回到画布上的制片项目节点。"""
+        self._xh_jump_tab(7)
+        node = next((value for value in self.production_canvas._nodes.values()
+                     if value.node_type == "storyboard_node"), None)
+        if node is None:
+            self.production_canvas.open_handdraw_storyboard()
+            node = next((value for value in self.production_canvas._nodes.values()
+                         if value.node_type == "storyboard_node"), None)
+        if node is not None:
+            self.production_canvas.focus_node(node.node_id)
+            self.production_canvas.show_inline_editor(node)
+
+    def _on_canvas_generate_requested(self, shot_id: str, operation: str):
+        """画布节点直接调用现有生成链；任务完成后结果自动回到画布。"""
+        self.script_workbench.refresh_resource_links("")
+        handlers = {
+            "image": self.script_workbench._request_image_for_shot,
+            "image_edit": self.script_workbench._request_image_edit_for_shot,
+            "video": self.script_workbench._request_image_video_for_shot,
+            "dialogue_audio": lambda sid: self.script_workbench._submit_dialogue_audio_task(
+                self.script_workbench._find_shot(sid)),
+        }
+        handler = handlers.get(operation)
+        if handler:
+            handler(shot_id)
+            self.statusBar().showMessage("画布生成任务已提交，完成后会自动出现结果节点", 5000)
+
+    def _on_canvas_storyboard_mutated(self):
+        """采用画布结果后同步刷新旧分镜卡片，迁移期间保持双向一致。"""
+        board = self.production_canvas.current_storyboard()
+        if board:
+            self.script_workbench._storyboard = board
+            self.script_workbench._render_storyboard()
+
+    def _on_director_import_storyboard(self, board: dict):
+        self._xh_jump_tab(5)
+        imported = self.editor_tab.import_storyboard(board)
+        if not imported:
+            self.statusBar().showMessage("没有可导入的分镜素材", 4000)
+
+    def _on_canvas_send_to_editor(self, payload: dict):
+        """画布右键直送剪辑台；项目交接会同时处理独立 TTS 对白轨。"""
+        payload = dict(payload or {})
+        self._xh_jump_tab(5)
+        if payload.get("mode") == "storyboard":
+            imported = self.editor_tab.import_storyboard(
+                payload.get("board") or {},
+                audio_policy=str(payload.get("audio_policy") or "replace"))
+        else:
+            imported = int(self.editor_tab.import_canvas_media(payload))
+        if not imported:
+            self.statusBar().showMessage("这个节点还没有可导入的生成结果", 4000)
+
+    def _on_canvas_project_loaded(self, board: dict):
+        """让脚本页与刚打开的画布工程共享同一份故事板，避免旧项目覆盖恢复内容。"""
+        if not isinstance(board, dict):
+            return
+        self.script_workbench._storyboard = board
+        self.script_workbench._render_storyboard()
+        self.production_canvas.set_storyboard(board)
+        self.statusBar().showMessage("AI 制片工程已恢复并自动续存", 5000)
+
     def _xh_jump_tab(self, index: int):
         """跳转Tab并同步高亮"""
         for btn, idx in self._tab_index.items():
             btn.setChecked(idx == index)
         self.stacked.setCurrentIndex(index)
 
-    def _on_script_to_voice(self, text: str):
-        """AI脚本 → 语音台"""
-        self.voice_workbench.load_text(text)
-        self._xh_jump_tab(5)  # 跳转到语音配音 Tab
+    def _on_scrape_download_batch_finished(self, batch_id: str, summary: dict):
+        """扒取下载批次结算后，启动尾页处理预设。"""
+        paths = [p for p in summary.get("paths", []) if p and os.path.exists(p)]
+        failed = summary.get("failed", []) or []
+        preset = summary.get("preset", {}) or {}
+        scrape = self.editor_tab.scrape_panel
+        if preset.get("destination") != "tail":
+            scrape.set_postprocess_status(
+                f"✅ 下载完成：成功 {len(paths)}，失败 {len(failed)}；已进入素材库",
+                error=not paths and bool(failed))
+            return
+        if not paths:
+            scrape.set_postprocess_status(
+                f"❌ 整批下载失败，共 {len(failed)} 个任务", error=True)
+            return
+        tail_path = preset.get("tail_path", "")
+        if not tail_path or not os.path.isfile(tail_path):
+            scrape.set_postprocess_status("❌ 预设尾页文件不存在，已停止自动处理", error=True)
+            return
+
+        self.global_tail_path = tail_path
+        self.btn_browse_tail.setText(f"已选: {os.path.basename(tail_path)}")
+        self.btn_browse_tail.setToolTip(tail_path)
+        ratio = preset.get("ratio", "")
+        ratio_idx = self.v_ratio.findText(ratio)
+        if ratio_idx >= 0:
+            self.v_ratio.setCurrentIndex(ratio_idx)
+        self.v_base_name.setText(preset.get("rename", ""))
+        self._auto_tail_jobs = getattr(self, "_auto_tail_jobs", {})
+        self._auto_tail_jobs[batch_id] = {"paths": paths, "preset": preset}
+        self._auto_tail_jobs[batch_id]["download_failed"] = len(failed)
+        self._xh_jump_tab(0)
+        scrape.set_postprocess_status(
+            f"⏳ 下载完成 {len(paths)} 个，正在导入尾页处理队列…")
+
+        existing = {os.path.normcase(os.path.abspath(t.get("path", ""))) for t in self.tasks}
+        new_paths = [p for p in paths
+                     if os.path.normcase(os.path.abspath(p)) not in existing]
+        if new_paths:
+            self.execute_import(new_paths)
+            self.import_thread.finished.connect(
+                lambda bid=batch_id: self._on_auto_tail_import_finished(bid))
+        else:
+            QTimer.singleShot(0, lambda bid=batch_id: self._on_auto_tail_import_finished(bid))
+
+    def _on_auto_tail_import_finished(self, batch_id: str):
+        job = getattr(self, "_auto_tail_jobs", {}).get(batch_id)
+        if not job:
+            return
+        path_keys = {os.path.normcase(os.path.abspath(p)) for p in job["paths"]}
+        rows = [i for i, task in enumerate(self.tasks)
+                if os.path.normcase(os.path.abspath(task.get("path", ""))) in path_keys]
+        job["rows"] = rows
+        preset = job["preset"]
+        scrape = self.editor_tab.scrape_panel
+        if not rows:
+            scrape.set_postprocess_status("❌ 视频导入尾页队列失败", error=True)
+            self._auto_tail_jobs.pop(batch_id, None)
+            return
+        if not preset.get("auto_export", True):
+            scrape.set_postprocess_status(
+                f"✅ 已导入尾页处理队列 {len(rows)} 个，等待手动导出")
+            self._auto_tail_jobs.pop(batch_id, None)
+            return
+
+        if preset.get("tail_mode") == "smart_replace":
+            pending = [(row, self.tasks[row]["path"]) for row in rows
+                       if self.tasks[row].get("precise_cut_time") is None]
+            if pending:
+                scrape.set_postprocess_status(
+                    f"⏳ 正在智能识别 {len(pending)} 个视频的旧尾页…")
+                worker = BatchAnalysisThread(pending)
+                job["analysis_worker"] = worker
+                worker.result_signal.connect(self.on_analysis_done)
+                worker.log_signal.connect(self.update_log)
+                worker.finished_signal.connect(
+                    lambda bid=batch_id: self._start_auto_tail_export(bid))
+                worker.start()
+                return
+        self._start_auto_tail_export(batch_id)
+
+    def _start_auto_tail_export(self, batch_id: str):
+        job = getattr(self, "_auto_tail_jobs", {}).get(batch_id)
+        if not job:
+            return
+        preset = job["preset"]
+        out_dir = preset.get("output_dir", "")
+        scrape = self.editor_tab.scrape_panel
+        if not out_dir or not os.path.isdir(out_dir):
+            scrape.set_postprocess_status("❌ 自动导出目录不存在", error=True)
+            self._auto_tail_jobs.pop(batch_id, None)
+            return
+        tasks_to_export = []
+        smart = preset.get("tail_mode") == "smart_replace"
+        for row in job.get("rows", []):
+            task = self.tasks[row]
+            cut_time = task.get("precise_cut_time") if smart else task.get("duration", 0)
+            tasks_to_export.append({
+                "row_index": row,
+                "path": task["path"],
+                "name": task["name"],
+                "duration": task.get("duration", 0),
+                "precise_cut_time": cut_time or task.get("duration", 0),
+            })
+        if not tasks_to_export:
+            scrape.set_postprocess_status("❌ 没有可自动导出的任务", error=True)
+            self._auto_tail_jobs.pop(batch_id, None)
+            return
+        if getattr(self, "export_thread_running", False):
+            scrape.set_postprocess_status(
+                "❌ 当前已有导出任务运行；本批视频已留在尾页队列，请稍后手动导出",
+                error=True)
+            self._auto_tail_jobs.pop(batch_id, None)
+            return
+        scrape.set_postprocess_status(
+            f"⚙ 正在自动添加尾页并导出 {len(tasks_to_export)} 个视频…")
+        started = self.run_export_process(
+            tasks_to_export, is_single=False, out_dir=out_dir,
+            on_finished=lambda bid=batch_id: self._on_auto_tail_export_finished(bid))
+        if not started:
+            scrape.set_postprocess_status("❌ 自动导出未能启动", error=True)
+            self._auto_tail_jobs.pop(batch_id, None)
+        else:
+            job["export_thread"] = self.thread
+
+    def _on_auto_tail_export_finished(self, batch_id: str):
+        job = getattr(self, "_auto_tail_jobs", {}).pop(batch_id, None)
+        if not job:
+            return
+        count = len(job.get("rows", []))
+        download_failed = job.get("download_failed", 0)
+        worker = job.get("export_thread")
+        export_ok = getattr(worker, "success_count", count)
+        export_failed = getattr(worker, "failed_count", 0)
+        details = []
+        if export_failed:
+            details.append(f"导出失败 {export_failed}")
+        if download_failed:
+            details.append(f"下载失败 {download_failed}")
+        suffix = "，" + "，".join(details) if details else ""
+        is_error = export_ok == 0 and (export_failed > 0 or download_failed > 0)
+        icon = "❌" if is_error else "✅"
+        self.editor_tab.scrape_panel.set_postprocess_status(
+            f"{icon} 自动加尾页结束：成功 {export_ok}/{count}{suffix}", error=is_error)
 
     def _log_xh(self, msg: str, level: str = "info"):
         """小欢语音模块状态消息 → 控制台"""
@@ -1709,6 +2159,96 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         else:
             QMessageBox.information(self, "清理完成", "没有需要清理的缓存文件")
 
+    def _auto_clean_cache(self):
+        """按 CACHE_MAX_GB 阈值自动清理 Cache/ 与 work_temp/ 中的最旧文件。阈值=0 时跳过。"""
+        try:
+            import config
+            import shutil
+            from pathlib import Path
+            thr = float(getattr(config, "CACHE_MAX_GB", 0.0) or 0.0)
+            if thr <= 0:
+                return
+            limit = thr * 1024 ** 3
+            dirs = [Path("Cache"), Path("work_temp")]
+            files = []
+            total = 0
+            for d in dirs:
+                if d.exists():
+                    for f in d.rglob("*"):
+                        if f.is_file():
+                            try:
+                                sz = f.stat().st_size
+                            except Exception:
+                                continue
+                            total += sz
+                            files.append((f.stat().st_mtime, f, sz))
+            if total <= limit:
+                return
+            # 删除最旧的文件，直到回到阈值以内
+            files.sort(key=lambda x: x[0])
+            for _mtime, f, sz in files:
+                if total <= limit:
+                    break
+                try:
+                    if f.is_file():
+                        f.unlink()
+                        total -= sz
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[auto_clean_cache] {e}")
+
+    def open_settings(self):
+        """打开全局设置中心。业务预设仍由各自工作台管理。"""
+        from ui.settings_panel import SettingsPanel
+        if getattr(self, "_settings_dlg", None) is None:
+            from PyQt6.QtWidgets import QVBoxLayout
+
+            dlg = _SettingsDialog(self)
+            dlg.setWindowTitle("设置中心")
+            dlg.resize(820, 640)
+            dlg.setMinimumSize(720, 560)
+            dl = QVBoxLayout(dlg); dl.setContentsMargins(0, 0, 0, 0)
+            panel = SettingsPanel(dlg)
+            dl.addWidget(panel)
+            panel.settings_saved.connect(self._on_global_settings_saved)
+            self._settings_dlg = dlg
+            self._settings_panel = panel
+        self._settings_dlg.show()
+        # 每次打开刷新偏好页（读取最新 .env 配置）
+        try:
+            self._settings_panel._load_prefs()
+        except Exception:
+            pass
+        self._settings_dlg.raise_()
+        self._settings_dlg.activateWindow()
+
+    def _on_global_settings_saved(self, payload: dict):
+        """把设置中心保存的路径立即同步到已经创建的下载/扒取面板。"""
+        try:
+            import core.downloader as downloader
+            download_dir = payload.get("download_dir", "")
+            cookie_file = payload.get("cookies_file", "")
+            if download_dir and os.path.isdir(download_dir):
+                downloader.DOWNLOAD_DIR = download_dir
+                self.editor_tab.download_panel._path_lbl.setText(f"📁 {download_dir}")
+                self.editor_tab.scrape_panel._scrape_dir = download_dir
+                self.editor_tab.scrape_panel._dir_lbl.setText(download_dir)
+            downloader.set_cookies_file(
+                cookie_file if cookie_file and os.path.isfile(cookie_file) else "")
+            if cookie_file and os.path.isfile(cookie_file):
+                self.editor_tab.download_panel._cookie_lbl.setText(
+                    f"🍪 {os.path.basename(cookie_file)}")
+                self.editor_tab.download_panel._cookie_lbl.setStyleSheet(
+                    "color:#4caf50;font-size:9px;border:none;")
+            else:
+                self.editor_tab.download_panel._cookie_lbl.setText("未导入")
+                self.editor_tab.download_panel._cookie_lbl.setStyleSheet(
+                    "color:#666;font-size:9px;border:none;")
+            self.statusBar().showMessage("全局设置已保存", 3000)
+        except Exception as exc:
+            self.statusBar().showMessage(f"设置已保存，界面同步失败：{exc}", 5000)
+
     def closeEvent(self, event):
         """保存窗口几何 + 检查编辑器是否有未保存更改 + 清理自动保存"""
         if hasattr(self, 'editor_tab') and not self.editor_tab._check_save_before_close():
@@ -1716,6 +2256,10 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             return
         if hasattr(self, 'editor_tab'):
             self.editor_tab._cleanup_autosave()
+        if hasattr(self, 'production_canvas'):
+            self.production_canvas._layout_timer.stop()
+            self.production_canvas._checkpoint_timer.stop()
+            self.production_canvas._save_layout_now()
         QSettings("CreativeEnginePro", "MainWindow").setValue("geometry", self.saveGeometry())
         super().closeEvent(event)
 
@@ -1808,6 +2352,8 @@ class VideoExportThread(QThread):
         self.tasks = tasks
         self.config = config
         self._is_running = True
+        self.success_count = 0
+        self.failed_count = 0
 
     def stop(self):
         self._is_running = False
@@ -1848,9 +2394,11 @@ class VideoExportThread(QThread):
 
             # --- 后续逻辑保持不变 ---
             if success:
+                self.success_count += 1
                 self.log_signal.emit(f"STATUS_UPDATE:{row_idx}:已完成")
                 self.progress_signal.emit(int((i + 1) / total * 100))
             else:
+                self.failed_count += 1
                 if self.processor.is_cancelled:
                     self.log_signal.emit(f"STATUS_UPDATE:{row_idx}:已取消")
                 else:

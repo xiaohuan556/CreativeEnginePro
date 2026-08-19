@@ -24,6 +24,11 @@ from PyQt6.QtGui import QIcon, QPixmap, QColor, QDrag, QImage, QFontMetrics, QPa
 from core.edit_engine import EditTimeline, VideoClip, AudioClip
 import cv2
 
+try:
+    from config import THUMB_SIZE
+except Exception:
+    THUMB_SIZE = 320
+
 
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".wmv", ".flv", ".webm", ".m4v", ".ts"}
 AUDIO_EXTS = {".mp3", ".wav", ".aac", ".flac", ".ogg", ".m4a", ".wma"}
@@ -53,9 +58,13 @@ def _get_media_type(path: str) -> str:
     return "unknown"
 
 
-def _make_thumbnail(path: str, media_type: str, size=(THUMB_W, THUMB_H)) -> QPixmap:
-    """生成 16:9 缩略图（在后台线程中调用）"""
-    W, H = size
+def _make_thumbnail(path: str, media_type: str, size=None) -> QPixmap:
+    """生成 16:9 缩略图（在后台线程中调用）。size 为 None 时使用 config.THUMB_SIZE。"""
+    if size is None:
+        W = THUMB_SIZE
+        H = int(THUMB_SIZE * 9 / 16)
+    else:
+        W, H = size
     try:
         if media_type == "video":
             cap = cv2.VideoCapture(path)

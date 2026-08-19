@@ -255,12 +255,14 @@ class DownloadPanel(QWidget):
 
     download_finished = pyqtSignal(str)
     url_downloaded = pyqtSignal(str)   # 下载完成时发出原始 URL（供扒取面板去重）
+    batch_finished = pyqtSignal(str, object)  # batch_id, {paths, failed, preset}
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._tasks: dict[str, DownloadTask] = {}      # task_id → task
         self._workers: dict[str, DownloadWorker] = {}  # task_id → worker
         self._items: dict[str, _DownloadItem] = {}     # task_id → ui
+        self._batch_states: dict[str, dict] = {}
         self._build_ui()
         # 加载已保存的下载目录
         self._load_download_dir()
@@ -492,13 +494,14 @@ class DownloadPanel(QWidget):
 
     def _refresh_browser_combo(self):
         """填充浏览器下拉：自动 + 本机已检测到的浏览器"""
-        from core.downloader import get_available_browsers, auto_detect_browser
+        from core.downloader import get_available_browsers
         self._browser_combo.clear()
         self._browser_combo.addItem("自动(推荐)")
-        for b in get_available_browsers():
+        available = get_available_browsers()
+        for b in available:
             self._browser_combo.addItem(f"{BROWSER_LABELS.get(b, b)}")
         # 显示当前将使用的浏览器（中性说明，不是报错）
-        auto = auto_detect_browser()
+        auto = available[0] if available else ""
         if auto:
             self._set_status(
                 f"将使用「{BROWSER_LABELS.get(auto, auto)}」的登录态下载"
@@ -636,9 +639,23 @@ class DownloadPanel(QWidget):
 
         task.status = "downloading"
         worker.start()
+        return tid
 
     def add_tasks(self, tasks: list):
         """公开接口：批量添加任务（供扒取面板等外部调用）"""
+        # 先登记计划数量，再启动 worker，避免极快任务在批次尚未登记完整时提前结束。
+        grouped = {}
+        for task in tasks:
+            if getattr(task, "batch_id", ""):
+                grouped.setdefault(task.batch_id, []).append(task)
+        for batch_id, batch_tasks in grouped.items():
+            self._batch_states[batch_id] = {
+                "remaining": len(batch_tasks),
+                "settled": set(),
+                "paths": [],
+                "failed": [],
+                "preset": dict(getattr(batch_tasks[0], "postprocess", {}) or {}),
+            }
         for t in tasks:
             self._add_task(t)
         self._queue_title.setVisible(True)
@@ -674,6 +691,7 @@ class DownloadPanel(QWidget):
                     if tid in self._items:
                         self._items[tid].set_cancelled()
                     t.status = "cancelled"
+                    self._settle_batch_task(tid, t, False, "", "已取消")
                     # 短暂显示「已取消」后从队列移除
                     QTimer.singleShot(1500, lambda t=tid: self._remove_item(t))
                 else:
@@ -702,16 +720,43 @@ class DownloadPanel(QWidget):
                 if task:
                     task.status = "completed"
                     self.url_downloaded.emit(task.url)
+                    self._settle_batch_task(tid, task, True, path, "")
                 QTimer.singleShot(3000, lambda t=tid: self._remove_item(t))
             elif error == "已取消":
                 self._items[tid].set_cancelled()
                 if task:
                     task.status = "cancelled"
+                    self._settle_batch_task(tid, task, False, "", error)
                 QTimer.singleShot(1500, lambda t=tid: self._remove_item(t))
             else:
                 self._items[tid].set_failed(error)
                 if task:
                     task.status = "failed"
+                    self._settle_batch_task(tid, task, False, "", error)
+
+    def _settle_batch_task(self, tid: str, task: DownloadTask, success: bool,
+                           path: str, error: str):
+        """记录批次内单项完成；整批结算后仅发出一次 batch_finished。"""
+        batch_id = getattr(task, "batch_id", "")
+        if not batch_id:
+            return
+        state = self._batch_states.get(batch_id)
+        if not state or tid in state["settled"]:
+            return
+        state["settled"].add(tid)
+        state["remaining"] = max(0, state["remaining"] - 1)
+        if success and path and os.path.exists(path):
+            state["paths"].append(path)
+        else:
+            state["failed"].append({"url": task.url, "error": error or "下载失败"})
+        if state["remaining"] == 0:
+            summary = {
+                "paths": list(state["paths"]),
+                "failed": list(state["failed"]),
+                "preset": dict(state["preset"]),
+            }
+            self._batch_states.pop(batch_id, None)
+            self.batch_finished.emit(batch_id, summary)
 
 # ─── 工具函数 ───
 def _extract_domain(url: str) -> str:

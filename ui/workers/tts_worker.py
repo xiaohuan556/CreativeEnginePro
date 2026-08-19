@@ -6,6 +6,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 from pathlib import Path
 import time
 import os
+import uuid
 
 
 class TTSGenerationWorker(QThread):
@@ -70,7 +71,7 @@ class TTSGenerationWorker(QThread):
                 os.path.dirname(os.path.abspath(__file__))))
             out_dir = Path(project_root) / "work_output" / "tts"
             out_dir.mkdir(parents=True, exist_ok=True)
-            out_path = out_dir / f"tts_{int(time.time())}.mp3"
+            out_path = out_dir / f"tts_{int(time.time())}_{uuid.uuid4().hex[:8]}.mp3"
 
             self.progress.emit(40)
             if self.isInterruptionRequested(): return

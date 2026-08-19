@@ -1,0 +1,4 @@
+interface:
+  display_name: "AI 制片编排"
+  short_description: "Plan stages, checkpoints, recovery, and safe reruns"
+  default_prompt: "Use $production-orchestrator to plan and advance this canvas production safely."

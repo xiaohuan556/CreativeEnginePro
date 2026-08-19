@@ -36,6 +36,7 @@ class MixMode:
     MODE_C = "模式C：随机拼接达到目标时长"
     MODE_D = "模式D：固定开头，随机后面"
     MODE_E = "模式E：固定结尾，随机前面"
+    MODE_F = "顺序片头模式：逐条取前4秒 + 固定后段拼接"
 
     @staticmethod
     def get_slots(mode: str, total: float = 15.0,
@@ -74,6 +75,16 @@ class MixMode:
             return [
                 {'role': 'random', 'duration': rest, 'label': f'前段({rest}s)'},
                 {'role': 'fixed',  'duration': tail, 'label': f'结尾({tail}s)'},
+            ]
+        elif mode == MixMode.MODE_F:
+            # 按素材导入顺序逐条取前4秒 + 固定后段若干
+            # 固定后段数量由素材决定，此处先放4个占位，实际由 TaskGenerator 动态构建
+            return [
+                {'role': 'random', 'duration': 4.0, 'label': '片头(4s)', 'from_start': True},
+                {'role': 'suffix', 'duration': 0.0, 'label': '后段1', 'suffix_index': 0},
+                {'role': 'suffix', 'duration': 0.0, 'label': '后段2', 'suffix_index': 1},
+                {'role': 'suffix', 'duration': 0.0, 'label': '后段3', 'suffix_index': 2},
+                {'role': 'suffix', 'duration': 0.0, 'label': '后段4', 'suffix_index': 3},
             ]
         return []
 
@@ -134,14 +145,29 @@ class ComboCalculator:
 class TaskGenerator:
 
     def __init__(self, mode: str, fixed_materials: dict, random_materials: list,
-                 seg_a=(3.0, 7.0, 5.0), seg_b=(3.0, 7.0, 5.0), total=15.0):
+                 seg_a=(3.0, 7.0, 5.0), seg_b=(3.0, 7.0, 5.0), total=15.0,
+                 suffix_materials: list = None):
         self.mode      = mode
         self.fixed     = fixed_materials
         self.randoms   = random_materials
+        self.suffix    = suffix_materials or []
         self.seg_a     = seg_a
         self.seg_b     = seg_b
         self.total     = total
         self.slots_def = MixMode.get_slots(mode, total, seg_a, seg_b)
+        # F 模式的固定后段数量由用户实际导入的素材决定。
+        # 旧实现固定创建 4 个槽位：少于 4 个会留下 None 导致整项任务被跳过，
+        # 多于 4 个则被静默忽略。
+        if mode == MixMode.MODE_F:
+            self.slots_def = [
+                {'role': 'random', 'duration': 4.0,
+                 'label': '片头(4s)', 'from_start': True},
+                *[
+                    {'role': 'suffix', 'duration': 0.0,
+                     'label': f'后段{idx + 1}', 'suffix_index': idx}
+                    for idx in range(len(self.suffix))
+                ],
+            ]
 
     def _get_fixed_mat(self, slot_label: str):
         label = slot_label.lower()
@@ -201,6 +227,88 @@ class TaskGenerator:
                         'end': abs_start + duration,
                         'duration': duration,
                         'role': 'fixed',
+                        'label': label,
+                    })
+
+                elif role == 'suffix':
+                    # 模式F 固定后段：按 suffix_index 取素材
+                    idx = slot.get('suffix_index', 0)
+                    if idx >= len(self.suffix):
+                        task_slots.append(None)
+                        continue
+                    mat = self.suffix[idx]
+                    dur = mat.usable_duration
+                    task_slots.append({
+                        'mat': mat,
+                        'start': mat.start,
+                        'end': mat.end if mat.end else mat.start + dur,
+                        'duration': dur,
+                        'role': 'fixed',
+                        'label': slot['label'],
+                    })
+
+                elif slot.get('from_start'):
+                    # 顺序片头模式：按导入顺序选素材，并固定从开头取
+                    if not self.randoms:
+                        task_slots.append(None)
+                        continue
+                    # 一条源素材对应一条成片：第 i 项固定使用第 i 个素材的前4秒。
+                    if self.mode == MixMode.MODE_F:
+                        chosen_mat = self.randoms[i % len(self.randoms)]
+                        chosen_key = f"{chosen_mat.path}@head"
+                        video_used.add(chosen_key)
+                        global_used.add(chosen_key)
+                        mat_use_count[id(chosen_mat)] += 1
+                        task_slots.append({
+                            'mat': chosen_mat,
+                            'start': chosen_mat.start,
+                            'end': chosen_mat.start + duration,
+                            'duration': duration,
+                            'role': 'random',
+                            'label': label,
+                        })
+                        continue
+                    shuffled = self.randoms[:]
+                    random.shuffle(shuffled)
+
+                    chosen_mat = chosen_key = None
+                    for mat in shuffled:
+                        if mat_use_count[id(mat)] >= max_reuse:
+                            continue
+                        if mat.usable_duration < duration:
+                            continue
+                        seg_key = f"{mat.path}@head"
+                        if seg_key not in video_used and seg_key not in global_used:
+                            chosen_mat = mat; chosen_key = seg_key; break
+
+                    if chosen_mat is None:
+                        for mat in shuffled:
+                            if mat_use_count[id(mat)] >= max_reuse:
+                                continue
+                            if mat.usable_duration >= duration:
+                                seg_key = f"{mat.path}@head"
+                                if seg_key not in video_used:
+                                    chosen_mat = mat; chosen_key = seg_key; break
+
+                    if chosen_mat is None:
+                        eligible = [m for m in shuffled if m.usable_duration >= duration]
+                        if eligible:
+                            least = min(eligible, key=lambda m: mat_use_count[id(m)])
+                        else:
+                            least = min(shuffled, key=lambda m: mat_use_count[id(m)])
+                        chosen_mat = least
+                        chosen_key = f"{chosen_mat.path}@head_forced"
+
+                    video_used.add(chosen_key)
+                    global_used.add(chosen_key)
+                    mat_use_count[id(chosen_mat)] += 1
+
+                    task_slots.append({
+                        'mat': chosen_mat,
+                        'start': chosen_mat.start,
+                        'end': chosen_mat.start + duration,
+                        'duration': duration,
+                        'role': 'random',
                         'label': label,
                     })
 
@@ -330,8 +438,10 @@ class FFmpegMixer:
                 self.log("拼接失败")
                 return False
 
-            # 步骤3：替换音频
-            if audio_path and os.path.exists(audio_path):
+            # 步骤3：添加背景音频
+            has_bgm = audio_path and os.path.exists(audio_path)
+
+            if has_bgm:
                 cmd_audio = [
                     self.ffmpeg, '-y',
                     '-i', merged, '-i', audio_path,
@@ -350,9 +460,11 @@ class FFmpegMixer:
                     '-t', str(total_duration), '-shortest',
                     out_path
                 ]
-            ret = subprocess.run(cmd_audio, capture_output=True, timeout=120)
+            ret = subprocess.run(cmd_audio, capture_output=True, timeout=120,
+                     env={**os.environ, 'PYTHONIOENCODING': 'utf-8'})
             if ret.returncode != 0:
                 self.log("音频合并失败")
+                self.log(ret.stderr.decode('utf-8', errors='ignore')[-400:])
                 return False
 
             return True

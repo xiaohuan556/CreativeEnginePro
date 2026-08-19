@@ -167,10 +167,16 @@ _audio_cache: dict[str, bool] = {}
 
 
 def probe_has_audio(path: str) -> bool:
-    """快速检测文件是否包含音频流（结果缓存）"""
+    """快速检测文件是否包含音频流（结果缓存）。
+
+    项目发布包通常只内置 ffmpeg.exe，不一定带 ffprobe.exe，因此 ffprobe
+    不可用或执行失败时必须回退到 ``ffmpeg -i``。否则会把探测失败误判成
+    “无音轨”，导出器继而过滤掉全部音频并输出 ``-an`` 静音视频。
+    """
     if path in _audio_cache:
         return _audio_cache[path]
     has = False
+    probed = False
     try:
         fp = _ffprobe_bin()
         result = subprocess.run(
@@ -179,10 +185,29 @@ def probe_has_audio(path: str) -> bool:
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
             timeout=5, creationflags=_NO_WINDOW,
         )
-        has = len(result.stdout.strip()) > 0
+        if result.returncode == 0:
+            has = len(result.stdout.strip()) > 0
+            probed = True
     except Exception:
         pass
-    _audio_cache[path] = has
+
+    if not probed:
+        try:
+            result = subprocess.run(
+                [_ffmpeg_bin(), '-i', path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=10, creationflags=_NO_WINDOW,
+            )
+            info = result.stderr.decode('utf-8', errors='replace') if result.stderr else ''
+            # 仅匹配 FFmpeg 的音频 Stream 行，避免文件名/元数据中的 "Audio" 误判。
+            has = re.search(r'Stream\s+#\S+.*:\s*Audio\s*:', info, re.IGNORECASE) is not None
+            probed = bool(info)
+        except Exception:
+            logging.debug("probe_has_audio(ffmpeg) failed: %s", path, exc_info=True)
+
+    # 探测工具完全不可用时不缓存失败结果，避免一次环境抖动让本次会话永久静音。
+    if probed:
+        _audio_cache[path] = has
     return has
 
 

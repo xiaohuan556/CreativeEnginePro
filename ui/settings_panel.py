@@ -1,303 +1,568 @@
+"""CreativeEnginePro 全局设置中心。
+
+全局设置只管理跨工作台共享的配置：AI 凭据、下载环境、性能和程序路径。
+尾页、轮播、配音等业务预设继续在对应工作台维护，避免重复配置源。
 """
-小欢语音 - 内嵌设置面板（侧边栏）
-精美分类 · 付费/免费标识 · 引擎 + 语言模型配置
-"""
-from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
-    QLineEdit, QComboBox, QFrame, QMessageBox, QScrollArea,
-)
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
-from PyQt6.QtGui import QIcon, QPixmap, QPainter, QPen, QColor
+from __future__ import annotations
+
+import os
 from pathlib import Path
-import os, sys
-import config
+
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings
+from PyQt6.QtWidgets import (
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox,
+    QFrame, QScrollArea, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
+    QStackedWidget, QFileDialog,
+)
+
+
+_DEFAULT_BASE = {
+    "openai": "https://modelhub.ailemac.com/api/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "custom_llm": "",
+}
 
 
 class SettingsPanel(QWidget):
-    settings_changed = pyqtSignal()
+    """按工具工作流组织的全局设置面板。"""
+
+    settings_saved = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # 关键：子 QWidget 带样式表背景时，必须开启 WA_StyledBackground 才能可靠绘制
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        # 不再初始 collapse 到 0 宽：QScrollArea(widgetResizable) 在 0 宽下缓存内容尺寸，
-        # 之后展开到 300 时常常无法重新布局，导致只剩暗色背景、文字图标全无。
-        # 不在此处 setFixedWidth：面板宽度由宿主（voice_workbench._position_settings）控制，
-        # 否则固定宽度会覆盖 setGeometry 的宽度设置。
-        self._collapsed = False
+        self._nav_buttons = []
         self._build()
-        self._content.show()
+        self._load_prefs()
 
+    # ── 布局 ──────────────────────────────────────────────
     def _build(self):
-        self.setStyleSheet("background:#232323;border:1px solid #3a3a3a;border-radius:10px;")
-        L = QVBoxLayout(self); L.setContentsMargins(0,0,0,0); L.setSpacing(0)
+        self.setStyleSheet("background:#202124;color:#d8dbe2;")
+        root = QHBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # ═══ 顶部栏 ═══
-        top = QWidget(); top.setFixedHeight(40)
-        top.setStyleSheet("background:#1a1a1a;border-bottom:1px solid #333333;border-top-left-radius:10px;border-top-right-radius:10px;")
-        th = QHBoxLayout(top); th.setContentsMargins(14,0,10,0)
-        th.addWidget(_lbl("设置", "#eeeeee", 13, True))
-        th.addStretch()
-        self.btn_toggle = QPushButton()
-        self.btn_toggle.setFixedSize(26, 26)
-        self.btn_toggle.setIcon(self._x_icon())
-        self.btn_toggle.setIconSize(QSize(14, 14))
-        self.btn_toggle.setToolTip("关闭设置")
-        self.btn_toggle.setStyleSheet("QPushButton{background:#2a2a2a;border:1px solid #444;border-radius:5px;}QPushButton:hover{background:#3a3a3a;border-color:#ff6b6b;}")
-        self.btn_toggle.clicked.connect(self.toggle); th.addWidget(self.btn_toggle)
-        L.addWidget(top)
+        sidebar = QFrame()
+        sidebar.setFixedWidth(176)
+        sidebar.setStyleSheet("QFrame{background:#17181b;border-right:1px solid #303137;}")
+        side = QVBoxLayout(sidebar)
+        side.setContentsMargins(12, 18, 12, 14)
+        side.setSpacing(6)
+        title = _label("设置", "#f2f3f5", 18, True)
+        side.addWidget(title)
+        subtitle = _label("CreativeEnginePro", "#737782", 9)
+        side.addWidget(subtitle)
+        side.addSpacing(14)
 
-        # ═══ 滚动内容 ═══
-        scroll = QScrollArea(); scroll.setWidgetResizable(True)
-        scroll.setStyleSheet("QScrollArea{background:transparent;border:none;}QScrollBar:vertical{background:#141414;width:4px;border-radius:2px;}QScrollBar::handle:vertical{background:#333;border-radius:2px;}")
-        self._content = QWidget(); self._content.setStyleSheet("background:transparent;")
-        C = QVBoxLayout(self._content); C.setContentsMargins(16,14,16,18); C.setSpacing(12)
-
-        # ═══ TTS 语音引擎 ═══
-        C.addWidget(_section_header("🎙  TTS 语音引擎", "选择配音服务商"))
-
-        # 引擎卡片行
-        engines_card = QFrame()
-        engines_card.setStyleSheet(_CARD)
-        ec = QVBoxLayout(engines_card); ec.setContentsMargins(14,10,14,12); ec.setSpacing(10)
-
-        self._current_engine = "edge"
-        self._engine_btns = []
-        engs = [
-            ("edge", "Edge-TTS", "微软免费语音，支持50+语言和方言", "🆓 免费"),
-            ("auto_lang", "🌐 千语种", "自动识别语言·edge/gTTS兜底·80+语种", "🆓 免费"),
-            ("siliconflow", "硅基流动", "CosyVoice2 · 8种定制音色 · 2000万token", "🆓 免费"),
-            ("deepgram", "Deepgram", "顶级英文音质 · 12种Aura声音", "🆓 免费"),
-            ("elevenlabs", "ElevenLabs", "高品质AI配音，21个英语声音", "💎 付费"),
-            ("fish_audio", "Fish Audio", "192万社区声音模型，多语言", "💎 付费"),
+        self.stack = QStackedWidget()
+        pages = [
+            ("🤖  AI 引擎", self._build_ai_page()),
+            ("⬇  下载与素材", self._build_download_page()),
+            ("⚡  性能与缓存", self._build_performance_page()),
+            ("ℹ  关于与路径", self._build_about_page()),
         ]
-        for i, (key, name, desc, badge) in enumerate(engs):
-            row = QFrame(); row.setCursor(Qt.CursorShape.PointingHandCursor)
-            row.setStyleSheet(_ENG_OFF)
-            rl = QHBoxLayout(row); rl.setContentsMargins(10,8,10,8); rl.setSpacing(8)
+        for index, (text, page) in enumerate(pages):
+            button = QPushButton(text)
+            button.setCheckable(True)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setStyleSheet(_NAV_BUTTON)
+            button.clicked.connect(lambda checked=False, i=index: self._switch_page(i))
+            self._nav_buttons.append(button)
+            side.addWidget(button)
+            self.stack.addWidget(page)
+        side.addStretch()
+        side.addWidget(_label("业务预设请在对应工作台设置", "#676b74", 9))
+        root.addWidget(sidebar)
 
-            left = QVBoxLayout(); left.setSpacing(1)
-            top_row = QHBoxLayout(); top_row.setSpacing(6)
-            top_row.addWidget(_lbl(name, "#ddd", 12, True))
-            b = _lbl(badge, "#4caf50" if "免费" in badge else "#f0ad4e", 9, True)
-            b.setStyleSheet(f"QLabel{{background:{'#1a3a1a' if '免费' in badge else '#3a2a1a'};color:{'#4caf50' if '免费' in badge else '#f0ad4e'};border-radius:3px;padding:1px 6px;font-size:9px;}}")
-            top_row.addWidget(b); top_row.addStretch()
-            left.addLayout(top_row)
-            left.addWidget(_lbl(desc, "#9a9a9a", 10))
-            rl.addLayout(left, 1)
+        content = QWidget()
+        content_layout = QVBoxLayout(content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(0)
+        content_layout.addWidget(self.stack, 1)
 
-            self._engine_btns.append((key, row))
-            row.mousePressEvent = lambda ev, k=key: self._select_engine(k)
-            ec.addWidget(row)
+        actions = QFrame()
+        actions.setStyleSheet("QFrame{background:#191a1d;border-top:1px solid #303137;}")
+        action_layout = QHBoxLayout(actions)
+        action_layout.setContentsMargins(18, 10, 18, 10)
+        self.status_label = _label("", "#78c58b", 10)
+        action_layout.addWidget(self.status_label)
+        action_layout.addStretch()
+        reload_btn = QPushButton("重新加载")
+        reload_btn.setStyleSheet(_SECONDARY_BUTTON)
+        reload_btn.clicked.connect(self._load_prefs)
+        action_layout.addWidget(reload_btn)
+        save_btn = QPushButton("保存设置")
+        save_btn.setObjectName("Primary")
+        save_btn.setStyleSheet(_PRIMARY_BUTTON)
+        save_btn.clicked.connect(self._save_prefs)
+        action_layout.addWidget(save_btn)
+        content_layout.addWidget(actions)
+        root.addWidget(content, 1)
+        self._switch_page(0)
 
-        C.addWidget(engines_card)
+    def _switch_page(self, index: int):
+        self.stack.setCurrentIndex(index)
+        for i, button in enumerate(self._nav_buttons):
+            button.setChecked(i == index)
 
-        # 当前引擎提示
-        self.hint_engine = _lbl("", "#555", 10); self.hint_engine.setWordWrap(True)
-        C.addWidget(self.hint_engine)
+    def _scroll_page(self, title: str, subtitle: str):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet(_SCROLL)
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(22, 20, 22, 24)
+        layout.setSpacing(14)
+        layout.addWidget(_label(title, "#f0f1f4", 18, True))
+        hint = _label(subtitle, "#858a94", 10)
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+        scroll.setWidget(page)
+        return scroll, layout
 
-        # ═══ API 密钥配置 ═══
-        C.addWidget(_section_header("🔑  API 密钥", "配置当前引擎的访问密钥"))
+    # ── AI ────────────────────────────────────────────────
+    def _build_ai_page(self):
+        scroll, layout = self._scroll_page(
+            "AI 引擎", "统一管理脚本、翻译、AI 图片和 AI 视频使用的服务凭据。")
 
-        keys_card = QFrame(); keys_card.setStyleSheet(_CARD)
-        kc = QVBoxLayout(keys_card); kc.setContentsMargins(14,10,14,14); kc.setSpacing(10)
+        llm = _card("语言模型", "AI 脚本、翻译和润色")
+        form = llm.layout()
+        self.llm_combo = QComboBox()
+        self.llm_combo.addItem("ModelHub / OpenAI 兼容", "openai")
+        self.llm_combo.addItem("DeepSeek 官方", "deepseek")
+        self.llm_combo.addItem("自定义兼容接口", "custom_llm")
+        self.llm_combo.setStyleSheet(_COMBO)
+        self.llm_combo.currentIndexChanged.connect(self._on_llm_mode_change)
+        _form_row(form, "服务商", self.llm_combo)
+        self.llm_model = _line("模型名，如 gpt-5.5 / deepseek-chat")
+        _form_row(form, "模型", self.llm_model)
+        self.llm_key = _line("当前语言模型 API Key", password=True)
+        _form_row(form, "LLM Key", self.llm_key)
+        self.llm_url = _line("留空使用默认地址")
+        _form_row(form, "Base URL", self.llm_url)
+        self.llm_hint = _label("", "#737782", 9)
+        self.llm_hint.setWordWrap(True)
+        form.addWidget(self.llm_hint)
+        layout.addWidget(llm)
 
-        self.eleven_frame = self._key_row("ElevenLabs Key", "sk_...")
-        kc.addWidget(self.eleven_frame)
-        self.edit_eleven_key = self._edt_from(self.eleven_frame)
+        generation = _card("图片与视频生成", "按实际共用关系配置，避免为同一服务重复填写")
+        form = generation.layout()
+        self.modelhub_key = _line("ModelHub sk-…", password=True)
+        _form_row(form, "ModelHub / OpenAI Key", self.modelhub_key)
+        form.addWidget(_note("供 GPT-Image、Veo 使用；也可作为 ModelHub 语言模型 Key。"))
+        self.ark_key = _line("火山方舟 ark-…", password=True)
+        _form_row(form, "豆包 Ark Key", self.ark_key)
+        form.addWidget(_note("Seedream 与 Seedance 共用这一枚 Key。"))
+        self.show_keys = QCheckBox("显示密钥")
+        self.show_keys.setStyleSheet(_CHECK)
+        self.show_keys.toggled.connect(self._toggle_keys)
+        form.addWidget(self.show_keys)
+        layout.addWidget(generation)
 
-        self.fish_frame = self._key_row("Fish Audio Key", "fish API key")
-        kc.addWidget(self.fish_frame)
-        self.edit_fish_key = self._edt_from(self.fish_frame)
+        voice_note = _card("配音服务", "音色、TTS 引擎和配音 Key 在剪辑工作台的「配音」面板统一管理。")
+        voice_note.layout().addWidget(_note("这里不重复放置配音参数，避免两边配置不一致。"))
+        layout.addWidget(voice_note)
+        layout.addStretch()
+        return scroll
 
-        self.sf_frame = self._key_row("硅基流动 Key", "sk-...")
-        kc.addWidget(self.sf_frame)
-        self.edit_sf_key = self._edt_from(self.sf_frame)
+    # ── 下载 ──────────────────────────────────────────────
+    def _build_download_page(self):
+        scroll, layout = self._scroll_page(
+            "下载与素材", "管理下载、扒取和开放许可音频使用的共享路径。")
+        paths = _card("默认下载位置", "下载页与扒取页共用")
+        form = paths.layout()
+        self.download_dir = _line("选择视频和音频的保存目录")
+        browse = QPushButton("选择目录")
+        browse.setStyleSheet(_SECONDARY_BUTTON)
+        browse.clicked.connect(self._pick_download_dir)
+        _form_row_with_button(form, "下载目录", self.download_dir, browse)
+        layout.addWidget(paths)
 
-        self.dg_frame = self._key_row("Deepgram Key", "Deepgram API key")
-        kc.addWidget(self.dg_frame)
-        self.edit_dg_key = self._edt_from(self.dg_frame)
+        login = _card("登录态与站点兼容", "YouTube、TikTok、抖音等站点可能需要登录 Cookie")
+        form = login.layout()
+        self.cookies_file = _line("Netscape cookies.txt（可选）")
+        cookie_btn = QPushButton("选择文件")
+        cookie_btn.setStyleSheet(_SECONDARY_BUTTON)
+        cookie_btn.clicked.connect(self._pick_cookie_file)
+        _form_row_with_button(form, "Cookie 文件", self.cookies_file, cookie_btn)
+        self.browser_status = _note("浏览器检测：尚未检测")
+        form.addWidget(self.browser_status)
+        detect_btn = QPushButton("重新检测浏览器")
+        detect_btn.setStyleSheet(_SECONDARY_BUTTON)
+        detect_btn.clicked.connect(lambda: self._refresh_browser_status(True))
+        form.addWidget(detect_btn, alignment=Qt.AlignmentFlag.AlignLeft)
+        layout.addWidget(login)
 
-        kc.addStretch()
-        C.addWidget(keys_card)
+        music = _card("Openverse 音频素材", "无需 API Key，在剪辑工作台的「音乐音效」页搜索和下载")
+        music.layout().addWidget(_note("下载时会自动保存作者、来源与许可证记录。"))
+        layout.addWidget(music)
+        layout.addStretch()
+        return scroll
 
-        # ═══ 语言模型 ═══
-        C.addWidget(_section_header("🧠  语言模型", "翻译·润色·脚本生成"))
-        llm_card = QFrame(); llm_card.setStyleSheet(_CARD)
-        lc = QVBoxLayout(llm_card); lc.setContentsMargins(14,10,14,14); lc.setSpacing(8)
-        lc.addWidget(_lbl("DeepSeek-V3", "#eeeeee", 12, True))
-        lc.addWidget(_lbl("高性能中文大模型，润色/翻译/脚本均用此模型", "#9a9a9a", 10))
-        self.llm_key_frame = self._key_row("API Key", "sk-...")
-        lc.addWidget(self.llm_key_frame)
-        self.edit_openai_key = self._edt_from(self.llm_key_frame)
-        C.addWidget(llm_card)
+    # ── 性能 ──────────────────────────────────────────────
+    def _build_performance_page(self):
+        scroll, layout = self._scroll_page(
+            "性能与缓存", "调整剪辑预览、素材缩略图和磁盘缓存策略。")
+        performance = _card("预览性能", "改动会影响后续新建的解码器和缩略图")
+        form = performance.layout()
+        self.spin_buffer = QSpinBox()
+        self.spin_buffer.setRange(4, 120)
+        self.spin_buffer.setSingleStep(2)
+        self.spin_buffer.setStyleSheet(_SPIN)
+        _form_row(form, "解码缓冲帧", self.spin_buffer)
+        form.addWidget(_note("数值越大播放越稳，但会占用更多内存。推荐 24。"))
+        self.spin_thumb = QSpinBox()
+        self.spin_thumb.setRange(80, 640)
+        self.spin_thumb.setSingleStep(20)
+        self.spin_thumb.setSuffix(" px")
+        self.spin_thumb.setStyleSheet(_SPIN)
+        _form_row(form, "缩略图宽度", self.spin_thumb)
+        layout.addWidget(performance)
 
-        # ═══ 保存 ═══
-        btn = QPushButton("💾  保存设置")
-        btn.setFixedHeight(38); btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        btn.setStyleSheet("QPushButton{background:#3d8ef8;color:#fff;border:none;border-radius:8px;font-size:13px;font-weight:bold;}QPushButton:hover{background:#4a9df9;}QPushButton:pressed{background:#2d7ee8;}")
-        btn.clicked.connect(self._save); C.addWidget(btn)
-        C.addStretch()
-        scroll.setWidget(self._content)
-        L.addWidget(scroll, 1)
-        self._load()
+        cache = _card("缓存管理", "Cache 与 work_temp 的自动清理策略")
+        form = cache.layout()
+        self.cache_enable = QCheckBox("启用启动时自动清理")
+        self.cache_enable.setStyleSheet(_CHECK)
+        self.cache_enable.toggled.connect(self._on_cache_toggle)
+        form.addWidget(self.cache_enable)
+        self.spin_cache = QDoubleSpinBox()
+        self.spin_cache.setRange(0, 100)
+        self.spin_cache.setSingleStep(0.5)
+        self.spin_cache.setDecimals(1)
+        self.spin_cache.setSuffix(" GB")
+        self.spin_cache.setStyleSheet(_SPIN)
+        _form_row(form, "占用阈值", self.spin_cache)
+        self.cache_readout = _note("当前占用：计算中…")
+        form.addWidget(self.cache_readout)
+        layout.addWidget(cache)
+        layout.addStretch()
+        return scroll
 
-    def _key_row(self, label, placeholder):
-        f = QFrame()
-        fl = QVBoxLayout(f); fl.setContentsMargins(0,0,0,0); fl.setSpacing(4)
-        fl.addWidget(_lbl(label, "#999", 10))
-        e = QLineEdit(); e.setPlaceholderText(placeholder)
-        e.setEchoMode(QLineEdit.EchoMode.Password); e.setStyleSheet(_INPUT)
-        fl.addWidget(e)
-        f.setVisible(False)
-        return f
+    # ── 关于 ──────────────────────────────────────────────
+    def _build_about_page(self):
+        scroll, layout = self._scroll_page(
+            "关于与路径", "查看配置位置，明确哪些设置应在哪个工作台完成。")
+        about = _card("CreativeEnginePro", "面向批量内容生产的剪辑、AI 生成和自动化工作台")
+        form = about.layout()
+        form.addWidget(_path_line("项目目录", Path.cwd()))
+        try:
+            from api_config import ENV_PATH
+            env_path = ENV_PATH
+        except Exception:
+            env_path = Path.cwd() / ".env"
+        form.addWidget(_path_line("环境配置", env_path))
+        form.addWidget(_path_line("缓存目录", Path.cwd() / "work_temp"))
+        layout.addWidget(about)
 
-    def _edt_from(self, frm):
-        for c in frm.findChildren(QLineEdit): return c
-        return None
+        scope = _card("设置归属", "功能参数就近管理，减少重复和冲突")
+        form = scope.layout()
+        for text in (
+            "尾页模式、尾页文件、自动输出 → 尾页处理页",
+            "轮播数量、转场、BGM、AI 风格 → 图片轮播页",
+            "配音引擎、音色、TTS Key → 剪辑工作台 / 配音",
+            "下载后的自动去向 → 扒取页",
+        ):
+            form.addWidget(_note("• " + text))
+        layout.addWidget(scope)
+        layout.addStretch()
+        return scroll
 
-    def _select_engine(self, key: str):
-        """点击引擎卡片切换（自动保存）"""
-        self._current_engine = key
-        for k, row in self._engine_btns:
-            row.setStyleSheet(_ENG_ON if k == key else _ENG_OFF)
-        self._on_engine_change(key)
-        self._save(silent=True)  # 切换即保存
-
-    def _on_engine_change(self, key: str = ""):
-        hints = {
-            "edge": "Microsoft Edge-TTS · 完全免费 · 50+语言 · 中文方言支持",
-            "auto_lang": "千语种模式 · 自动检测语言 · edge-tts优先 + gTTS兜底",
-            "siliconflow": "硅基流动 CosyVoice2 · 8种音色 · 新用户2000万token",
-            "deepgram": "Deepgram Aura · 12种声音 · 顶级英文音质",
-            "elevenlabs": "ElevenLabs · 付费按量 · 21个高质量英语声音",
-            "fish_audio": "Fish Audio · 付费按量 · 192万社区声音模型",
+    # ── 交互与持久化 ──────────────────────────────────────
+    def _on_llm_mode_change(self, *_):
+        mode = self.llm_combo.currentData()
+        default_url = _DEFAULT_BASE.get(mode, "")
+        self.llm_url.setPlaceholderText(
+            "必填，如 https://your-server/v1" if mode == "custom_llm"
+            else f"可选，默认 {default_url}")
+        examples = {
+            "openai": "如 gpt-5.5 / gpt-4o-mini",
+            "deepseek": "如 deepseek-chat",
+            "custom_llm": "自定义服务的模型名",
         }
-        self.eleven_frame.setVisible(key in ("elevenlabs",))
-        self.fish_frame.setVisible(key == "fish_audio")
-        self.sf_frame.setVisible(key == "siliconflow")
-        self.dg_frame.setVisible(key == "deepgram")
-        self.hint_engine.setText(hints.get(key, ""))
+        self.llm_model.setPlaceholderText(examples.get(mode, "模型名"))
+        self.llm_hint.setText("保存后新任务使用新配置；已初始化的 AI 任务建议重启程序。")
 
-    def toggle(self):
-        self._collapsed = not self._collapsed
-        if self._collapsed: self._collapse()
-        else: self._expand()
+    def _toggle_keys(self, visible: bool):
+        mode = QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
+        for widget in (self.llm_key, self.modelhub_key, self.ark_key):
+            widget.setEchoMode(mode)
 
-    def _x_icon(self):
-        """用 QPainter 画一个关闭「×」图标，完全不依赖字体字形（避免豆腐块）。"""
-        size = 26
-        pm = QPixmap(size, size)
-        pm.fill(QColor(0, 0, 0, 0))  # 透明底
-        p = QPainter(pm)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        pen = QPen(QColor("#dddddd"))
-        pen.setWidth(2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        p.setPen(pen)
-        m = 8  # 边距
-        p.drawLine(m, m, size - m, size - m)
-        p.drawLine(size - m, m, m, size - m)
-        p.end()
-        return QIcon(pm)
+    def _pick_download_dir(self):
+        path = QFileDialog.getExistingDirectory(self, "选择默认下载目录", self.download_dir.text())
+        if path:
+            self.download_dir.setText(path)
 
-    def _collapse(self): self._content.hide()
-    def _expand(self): self._content.show()
+    def _pick_cookie_file(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择 Netscape Cookie 文件", self.cookies_file.text(),
+            "Cookie 文件 (*.txt);;所有文件 (*.*)")
+        if path:
+            self.cookies_file.setText(path)
 
-    def _env_path(self):
-        if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-            return Path(sys.executable).parent / ".env"
-        return Path(__file__).parent.parent / ".env"
+    def _refresh_browser_status(self, force=False):
+        try:
+            from core.downloader import get_available_browsers, BROWSER_LABELS
+            browsers = get_available_browsers(force_refresh=force)
+            names = "、".join(BROWSER_LABELS.get(item, item) for item in browsers)
+            self.browser_status.setText(f"检测到：{names}" if names else "未检测到可用浏览器")
+        except Exception as exc:
+            self.browser_status.setText(f"浏览器检测失败：{str(exc)[:80]}")
 
-    def _save(self, silent=False):
-        ep = self._env_path()
-        # 收集要写入的键值
-        updates = {"TTS_ENGINE": self._current_engine}
-        if v := self.edit_eleven_key.text().strip(): updates["ELEVENLABS_API_KEY"] = v
-        if v := self.edit_fish_key.text().strip(): updates["FISH_AUDIO_KEY"] = v
-        if v := self.edit_sf_key.text().strip(): updates["SILICONFLOW_KEY"] = v
-        if v := self.edit_dg_key.text().strip(): updates["DEEPGRAM_KEY"] = v
-        if v := self.edit_openai_key.text().strip(): updates["OPENAI_API_KEY"] = v
+    def _on_cache_toggle(self, checked):
+        self.spin_cache.setEnabled(checked)
+        if not checked:
+            self.spin_cache.setValue(0.0)
 
-        # 增量更新：保留注释、空白行、不相关的配置项，只更新/追加我们管理的 key
-        managed = set(updates.keys())
-        lines_out = []
-        seen = set()
-        if ep.exists():
-            for ln in ep.read_text(encoding="utf-8").splitlines():
-                stripped = ln.strip()
-                if not stripped or stripped.startswith("#"):
-                    lines_out.append(ln)
-                    continue
-                if "=" in stripped:
-                    k = stripped.split("=", 1)[0].strip()
-                    seen.add(k)
-                    if k in managed:
-                        lines_out.append(f'{k}="{updates[k]}"')
-                    else:
-                        lines_out.append(ln)
-                else:
-                    lines_out.append(ln)
-        # 追加未出现过的管理键
-        for k in managed - seen:
-            lines_out.append(f'{k}="{updates[k]}"')
-        ep.write_text("\n".join(lines_out) + "\n", encoding="utf-8")
+    def _load_prefs(self):
+        from api_config import read_env
+        import config
 
-        # 更新运行时环境变量，并同步已加载的 config 模块，避免重启才生效
-        for k, v in updates.items():
-            os.environ[k] = v
-            if hasattr(config, k):
-                setattr(config, k, v)
-        # LLM 派生配置同步
-        if "OPENAI_API_KEY" in updates:
-            if config.LLM_MODE == "custom_llm" and getattr(config, "CUSTOM_LLM_KEY", ""):
-                config.LLM_API_KEY = config.CUSTOM_LLM_KEY
-                config.LLM_BASE_URL = getattr(config, "CUSTOM_LLM_URL", "") or "https://api.openai.com/v1"
-                config.LLM_MODEL_NAME = getattr(config, "CUSTOM_LLM_MODEL", "") or "gpt-3.5-turbo"
-            else:
-                config.LLM_API_KEY = updates["OPENAI_API_KEY"]
-                config.LLM_BASE_URL = config.OPENAI_BASE_URL
-                config.LLM_MODEL_NAME = getattr(config, "LLM_MODEL", os.getenv("LLM_MODEL", "deepseek-chat"))
-        self.settings_changed.emit()
-        if not silent:
-            QMessageBox.information(self, "已保存", "设置已保存，引擎已切换")
-            self.hide()   # 点击“保存设置”后自动关闭面板
+        env = read_env()
+        mode = env.get("LLM_MODE", getattr(config, "LLM_MODE", "openai"))
+        idx = self.llm_combo.findData(mode)
+        self.llm_combo.setCurrentIndex(max(0, idx))
+        if mode == "custom_llm":
+            self.llm_key.setText(env.get("CUSTOM_LLM_KEY", ""))
+            self.llm_model.setText(env.get("CUSTOM_LLM_MODEL", ""))
+            self.llm_url.setText(env.get("CUSTOM_LLM_URL", ""))
+        else:
+            self.llm_key.setText(env.get("LLM_API_KEY", ""))
+            self.llm_model.setText(env.get("LLM_MODEL", getattr(config, "LLM_MODEL", "")))
+            self.llm_url.setText(env.get("LLM_BASE_URL", ""))
+        self.modelhub_key.setText(env.get("OPENAI_API_KEY", ""))
+        self.ark_key.setText(env.get("SEEDREAM_API_KEY", ""))
 
-    def _load(self):
-        ep = self._env_path()
-        if not ep.exists(): return
-        cfg = {}
-        for ln in ep.read_text(encoding="utf-8").splitlines():
-            ln = ln.strip()
-            if "=" in ln and not ln.startswith("#"):
-                k, _, v = ln.partition("="); cfg[k.strip()] = v.strip().strip('"').strip("'")
-        eng = cfg.get("TTS_ENGINE", "edge")
-        self._select_engine(eng)
-        if v := cfg.get("ELEVENLABS_API_KEY"): self.edit_eleven_key.setText(v)
-        if v := cfg.get("FISH_AUDIO_KEY"): self.edit_fish_key.setText(v)
-        if v := cfg.get("SILICONFLOW_KEY"): self.edit_sf_key.setText(v)
-        if v := cfg.get("DEEPGRAM_KEY"): self.edit_dg_key.setText(v)
-        if v := cfg.get("OPENAI_API_KEY"): self.edit_openai_key.setText(v)
+        settings = QSettings("CreativeEnginePro", "DownloadPanel")
+        try:
+            from core import downloader
+            default_download_dir = downloader.DOWNLOAD_DIR
+        except Exception:
+            default_download_dir = ""
+        self.download_dir.setText(str(settings.value("download_dir", default_download_dir)))
+        self.cookies_file.setText(str(settings.value("cookies_file", "")))
+        self.spin_buffer.setValue(int(getattr(config, "DECODER_BUFFER", 24)))
+        self.spin_thumb.setValue(int(getattr(config, "THUMB_SIZE", 320)))
+        cache = float(getattr(config, "CACHE_MAX_GB", 0.0) or 0.0)
+        self.cache_enable.setChecked(cache > 0)
+        self.spin_cache.setValue(cache)
+        self.spin_cache.setEnabled(cache > 0)
+        self._on_llm_mode_change()
+        self._update_cache_readout()
+        self._refresh_browser_status()
+        self.status_label.setStyleSheet("color:#78c58b;font-size:10px;")
+        self.status_label.setText("已重新加载当前配置")
+
+    def _save_prefs(self):
+        from api_config import write_env
+        import config
+
+        mode = self.llm_combo.currentData()
+        key = self.llm_key.text().strip()
+        model = self.llm_model.text().strip()
+        url = self.llm_url.text().strip()
+        download_dir = self.download_dir.text().strip()
+        cookie_file = self.cookies_file.text().strip()
+        if mode == "custom_llm" and not url:
+            self.status_label.setStyleSheet("color:#e6a15c;font-size:10px;")
+            self.status_label.setText("自定义 LLM 必须填写 Base URL")
+            return
+        if download_dir and not os.path.isdir(download_dir):
+            self.status_label.setStyleSheet("color:#e6a15c;font-size:10px;")
+            self.status_label.setText("下载目录不存在，请重新选择")
+            self._switch_page(1)
+            return
+        if cookie_file and not os.path.isfile(cookie_file):
+            self.status_label.setStyleSheet("color:#e6a15c;font-size:10px;")
+            self.status_label.setText("Cookie 文件不存在，请重新选择或清空")
+            self._switch_page(1)
+            return
+        if mode == "custom_llm":
+            updates = {
+                "LLM_MODE": mode, "CUSTOM_LLM_KEY": key,
+                "CUSTOM_LLM_MODEL": model, "CUSTOM_LLM_URL": url,
+                "LLM_BASE_URL": "",
+            }
+        else:
+            updates = {
+                "LLM_MODE": mode, "LLM_API_KEY": key,
+                "LLM_MODEL": model, "LLM_BASE_URL": url,
+            }
+        updates.update({
+            "OPENAI_API_KEY": self.modelhub_key.text().strip(),
+            "SEEDREAM_API_KEY": self.ark_key.text().strip(),
+            "DECODER_BUFFER": str(self.spin_buffer.value()),
+            "THUMB_SIZE": str(self.spin_thumb.value()),
+            "CACHE_MAX_GB": str(self.spin_cache.value() if self.cache_enable.isChecked() else 0.0),
+        })
+        write_env(updates)
+
+        for key_name, caster in (
+            ("DECODER_BUFFER", int), ("THUMB_SIZE", int), ("CACHE_MAX_GB", float),
+            ("OPENAI_API_KEY", str), ("SEEDREAM_API_KEY", str),
+            ("LLM_MODE", str),
+            ("LLM_MODEL", str), ("LLM_API_KEY", str), ("LLM_BASE_URL", str),
+        ):
+            if key_name in updates:
+                try:
+                    setattr(config, key_name, caster(updates[key_name]))
+                except Exception:
+                    pass
+
+        # config.py 中有一组根据 LLM_MODE 派生的运行时变量；保存后同步重算，
+        # 让新建的脚本/翻译任务立即使用刚刚选择的服务。
+        if mode == "custom_llm":
+            config.CUSTOM_LLM_KEY = key
+            config.CUSTOM_LLM_MODEL = model
+            config.CUSTOM_LLM_URL = url
+            config.LLM_API_KEY = key
+            config.LLM_BASE_URL = url
+            config.LLM_MODEL_NAME = model or "gpt-3.5-turbo"
+        else:
+            config.LLM_API_KEY = key
+            config.LLM_BASE_URL = url or _DEFAULT_BASE[mode]
+            config.LLM_MODEL_NAME = model or (
+                "deepseek-chat" if mode == "deepseek" else "gpt-5.5")
+        config.LLM_MODEL = model or config.LLM_MODEL_NAME
+
+        settings = QSettings("CreativeEnginePro", "DownloadPanel")
+        if download_dir:
+            settings.setValue("download_dir", download_dir)
+        else:
+            settings.remove("download_dir")
+        if cookie_file:
+            settings.setValue("cookies_file", cookie_file)
+        else:
+            settings.remove("cookies_file")
+        try:
+            import core.downloader as downloader
+            if download_dir and os.path.isdir(download_dir):
+                downloader.DOWNLOAD_DIR = download_dir
+            downloader.set_cookies_file(cookie_file if os.path.isfile(cookie_file) else "")
+        except Exception:
+            pass
+
+        self._update_cache_readout()
+        self.status_label.setStyleSheet("color:#78c58b;font-size:10px;")
+        self.status_label.setText("设置已保存；AI Key 变更后建议重启程序")
+        self.settings_saved.emit({"download_dir": download_dir, "cookies_file": cookie_file})
+
+    def _current_cache_bytes(self):
+        total = 0
+        for directory in (Path("Cache"), Path("work_temp")):
+            if not directory.exists():
+                continue
+            for item in directory.rglob("*"):
+                if item.is_file():
+                    try:
+                        total += item.stat().st_size
+                    except OSError:
+                        pass
+        return total
+
+    def _update_cache_readout(self):
+        size = self._current_cache_bytes() / (1024 ** 3)
+        self.cache_readout.setText(f"当前占用：{size:.2f} GB（Cache + work_temp）")
 
 
-# ═══ 样式 ═══
-def _lbl(text, color="#ccc", size=11, bold=False):
-    l = QLabel(text)
-    l.setStyleSheet(f"color:{color};font-size:{size}px;{'font-weight:bold;' if bold else ''}")
-    return l
+# ── 组件辅助 ──────────────────────────────────────────────
+def _label(text, color="#d8dbe2", size=11, bold=False):
+    widget = QLabel(text)
+    widget.setStyleSheet(
+        f"color:{color};font-size:{size}px;" + ("font-weight:600;" if bold else ""))
+    return widget
 
-def _section_header(icon_text, desc):
-    f = QFrame()
-    fl = QVBoxLayout(f); fl.setContentsMargins(0,0,0,0); fl.setSpacing(2)
-    fl.addWidget(_lbl(icon_text, "#5aa6ff", 12, True))
-    fl.addWidget(_lbl(desc, "#8a8a8a", 10))
-    return f
 
-_CARD = "QFrame{background:#2a2a2a;border:1px solid #3a3a3a;border-radius:8px;}"
-_INPUT = (
-    "QLineEdit{background:#141414;border:1px solid #3a3a3a;border-radius:6px;"
-    "color:#dddddd;font-size:12px;padding:7px 10px;}"
-    "QLineEdit:focus{border-color:#3d8ef8;}"
+def _note(text):
+    widget = _label(text, "#7f8490", 9)
+    widget.setWordWrap(True)
+    return widget
+
+
+def _line(placeholder="", password=False):
+    widget = QLineEdit()
+    widget.setPlaceholderText(placeholder)
+    widget.setStyleSheet(_INPUT)
+    if password:
+        widget.setEchoMode(QLineEdit.EchoMode.Password)
+    return widget
+
+
+def _card(title, subtitle=""):
+    card = QFrame()
+    card.setStyleSheet(_CARD)
+    layout = QVBoxLayout(card)
+    layout.setContentsMargins(14, 12, 14, 14)
+    layout.setSpacing(9)
+    layout.addWidget(_label(title, "#e9eaed", 12, True))
+    if subtitle:
+        layout.addWidget(_note(subtitle))
+    return card
+
+
+def _form_row(layout, label, widget):
+    row = QHBoxLayout()
+    row.setSpacing(12)
+    text = _label(label, "#abb0ba", 10)
+    text.setFixedWidth(138)
+    row.addWidget(text)
+    row.addWidget(widget, 1)
+    layout.addLayout(row)
+
+
+def _form_row_with_button(layout, label, widget, button):
+    row = QHBoxLayout()
+    row.setSpacing(8)
+    text = _label(label, "#abb0ba", 10)
+    text.setFixedWidth(138)
+    row.addWidget(text)
+    row.addWidget(widget, 1)
+    row.addWidget(button)
+    layout.addLayout(row)
+
+
+def _path_line(label, path):
+    widget = _label(f"{label}：{Path(path)}", "#9aa0aa", 10)
+    widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+    widget.setWordWrap(True)
+    return widget
+
+
+_NAV_BUTTON = (
+    "QPushButton{text-align:left;padding:9px 10px;border:none;border-radius:6px;"
+    "background:transparent;color:#9297a1;font-size:11px;}"
+    "QPushButton:hover{background:#25272c;color:#d8dbe2;}"
+    "QPushButton:checked{background:#27364d;color:#78aef8;font-weight:600;}"
 )
-_ENG_OFF = "QFrame{background:#262626;border:1px solid #333;border-radius:6px;}QFrame:hover{background:#303030;}"
-_ENG_ON  = "QFrame{background:#1a2a4a;border:1px solid #3d8ef8;border-radius:6px;}"
+_CARD = "QFrame{background:#292b30;border:1px solid #383b42;border-radius:9px;}"
+_INPUT = (
+    "QLineEdit{background:#18191c;border:1px solid #3d4048;border-radius:6px;"
+    "color:#e1e3e7;padding:7px 9px;font-size:11px;}"
+    "QLineEdit:focus{border-color:#4d91f7;}"
+)
+_COMBO = (
+    "QComboBox{background:#18191c;border:1px solid #3d4048;border-radius:6px;"
+    "color:#e1e3e7;padding:6px 8px;font-size:11px;}"
+    "QComboBox QAbstractItemView{background:#202124;color:#ddd;selection-background-color:#315d9b;}"
+)
+_SPIN = (
+    "QSpinBox,QDoubleSpinBox{background:#18191c;border:1px solid #3d4048;border-radius:6px;"
+    "color:#e1e3e7;padding:6px 8px;min-width:90px;}"
+)
+_CHECK = (
+    "QCheckBox{color:#c6c9d0;font-size:10px;spacing:7px;}"
+    "QCheckBox::indicator{width:15px;height:15px;background:#18191c;border:1px solid #454952;border-radius:3px;}"
+    "QCheckBox::indicator:checked{background:#3d8ef8;border-color:#3d8ef8;}"
+)
+_PRIMARY_BUTTON = (
+    "QPushButton{background:#3d8ef8;color:white;border:none;border-radius:6px;"
+    "padding:8px 18px;font-weight:600;}QPushButton:hover{background:#559df7;}"
+)
+_SECONDARY_BUTTON = (
+    "QPushButton{background:#2b2d32;color:#c5c8cf;border:1px solid #41444c;"
+    "border-radius:6px;padding:7px 12px;}QPushButton:hover{border-color:#5a94e8;color:white;}"
+)
+_SCROLL = (
+    "QScrollArea{background:#202124;border:none;}"
+    "QScrollBar:vertical{background:#202124;width:7px;}"
+    "QScrollBar::handle:vertical{background:#454850;border-radius:3px;min-height:30px;}"
+)

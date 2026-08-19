@@ -8,6 +8,7 @@ import time
 import tempfile
 import subprocess
 import shutil
+import hashlib
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -17,6 +18,7 @@ from PyQt6.QtWidgets import (
     QHeaderView, QInputDialog, QMessageBox, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QThread, QSize
+from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from .widgets import CheckMarkBox
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -191,7 +193,6 @@ class _AudioItemWidget(QWidget):
 
 class VideoWorkbench(QWidget):
     status_msg = pyqtSignal(str, str)
-    text_to_voice = pyqtSignal(str)  # 字幕转到语音台（带跳转）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -434,11 +435,6 @@ class VideoWorkbench(QWidget):
         sub_bar.addWidget(self.btn_show_trans)
         sub_bar.addWidget(QLabel("  双击单元格可编辑字幕"))
         sub_bar.addStretch()
-        btn_to_voice = QPushButton("→ 转到语音台朗读")
-        btn_to_voice.setFixedHeight(30)
-        btn_to_voice.setStyleSheet(_ACC)
-        btn_to_voice.clicked.connect(self._send_to_voice)
-        sub_bar.addWidget(btn_to_voice)
         root.addLayout(sub_bar)
 
         self.sub_table = QTableWidget(0, 3)
@@ -451,7 +447,7 @@ class VideoWorkbench(QWidget):
         self.sub_table.setColumnWidth(1, 140)
         self.sub_table.verticalHeader().setVisible(False)
         self.sub_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.sub_table.cellDoubleClicked.connect(self._on_sub_click)
+        self.sub_table.cellDoubleClicked.connect(self._on_sub_dbl_click)
         self.sub_table.cellChanged.connect(self._on_sub_edit)
         self.sub_table.setFixedHeight(150)
         self.sub_table.cellClicked.connect(self._on_sub_click)
@@ -517,31 +513,35 @@ class VideoWorkbench(QWidget):
             return  # 防止重复触发
         self._voice_mixing = True
         tts_paths = [a["path"] for a in checked_a if Path(a["path"]).exists()]
-        if not tts_paths: return
-        if len(tts_paths) == 1:
-            mixed = tts_paths[0]
-        else:
-            from config import FFMPEG_BIN
-            tmp = Path(tempfile.gettempdir()) / f"xh_mix_{int(time.time())}.mp3"
-            inputs = []; filters = []
-            for j, p in enumerate(tts_paths):
-                inputs.extend(["-i", p]); filters.append(f"[{j}:a]")
-            merge = "".join(filters) + f"amix=inputs={len(tts_paths)}:duration=longest[aout]"
-            r = subprocess.run([FFMPEG_BIN, "-y"] + inputs +
-                ["-filter_complex", merge, "-map", "[aout]",
-                 "-c:a", "libmp3lame", "-b:a", "192k", str(tmp)], capture_output=True)
-            mixed = str(tmp) if (r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0) else tts_paths[0]
-            if r.returncode != 0:
-                self.status_msg.emit(f"配音混音失败，已用单文件: {r.stderr.decode('utf-8','replace')[-100:]}", "warn")
-        self._voice_player.setSource(QUrl.fromLocalFile(mixed))
-        self._voice_audio_out.setVolume(min(self._track_vols.get("voice", 75), 100) / 100)
-        self._voice_player.play()
-        self._voice_mixing = False
-        # 同步到主播放器位置
-        if self._player and self._player.duration() > 0:
-            pos = self._player.position()
-            if pos > 0:
-                self._voice_player.setPosition(pos)
+        try:
+            if not tts_paths:
+                self.status_msg.emit("勾选的配音文件不存在，请重新导入", "warn")
+                return
+            if len(tts_paths) == 1:
+                mixed = tts_paths[0]
+            else:
+                from config import FFMPEG_BIN
+                tmp = Path(tempfile.gettempdir()) / f"xh_mix_{int(time.time())}.mp3"
+                inputs = []; filters = []
+                for j, p in enumerate(tts_paths):
+                    inputs.extend(["-i", p]); filters.append(f"[{j}:a]")
+                merge = "".join(filters) + f"amix=inputs={len(tts_paths)}:duration=longest[aout]"
+                r = subprocess.run([FFMPEG_BIN, "-y"] + inputs +
+                    ["-filter_complex", merge, "-map", "[aout]",
+                     "-c:a", "libmp3lame", "-b:a", "192k", str(tmp)], capture_output=True)
+                mixed = str(tmp) if (r.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0) else tts_paths[0]
+                if r.returncode != 0:
+                    self.status_msg.emit(f"配音混音失败，已用单文件: {r.stderr.decode('utf-8','replace')[-100:]}", "warn")
+            self._voice_player.setSource(QUrl.fromLocalFile(mixed))
+            self._voice_audio_out.setVolume(min(self._track_vols.get("voice", 75), 100) / 100)
+            self._voice_player.play()
+            # 同步到主播放器位置
+            if self._player and self._player.duration() > 0:
+                pos = self._player.position()
+                if pos > 0:
+                    self._voice_player.setPosition(pos)
+        finally:
+            self._voice_mixing = False
 
     def seek_relative(self, sec: int):
         if self._player and self._player.duration() > 0:
@@ -615,13 +615,18 @@ class VideoWorkbench(QWidget):
         paths, _ = QFileDialog.getOpenFileNames(self, "导入素材", "",
             "媒体 (*.mp4 *.mov *.avi *.mkv *.mp3 *.wav *.ogg *.flac *.aac *.m4a);;所有文件 (*)")
         video_ext = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".flv", ".wmv"}
+        audio_ext = {".mp3", ".wav", ".ogg", ".flac", ".aac", ".m4a"}
+        imported = 0
         for p in paths:
             ext = Path(p).suffix.lower()
             if ext in video_ext:
-                self._add_video(p)
+                imported += int(self._add_video(p))
+            elif ext in audio_ext:
+                imported += int(self._add_audio(p, Path(p).stem))
             else:
-                self._add_audio(p, Path(p).stem)
-        self.status_msg.emit(f"导入 {len(paths)} 个文件", "success")
+                self.status_msg.emit(f"跳过不支持的文件: {Path(p).name}", "warn")
+        if imported:
+            self.status_msg.emit(f"导入 {imported} 个文件", "success")
 
     def _smart_import_fallback(self, paths):
         """从 dropEvent 调用：直接接收路径列表，不弹文件对话框"""
@@ -642,8 +647,8 @@ class VideoWorkbench(QWidget):
         self.status_msg.emit(f"已导入音频: {Path(path).stem}", "success")
 
     def _add_video(self, path: str):
-        if any(v["path"] == path for v in self._videos):
-            return
+        if not Path(path).is_file() or any(v["path"] == path for v in self._videos):
+            return False
         idx = len(self._videos)
         it = QListWidgetItem()
         it.setData(Qt.ItemDataRole.UserRole, ("video", idx))
@@ -661,10 +666,11 @@ class VideoWorkbench(QWidget):
         if len(self._videos) + len(self._audios) == 1:
             self._load_video(0)
         self.status_msg.emit(f"导入视频: {Path(path).name}", "info")
+        return True
 
     def _add_audio(self, path: str, name: str):
-        if any(a["path"] == path for a in self._audios):
-            return
+        if not Path(path).is_file() or any(a["path"] == path for a in self._audios):
+            return False
         idx = len(self._audios)
         it = QListWidgetItem()
         it.setData(Qt.ItemDataRole.UserRole, ("audio", idx))
@@ -680,6 +686,7 @@ class VideoWorkbench(QWidget):
 
         self._audios.append({"path": path, "name": name, "vocals": "", "bgm": "", "track": "original"})
         self.status_msg.emit(f"导入音频: {name}", "success")
+        return True
 
     def _on_item_track(self, idx: int, track: str):
         """列表项内音轨切换：更新数据 + 预览播放"""
@@ -823,6 +830,8 @@ class VideoWorkbench(QWidget):
                 act_exp_voc.setVisible(False)
                 act_exp_bgm.setVisible(False)
             menu.addSeparator()
+            act_open_dir = menu.addAction("📂 打开文件目录")
+            menu.addSeparator()
             act_sep = menu.addAction("🎵 分离人声背景声")
             act_sep.setEnabled(not has_sep)
             menu.addSeparator()
@@ -855,6 +864,8 @@ class VideoWorkbench(QWidget):
                 self._export_video_track(idx, "vocals")
             elif has_sep and chosen == act_exp_bgm:
                 self._export_video_track(idx, "bgm")
+            elif chosen == act_open_dir:
+                self._open_media_directory(v.get("path", ""))
             elif chosen == act_sep:
                 self._separate_single(idx)
             elif chosen == act_rename:
@@ -874,6 +885,18 @@ class VideoWorkbench(QWidget):
                 self._rename_audio(idx, it)
             elif chosen == act_del:
                 self._remove_media(kind, idx, it)
+
+    def _open_media_directory(self, media_path: str):
+        """打开素材所在目录；源文件丢失时仍尝试打开其父目录。"""
+        if not media_path:
+            self.status_msg.emit("素材路径为空", "warn")
+            return
+        folder = Path(media_path).expanduser().parent
+        if not folder.is_dir():
+            self.status_msg.emit(f"文件目录不存在: {folder}", "warn")
+            return
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder.resolve()))):
+            self.status_msg.emit(f"无法打开文件目录: {folder}", "error")
 
     def _export_video_track(self, idx: int, track: str):
         """右键导出单个视频的指定音轨"""
@@ -895,7 +918,7 @@ class VideoWorkbench(QWidget):
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.done_one.connect(lambda n: self.status_msg.emit(f"✓ {n}", "success"))
         self._export_worker.finished.connect(lambda: self._on_export_all_done(out_dir))
-        self._export_worker.error.connect(lambda e: self.status_msg.emit(f"导出失败: {e}", "error"))
+        self._export_worker.error.connect(self._on_export_failed)
         self.btn_batch_export.setEnabled(False)
         self.btn_batch_export.setText("📦 导出中...")
         self.progress.setValue(0)
@@ -906,9 +929,9 @@ class VideoWorkbench(QWidget):
         if not (0 <= idx < len(self._videos)): return
         if self._worker is not None and self._worker.isRunning():
             self.status_msg.emit("正在处理中，请稍候", "warn"); return
-        self._current_idx = idx
-        self._run_worker(_SepWorker(self._videos[idx]["path"]),
-            done=lambda r: self._on_sep_done(*r),
+        source = self._videos[idx]
+        self._run_worker(_SepWorker(source["path"]),
+            done=lambda r, source=source: self._on_sep_done(source, *r),
             err=lambda e: self.status_msg.emit(f"分离失败: {e}", "error"),
             btn=self.btn_batch_sep, label="分离中...")
 
@@ -952,13 +975,17 @@ class VideoWorkbench(QWidget):
             self.status_msg.emit("正在处理中，请稍候", "warn"); return
         a = self._audios[idx]
         self._run_worker(_SepWorker(a["path"]),
-            done=lambda r: self._on_audio_sep_done(idx, *r),
+            done=lambda r, source=a: self._on_audio_sep_done(source, *r),
             err=lambda e: self.status_msg.emit(f"分离失败: {e}", "error"),
             btn=self.btn_batch_sep, label="分离中...")
 
-    def _on_audio_sep_done(self, idx: int, vwav: str, bwav: str):
+    def _on_audio_sep_done(self, source, vwav: str, bwav: str):
         """音频分离完成回调"""
-        a = self._audios[idx]
+        if source not in self._audios:
+            self.status_msg.emit("分离完成，但源音频已被删除", "warn")
+            return
+        idx = self._audios.index(source)
+        a = source
         a["vocals"], a["bgm"] = self._rename_sep(a["path"], vwav, bwav)
         # 刷新音频widget的按钮状态
         self._refresh_audio_widget(idx)
@@ -988,7 +1015,8 @@ class VideoWorkbench(QWidget):
         name, ok = QInputDialog.getText(self, "重命名", "新名称：", text=a["name"])
         if ok and name.strip():
             a["name"] = name.strip()
-            it.setText(f"  ♫  {name.strip()}")
+            if idx in self._audio_widgets:
+                self._audio_widgets[idx].lbl.setText(f"♫ {name.strip()}")
 
     def _remove_media(self, kind: str, idx: int, it: QListWidgetItem):
         row = self.media_list.row(it)
@@ -1075,10 +1103,14 @@ class VideoWorkbench(QWidget):
             w.chk.setChecked(False)
 
     # ═══════════════ 分离
-    def _on_sep_done(self, vwav: str, bwav: str):
-        v = self._videos[self._current_idx]
+    def _on_sep_done(self, source, vwav: str, bwav: str):
+        if source not in self._videos:
+            self.status_msg.emit("分离完成，但源视频已被删除", "warn")
+            return
+        idx = self._videos.index(source)
+        v = source
         v["vocals"], v["bgm"] = self._rename_sep(v["path"], vwav, bwav)
-        self._refresh_item_widget(self._current_idx)
+        self._refresh_item_widget(idx)
         self.status_msg.emit("分离完成 ✓", "success")
         self._refresh_vol_visibility()
 
@@ -1086,12 +1118,13 @@ class VideoWorkbench(QWidget):
         """分离后重命名为唯一文件，避免批量覆盖"""
         from config import WORK_DIR
         stem = Path(video_path).stem
-        new_v = str(WORK_DIR / f"{stem}_vocals.wav")
-        new_b = str(WORK_DIR / f"{stem}_bgm.wav")
+        source_id = hashlib.sha1(str(Path(video_path).resolve()).encode("utf-8")).hexdigest()[:8]
+        new_v = str(WORK_DIR / f"{stem}_{source_id}_vocals.wav")
+        new_b = str(WORK_DIR / f"{stem}_{source_id}_bgm.wav")
         if Path(vwav).exists():
-            shutil.move(vwav, new_v)
+            os.replace(vwav, new_v)
         if Path(bwav).exists():
-            shutil.move(bwav, new_b)
+            os.replace(bwav, new_b)
         return new_v, new_b
 
     def _refresh_item_widget(self, idx: int):
@@ -1106,22 +1139,28 @@ class VideoWorkbench(QWidget):
             self.status_msg.emit("请先选择视频", "warn"); return
         if self._worker is not None and self._worker.isRunning():
             self.status_msg.emit("正在处理中，请稍候", "warn"); return
-        v = self._videos[self._current_idx]
+        source_idx = self._current_idx
+        v = self._videos[source_idx]
         audio = v.get("vocals") or v.get("path")
         if not v.get("vocals"):
             self.status_msg.emit("未分离，将用原视频音轨识别", "warn")
         self._run_worker(_ASRWorker(audio),
-            done=lambda entries: self._on_asr_done(entries),
+            done=lambda entries, source=v: self._on_asr_done(source, entries),
             err=lambda e: self.status_msg.emit(f"识别失败: {e}", "error"),
             btn=self.btn_asr, label="识别中...")
 
-    def _on_asr_done(self, entries):
-        v = self._videos[self._current_idx]
+    def _on_asr_done(self, source, entries):
+        if source not in self._videos:
+            self.status_msg.emit("识别完成，但源视频已被删除", "warn")
+            return
+        idx = self._videos.index(source)
+        v = source
         v["orig_subs"] = [{"start": e.start, "end": e.end, "text": e.text} for e in entries]
-        self._show_original = True
-        self._subtitles = v["orig_subs"]
-        self._refresh_sub_table()
-        self._update_subtab_style()
+        if idx == self._current_idx:
+            self._show_original = True
+            self._subtitles = v["orig_subs"]
+            self._refresh_sub_table()
+            self._update_subtab_style()
         self.status_msg.emit(f"识别完成: {len(entries)} 条字幕", "success")
 
     # ═══════════════ 翻译
@@ -1147,25 +1186,33 @@ class VideoWorkbench(QWidget):
     def _do_translate(self):
         if self._current_idx < 0:
             self.status_msg.emit("请先选择视频", "warn"); return
-        v = self._videos[self._current_idx]
+        if self._worker is not None and self._worker.isRunning():
+            self.status_msg.emit("正在处理中，请稍候", "warn"); return
+        source_idx = self._current_idx
+        v = self._videos[source_idx]
         entries = v.get("orig_subs", [])
         if not entries:
             self.status_msg.emit("请先识别语音", "warn"); return
         from core.transcriber import SRTEntry
         srt_entries = [SRTEntry(i + 1, e["start"], e["end"], e["text"]) for i, e in enumerate(entries)]
         self._run_worker(_SubTransWorker(srt_entries, self._target_lang),
-            done=lambda result: self._on_trans_done(result),
+            done=lambda result, source=v: self._on_trans_done(source, result),
             err=lambda e: self.status_msg.emit(f"翻译失败: {e}", "error"),
             btn=self._lang_btns.get(self._target_lang, self.btn_custom_lang),
             label="翻译中...")
 
-    def _on_trans_done(self, entries):
-        v = self._videos[self._current_idx]
+    def _on_trans_done(self, source, entries):
+        if source not in self._videos:
+            self.status_msg.emit("翻译完成，但源视频已被删除", "warn")
+            return
+        idx = self._videos.index(source)
+        v = source
         v["trans_subs"] = [{"start": e.start, "end": e.end, "text": e.text} for e in entries]
-        self._show_original = False
-        self._subtitles = v["trans_subs"]
-        self._refresh_sub_table()
-        self._update_subtab_style()
+        if idx == self._current_idx:
+            self._show_original = False
+            self._subtitles = v["trans_subs"]
+            self._refresh_sub_table()
+            self._update_subtab_style()
         self.status_msg.emit(f"翻译完成: {len(entries)} 条", "success")
 
     # ═══════════════ 字幕表格
@@ -1241,31 +1288,19 @@ class VideoWorkbench(QWidget):
         if 0 <= row < len(subs):
             subs[row]["text"] = text
             self._subtitles = subs
-
-    def _send_to_voice(self):
-        if self._current_idx < 0:
-            self.status_msg.emit("请先选择视频", "warn"); return
-        v = self._videos[self._current_idx]
-        subs = v.get("orig_subs" if self._show_original else "trans_subs", [])
-        if not subs:
-            self.status_msg.emit("当前没有字幕", "warn"); return
-        text = "\n".join(s["text"] for s in subs if s["text"].strip())
-        if text.strip():
-            self.text_to_voice.emit(text)
             self.status_msg.emit(f"已发送{'原文' if self._show_original else '译文'}到语音台", "success")
 
     # ═══════════════ 一键批量分离
     def _batch_separate(self):
-        checked = self._get_checked_videos()
-        if not checked:
-            checked_a = self._get_checked_audios()
-            if checked_a:
-                self.status_msg.emit("音频文件无需分离，请勾选视频", "warn")
-            else:
-                self.status_msg.emit("请先勾选视频", "warn")
+        checked_v = self._get_checked_videos()
+        checked_a = self._get_checked_audios()
+        queue = ([('video', item) for item in checked_v]
+                 + [('audio', item) for item in checked_a])
+        if not queue:
+            self.status_msg.emit("请先勾选视频或音频", "warn")
             return
-        self.status_msg.emit(f"批量分离 {len(checked)} 个视频...", "info")
-        self._sep_queue = list(checked)
+        self.status_msg.emit(f"批量分离 {len(queue)} 个素材...", "info")
+        self._sep_queue = queue
         self._sep_idx = 0
         self._run_next_sep()
 
@@ -1274,11 +1309,15 @@ class VideoWorkbench(QWidget):
             self.btn_batch_sep.setText("🎵 分离人声背景声")
             self.progress.setValue(100)
             # 刷新所有已分离项的按钮
-            for i, vd in enumerate(self._sep_queue):
-                for j, v in enumerate(self._videos):
-                    if v is vd:
-                        self._refresh_item_widget(j)
-                        break
+            for kind, source in self._sep_queue:
+                pool = self._videos if kind == "video" else self._audios
+                if source not in pool:
+                    continue
+                idx = pool.index(source)
+                if kind == "video":
+                    self._refresh_item_widget(idx)
+                else:
+                    self._refresh_audio_widget(idx)
             self.status_msg.emit(f"全部 {len(self._sep_queue)} 个分离完成 ✓", "success")
             # 2 秒后进度条归零
             from PyQt6.QtCore import QTimer
@@ -1291,23 +1330,28 @@ class VideoWorkbench(QWidget):
         # 清理上一个 batch worker
         if self._batch_worker:
             self._batch_worker.deleteLater()
-        vd = self._sep_queue[self._sep_idx]
+        kind, source = self._sep_queue[self._sep_idx]
         pct = int((self._sep_idx) / len(self._sep_queue) * 100)
         self.btn_batch_sep.setText(f"分离中 {self._sep_idx+1}/{len(self._sep_queue)} {pct}%")
         self.progress.setValue(pct)
-        self._batch_worker = _SepWorker(vd["path"])
-        self._batch_worker.finished.connect(lambda vw,bw,vd=vd: self._on_batch_sep(vd, vw, bw))
-        self._batch_worker.error.connect(lambda e,vd=vd: self._on_batch_sep_err(vd, e))
+        self._batch_worker = _SepWorker(source["path"])
+        self._batch_worker.finished.connect(
+            lambda vw, bw, k=kind, s=source: self._on_batch_sep(k, s, vw, bw))
+        self._batch_worker.error.connect(
+            lambda e, k=kind, s=source: self._on_batch_sep_err(k, s, e))
         self._batch_worker.start()
 
-    def _on_batch_sep(self, vd, vwav, bwav):
-        vd["vocals"], vd["bgm"] = self._rename_sep(vd["path"], vwav, bwav)
-        self.status_msg.emit(f"✓ {Path(vd['path']).name}", "success")
+    def _on_batch_sep(self, kind, source, vwav, bwav):
+        pool = self._videos if kind == "video" else self._audios
+        if source in pool:
+            source["vocals"], source["bgm"] = self._rename_sep(
+                source["path"], vwav, bwav)
+            self.status_msg.emit(f"✓ {Path(source['path']).name}", "success")
         self._sep_idx += 1
         self._run_next_sep()
 
-    def _on_batch_sep_err(self, vd, err):
-        self.status_msg.emit(f"✗ {Path(vd['path']).name}: {err}", "error")
+    def _on_batch_sep_err(self, kind, source, err):
+        self.status_msg.emit(f"✗ {Path(source['path']).name}: {err}", "error")
         self._sep_idx += 1
         self._run_next_sep()
 
@@ -1355,7 +1399,7 @@ class VideoWorkbench(QWidget):
         self._export_worker.progress.connect(self._on_export_progress)
         self._export_worker.done_one.connect(lambda n: self.status_msg.emit(f"✓ {n}", "success"))
         self._export_worker.finished.connect(lambda: self._on_export_all_done(out_dir))
-        self._export_worker.error.connect(lambda e: self.status_msg.emit(f"导出失败: {e}", "error"))
+        self._export_worker.error.connect(self._on_export_failed)
 
         self.btn_batch_export.setEnabled(False)
         self.btn_batch_export.setText("📦 导出中 0/0")
@@ -1381,6 +1425,16 @@ class VideoWorkbench(QWidget):
         from PyQt6.QtCore import QTimer
         QTimer.singleShot(2000, lambda: self.progress.setValue(0))
 
+    def _on_export_failed(self, error):
+        """导出失败后恢复按钮和进度，避免界面永久停在“导出中”。"""
+        self.btn_batch_export.setEnabled(True)
+        self.btn_batch_export.setText("📦 一键导出")
+        self.progress.setValue(0)
+        self.status_msg.emit(f"导出失败: {error}", "error")
+        if self._export_worker is not None:
+            self._export_worker.deleteLater()
+            self._export_worker = None
+
     def _cleanup_export_worker(self):
         """安全清理导出 worker（复用模式）"""
         if self._export_worker is not None:
@@ -1405,6 +1459,9 @@ class VideoWorkbench(QWidget):
         prefix = prefix.strip()
         for i, vd in enumerate(checked_v, 1):
             vd["rename"] = f"{prefix}{i:02d}"
+            idx = self._videos.index(vd)
+            if idx in self._item_widgets:
+                self._item_widgets[idx].lbl.setText(f"📹 {vd['rename']}")
             self.status_msg.emit(f"→ {vd['rename']}", "info")
         self.status_msg.emit(f"已命名 {len(checked_v)} 个导出文件", "success")
 
@@ -1479,7 +1536,7 @@ class VideoWorkbench(QWidget):
 
     def _reposition_subtitle(self):
         pw = self.video_widget.width(); ph = self.video_widget.height()
-        sw = min(pw - 40, 700)
+        sw = max(0, min(pw - 40, 700))
         self.subtitle_label.setFixedWidth(sw)
         self.subtitle_label.move((pw - sw) // 2, ph - 60)
         self.subtitle_label.raise_()
@@ -1698,9 +1755,6 @@ _ACT = (
     "QPushButton{background:#1e1e1e;color:#aaa;border:1px solid #333;border-radius:6px;"
     "font-size:12px;padding:7px 16px;}QPushButton:hover{color:#ccc;border-color:#3d8ef8;}"
     "QPushButton:disabled{color:#555;}")
-_ACC = (
-    "QPushButton{background:#3d8ef8;color:#fff;border:none;border-radius:6px;"
-    "font-size:12px;font-weight:bold;padding:6px 16px;}QPushButton:hover{background:#5a9ff9;}")
 _PROG = (
     "QProgressBar{background:#1a1a1a;border:none;border-radius:1px;}"
     "QProgressBar::chunk{background:#2a4a70;border-radius:1px;}")

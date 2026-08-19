@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QScrollArea,
                               QSizePolicy, QMenu, QLabel, QSlider, QPushButton,
                               QApplication)
 from PyQt6.QtCore import (Qt, QRect, QPoint, QPointF, QTimer, pyqtSignal, QSize, QUrl)
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtGui import (QPainter, QColor, QFont, QPen, QBrush, QPixmap,
                           QFontMetrics, QCursor, QKeyEvent, QMouseEvent,
                           QWheelEvent, QPainterPath, QLinearGradient)
@@ -68,6 +69,7 @@ class TimelineCanvas(QWidget):
     clip_double_clicked = pyqtSignal(object, str, int)
     ai_separate_requested  = pyqtSignal(object)
     ai_asr_requested       = pyqtSignal(object)
+    scene_detect_requested = pyqtSignal(object)
     drop_media_requested   = pyqtSignal(str, str, float, str, int, float)
     replace_video_requested = pyqtSignal(object, str)
     # 旧签名 (object, object, int) 已改为 (object, str)：clip + 可选文件路径
@@ -113,6 +115,13 @@ class TimelineCanvas(QWidget):
         self._marquee_rect = None
         self._marquee_active = False
         self._marquee_selected: list = []
+
+        # ── 朗读播放器（多选字幕直接朗读，不落轨）──
+        self._read_player = QMediaPlayer(self)
+        self._read_audio = QAudioOutput(self)
+        self._read_player.setAudioOutput(self._read_audio)
+        self._read_worker = None
+        self._read_busy = False
 
         # 拖入高亮
         self._drag_over_track: Optional[TrackDesc] = None
@@ -775,6 +784,26 @@ class TimelineCanvas(QWidget):
                     else:
                         p.setPen(QPen(fill.darker(160), 1))
                         p.drawRect(r)
+                    # 音频波形：按当前可见宽度对峰值降采样，避免长音频逐点绘制造成卡顿。
+                    peaks = getattr(clip, "waveform", None)
+                    if peaks and not _fast and r.width() > 4 and r.height() > 8:
+                        p.save()
+                        p.setClipRect(r.adjusted(2, 2, -2, -2))
+                        mid_y = r.center().y()
+                        amp_h = max(2, (r.height() - 8) // 2)
+                        draw_w = max(1, r.width() - 4)
+                        step = max(1, len(peaks) // draw_w)
+                        color = QColor("#c5a8ff") if vis else QColor(197, 168, 255, 90)
+                        p.setPen(QPen(color, 1))
+                        for x_off in range(draw_w):
+                            start = x_off * step
+                            if start >= len(peaks):
+                                break
+                            peak = max(peaks[start:min(len(peaks), start + step)])
+                            height = max(1, int(peak * amp_h))
+                            x = r.left() + 2 + x_off
+                            p.drawLine(x, mid_y - height, x, mid_y + height)
+                        p.restore()
                     # ── 淡入淡出 UI ──
                     fi = getattr(clip, "fade_in", 0) or 0
                     fo = getattr(clip, "fade_out", 0) or 0
@@ -917,6 +946,10 @@ class TimelineCanvas(QWidget):
                 # ★ 拖拽中跳过转场指示器渲染（非核心元素，省掉重绘开销）
                 if td.kind == "video" and td.idx == 0 and not _fast:
                     ot = getattr(clip, "out_transition", None)
+                    if not isinstance(ot, dict):
+                        # 外部/旧项目数据异常时，时间线仍应可绘制；数据模型会在
+                        # 新建或重新载入片段时完成正式规范化。
+                        ot = None
                     # 找紧接 clip 之后的下一个背景轨片段
                     nxt = None
                     tracks = getattr(self.tl, 'video_tracks', []) or []
@@ -1672,28 +1705,54 @@ class TimelineCanvas(QWidget):
         if clip and td:
             if td.kind == "video":
                 act_sep = menu.addAction("🎵  分离人声")
-                act_asr = menu.addAction("📝  语音识别")
+                act_scene = menu.addAction("🎬  智能分镜（自动截断）")
+                act_asr = menu.addAction("✂  AI 文字粗剪 / 语音识别")
                 menu.addSeparator()
                 act_freeze = menu.addAction("📸  定格帧 (3s)")
                 act_extract = menu.addAction("🖼  提取当前帧到图层编辑")
                 act_reverse = menu.addAction("🔄  倒放")
+            elif td.kind == "audio":
+                act_asr = menu.addAction("📝  语音识别")
             elif td.kind == "subtitle":
                 act_edit = menu.addAction("✏  编辑字幕文本")
+                act_polish = menu.addAction("✨  AI 润色")
 
-            act_kf_set = menu.addAction("🔷  在此设置关键帧")
-            act_kf_clr = menu.addAction("❌  清除所有关键帧")
-            menu.addSeparator()
-            act_del = menu.addAction("🗑  删除")
+        # ── 多选字幕直接朗读（不必打开语音台）──
+        sel_subs = [c for c, t in getattr(self, "_marquee_selected", []) if t.kind == "subtitle"]
+        if sel_subs:
+            act_read_sel = menu.addAction(f"▶  朗读选中字幕 ({len(sel_subs)})")
+        else:
+            act_read_sel = None
+        # 右键点在单条字幕上且它不在多选集合内 → 单条朗读
+        if clip and td and td.kind == "subtitle" and clip not in sel_subs:
+            act_read_one = menu.addAction("▶  朗读字幕")
+        else:
+            act_read_one = None
+
+        act_kf_set = menu.addAction("🔷  在此设置关键帧")
+        act_kf_clr = menu.addAction("❌  清除所有关键帧")
+        menu.addSeparator()
+        act_del = menu.addAction("🗑  删除")
 
         act = menu.exec(QCursor.pos())
 
         if not act:
             return
 
+        # 朗读优先判断
+        if sel_subs and act == act_read_sel:
+            self._read_aloud(sel_subs)
+            return
+        if clip and td and td.kind == "subtitle" and act == act_read_one:
+            self._read_aloud([clip])
+            return
+
         if clip and td:
             if td.kind == "video":
                 if act == act_sep:
                     self.ai_separate_requested.emit(clip)
+                elif act == act_scene:
+                    self.scene_detect_requested.emit(clip)
                 elif act == act_asr:
                     self.ai_asr_requested.emit(clip)
                 elif act == act_freeze:
@@ -1702,8 +1761,14 @@ class TimelineCanvas(QWidget):
                     self.extract_frame_requested.emit(clip, self.playhead)
                 elif act == act_reverse:
                     self.reverse_requested.emit(clip)
-            elif td.kind == "subtitle" and act == act_edit:
-                self.subtitle_edit_requested.emit(clip)
+            elif td.kind == "audio":
+                if act == act_asr:
+                    self.ai_asr_requested.emit(clip)
+            elif td.kind == "subtitle":
+                if act == act_edit:
+                    self.subtitle_edit_requested.emit(clip)
+                elif act == act_polish:
+                    self._menu_ai_polish(clip)
 
             if act == act_kf_set:
                 self._menu_add_keyframe(clip)
@@ -1728,6 +1793,182 @@ class TimelineCanvas(QWidget):
                 pt = getattr(self, 'parent_timeline', None)
                 if pt and pt._preview_player:
                     pt._preview_player.clear_video_selection()
+
+    # ─── 多选字幕直接朗读（不落轨）───
+    def _read_aloud(self, clips):
+        """把选中字幕文本直接 TTS 朗读（不生成文件、不落轨、不进素材库）。
+
+        复用配音面板当前引擎/音色/语速/音量配置。
+        """
+        if self._read_busy:
+            return
+        # 按时间排序，保证朗读顺序与画面一致
+        items = [(getattr(c, "timeline_start", 0.0),
+                  (getattr(c, "text", "") or "").strip()) for c in clips]
+        items.sort(key=lambda x: x[0])
+        texts = [t for _, t in items if t]
+        if not texts:
+            return
+        full = "\n".join(texts)
+        cfg = {}
+        if hasattr(self, "parent_timeline") and self.parent_timeline is not None:
+            try:
+                cfg = self.parent_timeline.get_dubbing_config()
+            except Exception:
+                cfg = {}
+        engine = cfg.get("engine", "edge")
+        voice = cfg.get("voice", "")
+        rate = cfg.get("rate", "+0%")
+        volume = cfg.get("volume", 1.0)
+        try:
+            from ui.workers.tts_worker import TTSGenerationWorker
+        except Exception:
+            return
+        self._read_busy = True
+        self._read_worker = TTSGenerationWorker(
+            text=full, voice=voice, rate=rate, engine_type=engine, volume=volume)
+        self._read_worker.finished.connect(self._on_read_done)
+        self._read_worker.error.connect(self._on_read_error)
+        self._read_worker.start()
+
+    def _on_read_done(self, path: str):
+        self._read_busy = False
+        if path and os.path.exists(path):
+            self._read_player.setSource(QUrl.fromLocalFile(path))
+            self._read_player.play()
+        if self._read_worker is not None:
+            self._read_worker.deleteLater()
+            self._read_worker = None
+
+    def _on_read_error(self, err: str):
+        self._read_busy = False
+        if self._read_worker is not None:
+            self._read_worker.deleteLater()
+            self._read_worker = None
+
+    # ─── 字幕 AI 润色（右键菜单） ───
+    def _ensure_polish_dialog(self):
+        """复用同一个进度对话框（不确定进度，LLM 调用中）。"""
+        dlg = getattr(self, "_polish_dlg", None)
+        if dlg is None:
+            from PyQt6.QtWidgets import QProgressDialog
+            dlg = QProgressDialog(self)
+            dlg.setWindowTitle("AI 润色")
+            dlg.setRange(0, 0)          # 不确定进度
+            dlg.setCancelButton(None)   # 调用中不可取消
+            dlg.setMinimumDuration(0)
+            dlg.setFixedSize(260, 96)
+            dlg.setWindowModality(Qt.WindowModality.NonModal)  # 不阻塞时间线
+            dlg.setStyleSheet(
+                "QProgressDialog{background:#1e1e1e;color:#ddd;border:1px solid #333;"
+                "border-radius:8px;} QLabel{color:#ddd;font-size:12px;}")
+            self._polish_dlg = dlg
+        return dlg
+
+    def _polish_progress_show(self, n: int):
+        dlg = self._ensure_polish_dialog()
+        dlg.setLabelText(f"AI 润色中…（{n} 个任务进行中）" if n > 1 else "AI 润色中…")
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _polish_progress_hide(self):
+        dlg = getattr(self, "_polish_dlg", None)
+        if dlg is not None:
+            dlg.reset()  # 隐藏并重置
+
+    def _menu_ai_polish(self, clip):
+        """对字幕块文本做 LLM 润色，结果作为新字幕块叠加在原字幕上方轨道。"""
+        text = (getattr(clip, "text", "") or "").strip()
+        if not text:
+            return
+        busy = getattr(self, "_polish_busy", None)
+        if busy is None:
+            busy = set()
+            self._polish_busy = busy
+        if clip.id in busy:
+            return  # 该字幕正在润色中，防重复
+        busy.add(clip.id)
+        self._polish_progress_show(len(busy))
+
+        from ui.dubbing_panel import _PolishThread
+        th = _PolishThread(text)
+        if not hasattr(self, "_polish_threads"):
+            self._polish_threads = []
+        self._polish_threads.append(th)
+
+        def _cleanup():
+            busy.discard(clip.id)
+            if busy:
+                self._polish_progress_show(len(busy))
+            else:
+                self._polish_progress_hide()
+            try:
+                self._polish_threads.remove(th)
+            except ValueError:
+                pass
+            th.deleteLater()
+
+        def _on_done(polished: str):
+            _cleanup()
+            self._apply_polish_result(clip, polished)
+
+        def _on_failed(err: str):
+            _cleanup()
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "AI 润色失败", str(err))
+
+        th.done.connect(_on_done)
+        th.failed.connect(_on_failed)
+        th.start()
+
+    def _apply_polish_result(self, orig, polished: str):
+        """把润色结果作为新字幕块放到原字幕正上方（时间完全重叠）。"""
+        polished = (polished or "").strip()
+        if not polished:
+            return
+        import copy as _copy
+        import uuid as _uuid
+        blk = _copy.deepcopy(orig)
+        blk.id = str(_uuid.uuid4())[:8]
+        blk.text = polished
+        blk.keyframes = {}
+        blk.word_animation = False
+        blk.word_timings = []
+        blk.from_asr = False
+        # 画布位置：在原字幕基础上上移一档，避免文字重叠遮挡
+        pos_map = {'top': -0.85, 'center': 0.0, 'bottom': 0.85}
+        base_px = orig.pos_x if getattr(orig, "pos_x", None) is not None else 0.0
+        base_py = (orig.pos_y if getattr(orig, "pos_y", None) is not None
+                   else pos_map.get(getattr(orig, "position", "bottom"), 0.85))
+        blk.pos_x = base_px
+        blk.pos_y = max(-1.0, base_py - 0.12)
+
+        tl = self.tl
+        tl._save_history()  # 撤回
+        tracks = tl.subtitle_tracks
+        orig_idx = next((i for i, t in enumerate(tracks) if orig in t), 0)
+        # 找原字幕上方（索引更小 = 视觉更靠上）第一条无时间重叠的轨道
+        chosen = -1
+        for i in range(orig_idx - 1, -1, -1):
+            conflict = any(b.timeline_start < blk.timeline_end
+                           and b.timeline_end > blk.timeline_start
+                           for b in tracks[i])
+            if not conflict:
+                chosen = i
+                break
+        if chosen >= 0:
+            tracks[chosen].append(blk)
+        else:
+            # 上方无可用轨道 → 顶部新建一条
+            from core.edit_engine import TrackInfo
+            tracks.insert(0, [blk])
+            tl.subtitle_track_info.insert(0, TrackInfo("字幕1"))
+            for i, info in enumerate(tl.subtitle_track_info):
+                if info and (not info.name or info.name.startswith("字幕")):
+                    info.name = f"字幕{i+1}"
+        tl.changed.emit()
+        self.update()
 
     def _menu_add_keyframe(self, clip):
         try:
@@ -1885,6 +2126,7 @@ class TimelineWidget(QWidget):
     clip_double_clicked = pyqtSignal(object, str, int)
     ai_separate_requested = pyqtSignal(object)
     ai_asr_requested      = pyqtSignal(object)
+    scene_detect_requested = pyqtSignal(object)
     subtitle_asr_requested = pyqtSignal(float, float)
     replace_video_requested = pyqtSignal(object, str)
     # 旧签名 (object, object, int) 已改为 (object, str)：clip + 可选文件路径
@@ -1894,13 +2136,17 @@ class TimelineWidget(QWidget):
     clip_trimmed           = pyqtSignal(object)
     drop_media_requested   = pyqtSignal(str, str, float, str, int, float)
     new_timeline_requested = pyqtSignal()
+    scene_detect_selected_requested = pyqtSignal()
+    text_rough_cut_requested = pyqtSignal()
     subtitle_edit_requested = pyqtSignal(object)  # 右键编辑字幕 → 内联编辑
     seam_double_clicked    = pyqtSignal(object, object)  # 背景轨相邻片段接缝双击 → (A_clip, B_clip)
     thumbs_regen_requested = pyqtSignal()   # 缩放导致缩略图张数变化，请求重新生成
 
-    def __init__(self, timeline: EditTimeline, parent=None):
+    def __init__(self, timeline: EditTimeline, parent=None,
+                 dubbing_config_provider=None):
         super().__init__(parent)
         self.tl = timeline
+        self.dubbing_config_provider = dubbing_config_provider
         self._play_timer = QTimer(self)
         self._play_timer.setInterval(33)
         self._play_timer.timeout.connect(self._tick_play)
@@ -1923,6 +2169,21 @@ class TimelineWidget(QWidget):
         self._thumb_regen_timer.timeout.connect(self.thumbs_regen_requested.emit)
         self._build_ui()
         self.tl.changed.connect(self._on_timeline_changed)
+
+    def get_dubbing_config(self) -> dict:
+        """取当前配音配置（引擎/音色/语速/音量），供轨道朗读复用。
+
+        优先用 editor_tab 注入的 provider（即配音面板当前配置），
+        否则回退到 edge 默认。
+        """
+        if callable(self.dubbing_config_provider):
+            try:
+                cfg = self.dubbing_config_provider()
+                if isinstance(cfg, dict):
+                    return cfg
+            except Exception:
+                pass
+        return {"engine": "edge", "voice": "", "rate": "+0%", "volume": 1.0}
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -2003,9 +2264,29 @@ class TimelineWidget(QWidget):
         btn_new_tl.setToolTip("新建一条空白时间线")
         btn_new_tl.clicked.connect(self.new_timeline_requested.emit)
 
+        btn_scene_detect = QPushButton("🎬 智能分镜")
+        btn_scene_detect.setStyleSheet(
+            "QPushButton{background:#1e2d32;color:#83c9d8;border:1px solid #315963;"
+            "border-radius:3px;padding:3px 10px;font-size:12px;}"
+            "QPushButton:hover{background:#274149;color:#a8e8f2;border-color:#4c8190;}"
+            "QPushButton:pressed{background:#182529;}")
+        btn_scene_detect.setToolTip("检测画面跳变并自动截开选中的视频片段")
+        btn_scene_detect.clicked.connect(self.scene_detect_selected_requested.emit)
+
+        btn_text_cut = QPushButton("✂ 文字粗剪")
+        btn_text_cut.setStyleSheet(
+            "QPushButton{background:#30251d;color:#e6a66f;border:1px solid #704523;"
+            "border-radius:3px;padding:3px 10px;font-size:12px;}"
+            "QPushButton:hover{background:#493121;color:#ffc28e;border-color:#a86731;}"
+            "QPushButton:pressed{background:#251d17;}")
+        btn_text_cut.setToolTip("选中视频，通过语音文字勾选需要保留的内容")
+        btn_text_cut.clicked.connect(self.text_rough_cut_requested.emit)
+
         for w in [self._btn_play, btn_split, btn_del, btn_sub]:
             tb_lay.addWidget(w)
         tb_lay.addWidget(btn_new_tl)
+        tb_lay.addWidget(btn_scene_detect)
+        tb_lay.addWidget(btn_text_cut)
         tb_lay.addStretch()
         tb_lay.addWidget(self._btn_align)
         tb_lay.addSpacing(8)
@@ -2032,6 +2313,8 @@ class TimelineWidget(QWidget):
             lambda c: self.ai_separate_requested.emit(c))
         self._canvas.ai_asr_requested.connect(
             lambda c: self.ai_asr_requested.emit(c))
+        self._canvas.scene_detect_requested.connect(
+            lambda c: self.scene_detect_requested.emit(c))
         self._canvas.replace_video_requested.connect(
             lambda c, p: self.replace_video_requested.emit(c, p))
         self._canvas.freeze_requested.connect(

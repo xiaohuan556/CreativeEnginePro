@@ -1,0 +1,9 @@
+{
+  "version": "1.1.0",
+  "handler": "ai.production_skills:build_repair_plan",
+  "inputs": {"type": "object", "required": ["shots", "media_evidence"]},
+  "outputs": {"type": "object", "required": ["items", "ready"]},
+  "requires": {"capabilities": ["vision"], "artifacts": ["rendered_media"]},
+  "depends_on": ["shot-readiness"],
+  "migrations": [{"from": "1.0.0", "to": "1.1.0", "policy": "additive"}]
+}

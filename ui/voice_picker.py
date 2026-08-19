@@ -7,6 +7,8 @@ import threading
 import tempfile
 import time
 import os
+import json as _json
+import hashlib as _hashlib
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -14,6 +16,111 @@ from PyQt6.QtWidgets import (
     QScrollArea, QGridLayout, QWidget, QSizePolicy, QProgressBar,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QThread
+
+# ── 声音列表磁盘缓存（避免每次打开弹窗都重新联网拉取）──
+_VOICE_CACHE_DIR = Path(__file__).parent.parent / "Cache" / "voices"
+
+
+def _key_salt_for(engine: str) -> str:
+    """API 引擎的缓存需按账户 Key 区分。"""
+    if engine == "elevenlabs":
+        try:
+            from config import ELEVENLABS_API_KEY
+            return ELEVENLABS_API_KEY or ""
+        except Exception:
+            return ""
+    if engine == "fish_audio":
+        return os.getenv("FISH_AUDIO_KEY", "") or os.getenv("BAIDU_TTS_KEY", "")
+    return ""
+
+
+def _cache_path(engine: str, salt: str) -> Path:
+    _VOICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    h = _hashlib.md5((engine + "|" + salt).encode("utf-8")).hexdigest()[:12]
+    return _VOICE_CACHE_DIR / f"{engine}_{h}.json"
+
+
+def _cache_save(engine: str, voices: list, salt: str = ""):
+    try:
+        _VOICE_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        _cache_path(engine, salt).write_text(
+            _json.dumps({"engine": engine, "voices": voices}, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _cache_load(engine: str, salt: str = "") -> list:
+    try:
+        p = _cache_path(engine, salt)
+        if p.exists():
+            d = _json.loads(p.read_text(encoding="utf-8"))
+            if d.get("engine") == engine and d.get("voices"):
+                return d["voices"]
+    except Exception:
+        pass
+    return None
+
+
+_PRELOAD_WORKERS = []
+
+
+def preload_voices(engine: str):
+    """后台预加载并缓存某引擎声音（不弹窗），用于切引擎时预热。"""
+    if engine not in ("elevenlabs", "fish_audio"):
+        return
+    w = _VoiceLoaderWorker(engine)
+    w.finished_data.connect(lambda v, c, e: _cache_save(e, v, _key_salt_for(e)))
+    w.error_msg.connect(lambda e: None)
+    _PRELOAD_WORKERS.append(w)
+    w.start()
+
+
+def _derive_categories(engine: str, voices: list):
+    """根据引擎与声音列表推导分类（纯本地计算，无网络）。"""
+    if engine == "elevenlabs":
+        langs = {}
+        for v in voices:
+            l = (v.get("labels", {}).get("language", "") or
+                 v.get("labels", {}).get("locale", "") or "other")
+            langs.setdefault(l, []).append(v)
+        cats = []
+        el_zh = {"en": "英语", "zh": "中文", "ja": "日语", "ko": "韩语"}
+        for code, zh in el_zh.items():
+            if code in langs:
+                cats.append((f"{zh}({len(langs[code])})",
+                             lambda v, c=code: v.get("labels", {}).get("language", "") == c))
+        cats.append((f"全部({len(voices)})", lambda v: True))
+        return cats
+    if engine == "fish_audio":
+        langs = {}
+        for v in voices:
+            ls = v.get("labels", {}).get("language", "other")
+            for l in (ls if isinstance(ls, list) else [ls]):
+                langs.setdefault(l, []).append(v)
+        cats = []
+        for l, zh_name in [("zh", "中文"), ("en", "英语"), ("ja", "日语"),
+                           ("ko", "韩语"), ("es", "西语"), ("ar", "阿语")]:
+            if l in langs:
+                def _mkfn(ll):
+                    return lambda v: ll in (
+                        v.get("labels", {}).get("language", [])
+                        if isinstance(v.get("labels", {}).get("language", ""), list)
+                        else [v.get("labels", {}).get("language", "other")])
+                cats.append((f"{zh_name}({len(langs[l])})", _mkfn(l)))
+        others = []
+        for l in langs:
+            if l not in ("zh", "en", "ja", "ko", "es", "ar"):
+                others.extend(langs[l])
+        if others:
+            cats.append((f"其他({len(others)})", lambda v: v in others))
+        cats.append((f"全部({len(voices)})", lambda v: True))
+        return cats
+    if engine == "siliconflow":
+        return [(f"全部({len(voices)})", lambda v: True)]
+    if engine == "deepgram":
+        return [(f"全部({len(voices)})", lambda v: True)]
+    return EDGE_CATS
 
 # ── ElevenLabs voice fetch ──
 def _fetch_eleven_voices(api_key: str) -> list:
@@ -303,7 +410,7 @@ class VoicePickerPopup(QFrame):
         self._build()
         self._preview_done.connect(self._on_preview_done)
         self._refresh_cards.connect(self._on_translate_done)
-        self._start_load()
+        self._try_load_cached_or_fetch()
 
     def closeEvent(self, ev):
         """关闭弹窗时取消试听线程，防止信号发送到已销毁的 widget"""
@@ -360,7 +467,16 @@ class VoicePickerPopup(QFrame):
     def _lbl(self, text, color):
         l = QLabel(text); l.setStyleSheet(f"color:{color};font-size:12px;"); return l
 
-    def _start_load(self):
+    def _try_load_cached_or_fetch(self):
+        """优先用磁盘缓存秒开；命中缓存后后台静默刷新。"""
+        cached = _cache_load(self._engine, _key_salt_for(self._engine))
+        if cached:
+            self._render_voices(cached, self._engine)
+            self._start_load(refresh=True)
+        else:
+            self._start_load(refresh=False)
+
+    def _start_load(self, refresh=False):
         # 清理旧 loader
         if self._loader is not None:
             old = self._loader
@@ -370,6 +486,9 @@ class VoicePickerPopup(QFrame):
                 old.finished.connect(old.deleteLater)
             else:
                 old.deleteLater()
+        if refresh:
+            self.lbl_status.setText("更新中…")
+            self.progress.setRange(0, 0)
         self._loader = _VoiceLoaderWorker(self._engine)
         self._loader.finished_data.connect(self._on_loaded)
         self._loader.error_msg.connect(lambda e: (self.lbl_status.setText(f"加载失败: {e[:40]}"), self.progress.setRange(0,100), self.progress.setValue(100)))
@@ -380,9 +499,18 @@ class VoicePickerPopup(QFrame):
         if self._loader:
             self._loader.deleteLater()
             self._loader = None
-        self._voices = voices; self._categories = categories; self._engine = engine
+        self._render_voices(voices, engine, categories)
+        # 写回缓存，下次打开秒显
+        _cache_save(engine, voices, _key_salt_for(engine))
+
+    def _render_voices(self, voices, engine, categories=None):
+        self._voices = voices; self._engine = engine
+        if categories is None:
+            categories = _derive_categories(engine, voices)
+        self._categories = categories
         self.progress.setRange(0,100); self.progress.setValue(100)
-        eng_name = {"elevenlabs":"ElevenLabs","edge":"Edge-TTS"}.get(engine, engine)
+        eng_name = {"elevenlabs":"ElevenLabs","edge":"Edge-TTS","fish_audio":"Fish Audio",
+                    "siliconflow":"硅基流动","deepgram":"Deepgram"}.get(engine, engine)
         self.lbl_status.setText(f"✓ {eng_name} · {len(voices)}个声音")
 
         # 重建分类按钮
@@ -425,6 +553,8 @@ class VoicePickerPopup(QFrame):
         self.lbl_status.setText("✓ Fish Audio · 已翻译")
         self._add_fav_category()
         self._show_category(self._current_cat)
+        # 翻译后的名字写回缓存，下次秒显（无需再联网翻译）
+        _cache_save(self._engine, self._voices, _key_salt_for(self._engine))
 
     def _load_favorites(self) -> set:
         """加载当前引擎的收藏列表"""
@@ -739,49 +869,23 @@ class _VoiceLoaderWorker(QThread):
                 if not ELEVENLABS_API_KEY:
                     self.error_msg.emit("未设置 ElevenLabs Key"); return
                 voices = _fetch_eleven_voices(ELEVENLABS_API_KEY)
-                langs = {}
-                for v in voices:
-                    l = v.get("labels",{}).get("language","") or v.get("labels",{}).get("locale","") or "other"
-                    langs.setdefault(l, []).append(v)
-                cats = []
-                el_zh = {"en":"英语","zh":"中文","ja":"日语","ko":"韩语"}
-                for code, zh in el_zh.items():
-                    if code in langs:
-                        cats.append((f"{zh}({len(langs[code])})", lambda v,c=code: v.get("labels",{}).get("language","")==c))
-                cats.append((f"全部({len(voices)})", lambda v: True))
+                cats = _derive_categories("elevenlabs", voices)
+                _cache_save("elevenlabs", voices, _key_salt_for("elevenlabs"))
                 self.finished_data.emit(voices, cats, "elevenlabs")
             elif self._engine == "fish_audio":
                 voices = _fetch_fish_voices()
-                langs = {}
-                for v in voices:
-                    ls = v.get("labels", {}).get("language", "other")
-                    for l in (ls if isinstance(ls, list) else [ls]):
-                        langs.setdefault(l, []).append(v)
-                cats = []
-                for l, zh_name in [("zh","中文"),("en","英语"),("ja","日语"),("ko","韩语"),("es","西语"),("ar","阿语")]:
-                    if l in langs:
-                        def _mkfn(ll):
-                            return lambda v: ll in (v.get("labels",{}).get("language",[]) if isinstance(v.get("labels",{}).get("language",""), list) else [v.get("labels",{}).get("language","other")])
-                        cats.append((f"{zh_name}({len(langs[l])})", _mkfn(l)))
-                # 其他语言统一放"其他"
-                others = []
-                for l in langs:
-                    if l not in ("zh","en","ja","ko","es","ar"):
-                        others.extend(langs[l])
-                if others:
-                    cats.append((f"其他({len(others)})", lambda v: v in others))
-                cats.append((f"全部({len(voices)})", lambda v: True))
+                cats = _derive_categories("fish_audio", voices)
+                _cache_save("fish_audio", voices, _key_salt_for("fish_audio"))
                 self.finished_data.emit(voices, cats, "fish_audio")
             elif self._engine == "siliconflow":
-                cats = [(f"全部({len(SF_VOICES)})", lambda v: True)]
-                self.finished_data.emit(SF_VOICES, cats, "siliconflow")
+                self.finished_data.emit(SF_VOICES, _derive_categories("siliconflow", SF_VOICES), "siliconflow")
             elif self._engine == "deepgram":
-                cats = [(f"全部({len(DG_VOICES)})", lambda v: True)]
-                self.finished_data.emit(DG_VOICES, cats, "deepgram")
+                self.finished_data.emit(DG_VOICES, _derive_categories("deepgram", DG_VOICES), "deepgram")
             else:
                 import asyncio, edge_tts
                 voices = asyncio.run(edge_tts.list_voices())
-                self.finished_data.emit(voices, EDGE_CATS, "edge")
+                _cache_save("edge", voices)
+                self.finished_data.emit(voices, _derive_categories("edge", voices), "edge")
         except Exception as e:
             import traceback
             self.error_msg.emit(f"{e}\n{traceback.format_exc()}")

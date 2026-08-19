@@ -13,3 +13,13 @@ nul
 *.zip
 *.7z
 .env
+
+# Local canvas/media state and development diagnostics
+.tmpframes/
+MediaLibrary/
+*.mp4
+.orig_*
+_diag.py
+_flaky.py
+_probe*.py
+ss_image_meta.json

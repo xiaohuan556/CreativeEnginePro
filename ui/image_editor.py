@@ -12,6 +12,7 @@ import math
 import time
 import pickle
 from enum import IntEnum
+from pathlib import Path
 
 import numpy as np
 from PyQt6.QtWidgets import (
@@ -21,7 +22,7 @@ from PyQt6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QApplication,
     QSizePolicy, QFrame, QAbstractItemView, QMessageBox, QPlainTextEdit,
     QSplitter, QMenu, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabBar, QInputDialog, QStyle,
+    QTabBar, QInputDialog, QStyle, QDialogButtonBox,
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QFont, QPen, QBrush, QTransform,
@@ -58,6 +59,205 @@ class Tool(IntEnum):
     GRADIENT = 14        # 渐变工具（拖拽生成线性/径向渐变填充层）
     CLONE = 15           # 克隆图章（Alt 取源点，拖拽复制纹理）
     HEAL = 16            # 修复画笔（克隆 + 目标亮度/纹理混合）
+
+
+class AIInpaintPromptDialog(QDialog):
+    """图片选区右键使用的轻量 Prompt 输入弹窗。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("AI 局部修改")
+        self.setModal(True)
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(290)
+        self.setStyleSheet("""
+            QDialog { background:#181a1f; color:#eef2f8; }
+            QLabel#aiTitle { color:#ffffff; font-size:18px; font-weight:700; }
+            QLabel#aiHint { color:#929baa; font-size:12px; }
+            QLabel#aiTip {
+                background:#282318; color:#e8c982; border:1px solid #4a3d22;
+                border-radius:7px; padding:8px 10px; font-size:11px;
+            }
+            QLabel#aiCount { color:#697384; font-size:11px; }
+            QPlainTextEdit {
+                background:#111318; color:#f2f5fa; border:1px solid #343a45;
+                border-radius:9px; padding:11px; font-size:13px;
+                selection-background-color:#397fda;
+            }
+            QPlainTextEdit:focus { border:1px solid #4b97ff; }
+            QPushButton {
+                min-height:34px; border-radius:7px; padding:0 18px;
+                font-size:12px; font-weight:600;
+            }
+            QPushButton#cancelButton {
+                background:#242830; color:#aeb6c2; border:1px solid #363c47;
+            }
+            QPushButton#cancelButton:hover { background:#2c313b; color:#ffffff; }
+            QPushButton#polishButton {
+                background:#222b3a; color:#7db5ff; border:1px solid #334f73;
+                min-height:28px; padding:0 12px; font-size:11px;
+            }
+            QPushButton#polishButton:hover {
+                background:#293a52; color:#a9d0ff; border-color:#4b78ad;
+            }
+            QPushButton#generateButton {
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #2878e8, stop:1 #4899ff);
+                color:#ffffff; border:1px solid #5ba5ff;
+            }
+            QPushButton#generateButton:hover {
+                background:#56a4ff; border-color:#7bb9ff;
+            }
+            QPushButton#generateButton:disabled {
+                background:#273246; color:#647087; border-color:#303b4d;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(22, 20, 22, 18)
+        root.setSpacing(9)
+
+        title = QLabel("✨  AI 局部修改")
+        title.setObjectName("aiTitle")
+        root.addWidget(title)
+        hint = QLabel("描述框选区域要变成什么，选区外的画面将保持不变")
+        hint.setObjectName("aiHint")
+        root.addWidget(hint)
+
+        tip = QLabel("💡 温馨提示：框选时请尽量覆盖完整的待修改对象，并在周围留少量空间，生成效果会更自然。")
+        tip.setObjectName("aiTip")
+        tip.setWordWrap(True)
+        root.addWidget(tip)
+
+        self.editor = QPlainTextEdit()
+        self.editor.setPlaceholderText(
+            "例如：把选区内的帽子改成红色针织帽，保持人物姿态和光照不变")
+        self.editor.setMinimumHeight(125)
+        root.addWidget(self.editor, 1)
+
+        meta_row = QHBoxLayout()
+        meta_row.setContentsMargins(0, 0, 0, 0)
+        self.polish_button = QPushButton("✨ AI 润色")
+        self.polish_button.setObjectName("polishButton")
+        self.polish_button.setEnabled(False)
+        self.polish_button.clicked.connect(self._polish_prompt)
+        meta_row.addWidget(self.polish_button)
+        meta_row.addStretch(1)
+        self.count_label = QLabel("0 / 500")
+        self.count_label.setObjectName("aiCount")
+        self.count_label.setAlignment(Qt.AlignmentFlag.AlignRight)
+        meta_row.addWidget(self.count_label)
+        root.addLayout(meta_row)
+
+        buttons = QDialogButtonBox()
+        cancel = buttons.addButton("取消", QDialogButtonBox.ButtonRole.RejectRole)
+        self.generate = buttons.addButton(
+            "开始修改", QDialogButtonBox.ButtonRole.AcceptRole)
+        cancel.setObjectName("cancelButton")
+        self.generate.setObjectName("generateButton")
+        self.generate.setEnabled(False)
+        buttons.rejected.connect(self.reject)
+        buttons.accepted.connect(self.accept)
+        root.addWidget(buttons)
+
+        self.editor.textChanged.connect(self._on_text_changed)
+        self._polish_handle = None
+        self._polish_timer = QTimer(self)
+        self._polish_timer.setInterval(150)
+        self._polish_timer.timeout.connect(self._poll_polish)
+        QTimer.singleShot(0, self.editor.setFocus)
+
+    def _on_text_changed(self):
+        text = self.editor.toPlainText()
+        if len(text) > 500:
+            cursor = self.editor.textCursor()
+            pos = min(cursor.position(), 500)
+            self.editor.setPlainText(text[:500])
+            cursor = self.editor.textCursor()
+            cursor.setPosition(pos)
+            self.editor.setTextCursor(cursor)
+            text = text[:500]
+        self.count_label.setText(f"{len(text)} / 500")
+        busy = self._polish_handle is not None and not self._polish_handle.is_finished
+        self.generate.setEnabled(bool(text.strip()) and not busy)
+        self.polish_button.setEnabled(bool(text.strip()) and not busy)
+
+    def _polish_prompt(self):
+        source = self.editor.toPlainText().strip()
+        if not source:
+            return
+        try:
+            from ai import TaskRequest, ProviderDomain
+            from ai.service import get_ai_manager
+
+            manager = get_ai_manager()
+            providers = manager.registry.by_domain(ProviderDomain.LLM)
+            provider = next((item for item in providers if item.name == "openai"),
+                            providers[0] if providers else None)
+            if provider is None:
+                QMessageBox.information(
+                    self, "AI 润色",
+                    "未检测到文本模型。请在 .env 配置 LLM_API_KEY 或 OPENAI_API_KEY 后重启。")
+                return
+            messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        "你是专业的 AI 图片局部重绘提示词优化助手。"
+                        "在不改变用户意图的前提下，把输入改写成清晰、具体、可执行的中文提示词。"
+                        "说明对象、材质、颜色、细节、光照和融合要求；强调保持原图构图、"
+                        "主体位置、比例、透视及选区外内容不变。只输出润色后的提示词，"
+                        "不要解释、不要标题、不要引号，控制在 300 字以内。"
+                    ),
+                },
+                {"role": "user", "content": source},
+            ]
+            params = {}
+            try:
+                from config import LLM_MODEL_NAME
+                if LLM_MODEL_NAME:
+                    params["model"] = LLM_MODEL_NAME
+            except Exception:
+                pass
+            request = TaskRequest(operation="chat", inputs={"messages": messages},
+                                  params=params)
+            self._polish_handle = manager.submit(provider.name, request)
+            self.polish_button.setText("润色中…")
+            self.polish_button.setEnabled(False)
+            self.generate.setEnabled(False)
+            self._polish_timer.start()
+        except Exception as exc:
+            self._finish_polish_error(str(exc))
+
+    def _poll_polish(self):
+        handle = self._polish_handle
+        if handle is None or not handle.is_finished:
+            return
+        self._polish_timer.stop()
+        if handle.is_success and handle.result:
+            polished = str(handle.result.data or "").strip().strip('"').strip("'")
+            if polished:
+                self.editor.setPlainText(polished[:500])
+                cursor = self.editor.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                self.editor.setTextCursor(cursor)
+        else:
+            error = handle.result.error if handle.result else "未知错误"
+            QMessageBox.warning(self, "AI 润色失败", str(error))
+        self._polish_handle = None
+        self.polish_button.setText("✨ AI 润色")
+        self._on_text_changed()
+        self.editor.setFocus()
+
+    def _finish_polish_error(self, error):
+        self._polish_timer.stop()
+        self._polish_handle = None
+        self.polish_button.setText("✨ AI 润色")
+        self._on_text_changed()
+        QMessageBox.warning(self, "AI 润色失败", error)
+
+    def prompt(self) -> str:
+        return self.editor.toPlainText().strip()
 
 
 # ───────────────────────────── 数据模型 ─────────────────────────────
@@ -278,6 +478,8 @@ class CanvasView(QGraphicsView):
         self.artboard_item.setZValue(5)
         self.scene.addItem(self.artboard_item)
         self.setAcceptDrops(True)
+        # QGraphicsView 的实际接收面是 viewport；部分平台不会把 view 的设置自动下传。
+        self.viewport().setAcceptDrops(True)
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         # 文字编辑态下需要由本控件直接接收中文输入法事件（IME），
@@ -502,9 +704,11 @@ class CanvasView(QGraphicsView):
         if getattr(self.editor, "show_rulers", False):
             px, py = e.position().x(), e.position().y()
             if py < self.RULER_W and px >= self.RULER_W:
+                self._guide_pre_snap = self.editor._snapshot()
                 self._guide_drag = "h"
                 return
             if px < self.RULER_W and py >= self.RULER_W:
+                self._guide_pre_snap = self.editor._snapshot()
                 self._guide_drag = "v"
                 return
         self._dragging = True
@@ -514,6 +718,11 @@ class CanvasView(QGraphicsView):
             gi = self.editor._hit_guide(
                 self._start, tol=6.0 / max(0.2, self.transform().m11()))
             if gi is not None:
+                self._guide_pre_snap = self.editor._snapshot()
+                kind, idx = gi
+                values = (self.editor.project.h_guides if kind == "h"
+                          else self.editor.project.v_guides)
+                self._guide_move_orig = values[idx] if 0 <= idx < len(values) else None
                 self._guide_move = gi
                 return
         # 文字编辑态：点击非文字层空白区域 → 提交并退出编辑框
@@ -535,7 +744,7 @@ class CanvasView(QGraphicsView):
             handle = self.editor._hit_handle(self._start)
             if handle is not None:
                 self._handle_drag = handle
-                self._handle_pre_snap = self._snapshot()   # pre-state：变换前的状态
+                self._handle_pre_snap = self.editor._snapshot()   # pre-state：变换前的状态
                 self._handle_orig = {
                     "x": self.editor.active.x, "y": self.editor.active.y,
                     "scale": self.editor.active.scale,
@@ -815,7 +1024,9 @@ class CanvasView(QGraphicsView):
                     self.editor.project.h_guides.append(sp.y())
                 else:
                     self.editor.project.v_guides.append(sp.x())
+                self.editor._push_undo_snapshot("添加参考线", self._guide_pre_snap)
                 self.editor._draw_guides_and_grid()
+            self._guide_pre_snap = None
             self.viewport().update()
             return
         # P5 拖动已有参考线结束：拖回标尺区域 → 删除该线
@@ -828,6 +1039,13 @@ class CanvasView(QGraphicsView):
                 lst = self.editor.project.h_guides if kind == 'h' else self.editor.project.v_guides
                 if 0 <= idx < len(lst):
                     lst.pop(idx)
+            values = (self.editor.project.h_guides if kind == "h"
+                      else self.editor.project.v_guides)
+            current = values[idx] if 0 <= idx < len(values) else None
+            if current != getattr(self, "_guide_move_orig", None):
+                self.editor._push_undo_snapshot("移动/删除参考线", self._guide_pre_snap)
+            self._guide_pre_snap = None
+            self._guide_move_orig = None
             self.editor._draw_guides_and_grid()
             self.viewport().update()
             return
@@ -916,11 +1134,29 @@ class CanvasView(QGraphicsView):
         super().mouseDoubleClickEvent(e)
 
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        if self._has_supported_drop_image(e.mimeData()):
             e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    def dragMoveEvent(self, e):
+        # 持续接受移动事件，避免 QGraphicsScene/父窗口在拖动途中抢走 drop。
+        if self._has_supported_drop_image(e.mimeData()):
+            e.acceptProposedAction()
+        else:
+            e.ignore()
+
+    @staticmethod
+    def _has_supported_drop_image(mime) -> bool:
+        if not mime.hasUrls():
+            return False
+        supported = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif", ".gif"}
+        return any(u.isLocalFile() and os.path.splitext(u.toLocalFile())[1].lower() in supported
+                   for u in mime.urls())
 
     def dropEvent(self, e):
         # 仅处理单张图片拖入 → 自动匹配画布尺寸
+        imported = False
         for u in e.mimeData().urls():
             p = u.toLocalFile()
             if not p:
@@ -929,7 +1165,11 @@ class CanvasView(QGraphicsView):
             if ext not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif", ".gif"}:
                 continue
             self.editor._drop_import_image(p)
+            imported = True
+        if imported:
             e.acceptProposedAction()
+        else:
+            e.ignore()
 
     def keyPressEvent(self, e):
         self.editor.keyPressEvent(e)
@@ -1099,6 +1339,7 @@ class LayerItemWidget(QWidget):
         lay.addWidget(self.name, 1)
 
     def _toggle_eye(self):
+        self.editor._push_undo("切换图层可见性")
         self.layer.visible = not self.layer.visible
         self.eye.setIcon(_draw_eye_icon(self.layer.visible))
         self.editor._redraw()
@@ -2123,6 +2364,12 @@ class ImageEditorWidget(QWidget):
         self._history = []           # [{"name": str, "snapshot": dict}]
         self._history_idx = -1       # 当前所在历史位置（-1 = 无历史）
         self.max_undo = 30
+        self._pending_property_history = None
+        self._committing_property_history = False
+        self._property_history_timer = QTimer(self)
+        self._property_history_timer.setSingleShot(True)
+        self._property_history_timer.setInterval(280)
+        self._property_history_timer.timeout.connect(self._commit_property_history)
         # 空格抓手（PS 风格）：按住空格临时切为平移画布模式
         self._space_held = False
         self._space_prev_tool = Tool.MOVE
@@ -2145,7 +2392,6 @@ class ImageEditorWidget(QWidget):
         # 选区蚂蚁线动画（marching ants）
         self._sel_phase = 0
         self._sel_preview_base = None   # 拖拽多选时冻结的已提交选区底图（避免回读 sel_item 累积残影）
-        from PyQt6.QtCore import QTimer
         self._sel_timer = QTimer(self)
         self._sel_timer.setInterval(150)
         self._sel_timer.timeout.connect(self._tick_sel_anim)
@@ -2182,11 +2428,12 @@ class ImageEditorWidget(QWidget):
         self._rembg_ensured = None   # True/False 缓存 _ensure_rembg 结果，避免重复弹窗
         # AI 增强（超分 / 人脸修复）异步任务状态
         self._ai_enh_busy = False
-        # 前后对比（高清放大后对比原图）：before=放大前像素，layer=被放大的层，active=是否显示原图
-        self._compare_before = None
-        self._compare_layer = None
+        # 通用 AI 前后对比：保存 AI 操作前的整张画布快照，支持所有 AI 修改。
+        self._compare_before_image = None
+        self._compare_pending_image = None
+        self._compare_pending_label = ""
+        self._compare_label = "AI 处理"
         self._compare_active = False
-        self._compare_is_real_ai = False
         self._compare_btn = None
         # 高清放大超分模型偏好：auto（按内容自动）/ general（写实通用）/ anime（插画锐利）
         self._upscale_model_pref = "auto"
@@ -2230,6 +2477,7 @@ class ImageEditorWidget(QWidget):
 
         # ────── 主体：左侧工具栏 | 画布 | 右侧（属性上 / 图层下）──────
         main_split = QSplitter(Qt.Orientation.Horizontal)
+        self.main_split = main_split
         main_split.setStyleSheet("QSplitter::handle{background:#2a2a2a;width:3px;}")
         main_split.setOpaqueResize(True)
         main_split.setChildrenCollapsible(False)
@@ -2272,6 +2520,10 @@ class ImageEditorWidget(QWidget):
 
         right_split.setSizes([380, 260])
         main_split.addWidget(right_split)
+        self._right_split = right_split
+
+        # AI 生图已统一迁移到 AI 制片画布；图片工作台只保留像素级编辑。
+        self._ai_image_panel = None
         main_split.setSizes([44, 720, 260])
         outer.addWidget(main_split, 1)
 
@@ -2300,7 +2552,6 @@ class ImageEditorWidget(QWidget):
     def _sep_v(self):
         f = QFrame(); f.setFrameShape(QFrame.Shape.VLine); f.setStyleSheet("color:#383838;"); f.setFixedWidth(1)
         return f
-
 
     # ═══════ 布局组件（PS 风格：左工具栏 / 右上属性 / 右下图层）═══════
     def _build_top_menu_bar(self):
@@ -2530,12 +2781,12 @@ class ImageEditorWidget(QWidget):
         ai_btn.setMenu(ai_menu)
         l.addWidget(ai_btn)
 
-        # 前后对比按钮（高清放大后可用，点击切换 原图 / AI 结果）
+        # 通用 AI 前后对比按钮
         self._compare_btn = QPushButton("◑ 前后对比")
         self._compare_btn.setStyleSheet(self._mini_btn())
-        self._compare_btn.setToolTip("高清放大后对比原图：点击在「原图 ↔ AI 结果」间切换")
+        self._compare_btn.setToolTip("完成 AI 修改后，点击切换查看「处理前 ↔ 当前结果」")
         self._compare_btn.setCheckable(True)
-        self._compare_btn.setEnabled(True)
+        self._compare_btn.setEnabled(False)
         self._compare_btn.toggled.connect(self._on_compare_toggle)
         l.addWidget(self._compare_btn)
 
@@ -2770,6 +3021,8 @@ class ImageEditorWidget(QWidget):
         rl.addLayout(align_row)
         rl.addWidget(QLabel("不透明度"))
         self.op_slider = QSlider(Qt.Orientation.Horizontal); self.op_slider.setRange(0, 100); self.op_slider.setValue(100)
+        self.op_slider.sliderPressed.connect(self._begin_opacity_change)
+        self.op_slider.sliderReleased.connect(self._end_opacity_change)
         self.op_slider.valueChanged.connect(self._set_active_opacity)
         rl.addWidget(self.op_slider)
 
@@ -2804,6 +3057,8 @@ class ImageEditorWidget(QWidget):
         oprow.addWidget(op_lbl)
         self.layer_op_slider = QSlider(Qt.Orientation.Horizontal)
         self.layer_op_slider.setRange(0, 100); self.layer_op_slider.setValue(100)
+        self.layer_op_slider.sliderPressed.connect(self._begin_opacity_change)
+        self.layer_op_slider.sliderReleased.connect(self._end_opacity_change)
         self.layer_op_slider.valueChanged.connect(self._set_active_opacity)
         oprow.addWidget(self.layer_op_slider, 1)
         self.layer_op_label = QLabel("100%")
@@ -2977,6 +3232,10 @@ class ImageEditorWidget(QWidget):
                 host.tab.setTabText(idx, self.doc_name)
 
     def new_project(self, w=1080, h=1080):
+        self._property_history_timer.stop()
+        self._pending_property_history = None
+        if hasattr(self, "_compare_before_image"):
+            self._reset_ai_compare()
         self.project = ImageProject(w, h)
         self.active = None
         self.active_artboard = None
@@ -4177,6 +4436,7 @@ class ImageEditorWidget(QWidget):
         lock_action = menu.addAction(lock_label)
         menu.addSeparator()
         add_media_a = menu.addAction("📤  添加到视频素材库")
+        add_resource_a = menu.addAction("📚  保存到 AI 资产库")
         menu.addSeparator()
         menu.addAction("全选图层", self._select_all_layers)
         menu.addAction("反选图层", self._invert_layer_selection)
@@ -4218,10 +4478,13 @@ class ImageEditorWidget(QWidget):
         elif action == flip_v_action:
             self._flip_vertical(layer)
         elif action == lock_action:
+            self._push_undo("锁定图层" if not getattr(layer, 'locked', False) else "解锁图层")
             layer.locked = not getattr(layer, 'locked', False)
             self._refresh_layers()
         elif action is add_media_a and add_media_a is not None:
             self._add_layer_to_media_library(layer)
+        elif action is add_resource_a and add_resource_a is not None:
+            self._push_layer_to_resource_center(layer)
 
     def _export_layer_to_png(self, layer, path):
         """把单个图层渲染为带透明通道的 PNG（保留不透明度/样式/阴影），并裁剪到内容包围盒。"""
@@ -4255,6 +4518,27 @@ class ImageEditorWidget(QWidget):
             QMessageBox.warning(self, "错误", f"导出图层失败：{e}")
             return
         self.add_layer_to_media_requested.emit(path)
+
+    def _push_layer_to_resource_center(self, layer):
+        """导出当前图层，并选择新建/追加为角色或场景资产。"""
+        import time as _time
+        if layer is None or layer.kind not in ("image", "shape", "text"):
+            return
+        folder = Path(__file__).parent.parent / "work_temp" / "resource_imports"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"resource_{int(_time.time() * 1000)}.png"
+        try:
+            self._export_layer_to_png(layer, str(path))
+            from ai.ui.resource_center import import_assets_to_resource_center
+            result = import_assets_to_resource_center(
+                self, [str(path)], default_kind="character")
+            if result:
+                kind, items = result
+                label = "角色" if kind == "character" else "场景"
+                self.status_tool.setText(
+                    f"已保存到 AI 资产库：{len(items)} 个{label}资产")
+        except Exception as error:
+            QMessageBox.warning(self, "推送失败", str(error))
 
     def _refresh_layers(self):
         self.layer_list.clear()
@@ -4412,7 +4696,11 @@ class ImageEditorWidget(QWidget):
 
     def _set_blend_mode(self, text):
         if self.active:
-            self.active.blend = self.BLEND_MODES.get(text, "normal")
+            value = self.BLEND_MODES.get(text, "normal")
+            if self.active.blend == value:
+                return
+            self._push_undo("更改混合模式")
+            self.active.blend = value
             self._redraw()
 
     def _sync_props(self):
@@ -4430,14 +4718,35 @@ class ImageEditorWidget(QWidget):
         # 画板模式下「透明」勾选框反映的是【当前激活画板】的透明状态，
         # 否则反映项目级透明。此前误用 project.transparent，导致进入画板后
         # 勾选框初始状态与画板实际状态错位 → 需连点两下才生效，且各画板不独立。
+        self.trans_chk.blockSignals(True)
         self.trans_chk.setChecked(
             self.active_artboard.transparent if self.active_artboard is not None
             else self.project.transparent)
+        self.trans_chk.blockSignals(False)
         self._sync_style()
+
+    def _begin_opacity_change(self):
+        """保存拖动前状态；一次连续拖动只生成一条历史记录。"""
+        self._opacity_pre_snap = self._snapshot() if self.active else None
+        self._opacity_start_value = self.active.opacity if self.active else None
+
+    def _end_opacity_change(self):
+        snap = getattr(self, "_opacity_pre_snap", None)
+        start = getattr(self, "_opacity_start_value", None)
+        self._opacity_pre_snap = None
+        self._opacity_start_value = None
+        if snap is not None and self.active is not None and self.active.opacity != start:
+            self._push_undo_snapshot("调整图层不透明度", snap)
 
     def _set_active_opacity(self, v):
         if self.active:
-            self.active.opacity = v / 100.0
+            value = v / 100.0
+            if self.active.opacity == value:
+                return
+            # 键盘单步调整不会触发 sliderPressed，仍然记录本次操作。
+            if getattr(self, "_opacity_pre_snap", None) is None:
+                self._push_undo("调整图层不透明度")
+            self.active.opacity = value
             self._sync_opacity_widgets(v)
             self._redraw()
 
@@ -4488,6 +4797,11 @@ class ImageEditorWidget(QWidget):
         self._set_canvas_size(self.cw.value(), self.ch.value(), push_undo=True)
 
     def _set_transparent(self, on):
+        current = (self.active_artboard.transparent if self.active_artboard is not None
+                   else self.project.transparent)
+        if current == on:
+            return
+        self._push_undo("切换透明背景")
         if self.active_artboard is not None:
             self.active_artboard.transparent = on
         else:
@@ -4497,6 +4811,9 @@ class ImageEditorWidget(QWidget):
     # ═══════ 样式 / 处理 处理器 ═══════
     def _set_clip(self, on):
         if self.active:
+            if self.active.clip == on:
+                return
+            self._push_undo("切换剪切属性")
             self.active.clip = on
             self._redraw()
 
@@ -4612,6 +4929,9 @@ class ImageEditorWidget(QWidget):
 
     def _set_stroke_on_shape(self, on):
         if self.active and self.active.kind in ("shape", "text"):
+            if self.active.stroke_on == on:
+                return
+            self._queue_property_undo("切换图层描边")
             self.active.stroke_on = on
             if on and self.active.stroke_w < 1:
                 self.active.stroke_w = 1
@@ -4620,47 +4940,74 @@ class ImageEditorWidget(QWidget):
 
     def _set_radius(self, v):
         if self.active and self.active.kind == "shape":
+            if self.active.radius == v:
+                return
+            self._queue_property_undo("调整圆角")
             self.active.radius = v
             self._redraw()
 
     def _set_stroke_w(self, v):
         if self.active and self.active.kind in ("shape", "text"):
+            if self.active.stroke_w == v:
+                return
+            self._queue_property_undo("调整描边宽度")
             self.active.stroke_w = v
             self._redraw()
 
     def _set_shadow(self, on):
         if self.active:
+            if self.active.shadow == on:
+                return
+            self._queue_property_undo("切换投影")
             self.active.shadow = on
             self._redraw()
 
     def _set_shadow_dx(self, v):
         if self.active:
+            if self.active.shadow_dx == v:
+                return
+            self._queue_property_undo("调整投影位置")
             self.active.shadow_dx = v
             self._redraw()
 
     def _set_shadow_dy(self, v):
         if self.active:
+            if self.active.shadow_dy == v:
+                return
+            self._queue_property_undo("调整投影位置")
             self.active.shadow_dy = v
             self._redraw()
 
     def _set_shadow_blur(self, v):
         if self.active:
+            if self.active.shadow_blur == v:
+                return
+            self._queue_property_undo("调整投影模糊")
             self.active.shadow_blur = v
             self._redraw()
 
     def _set_shadow_op(self, v):
         if self.active:
+            if self.active.shadow_opacity == v / 100.0:
+                return
+            self._queue_property_undo("调整投影不透明度")
             self.active.shadow_opacity = v / 100.0
             self._redraw()
 
     # ── P5 文字渐变填充控制 ──
     def _set_text_gradient_on(self, on):
         if self.active and self.active.kind == "text":
+            if self.active.gradient == on:
+                return
+            self._queue_property_undo("切换文字渐变")
             self.active.gradient = on
             self._redraw()
 
     def _set_text_grad_angle(self, v):
         if self.active and self.active.kind == "text":
+            if self.active.grad_angle == v:
+                return
+            self._queue_property_undo("调整渐变角度")
             self.active.grad_angle = v
             self._redraw()
 
@@ -4668,6 +5015,7 @@ class ImageEditorWidget(QWidget):
         c = QColorDialog.getColor(self._style_color_current(target), self)
         if not c.isValid():
             return
+        self._push_undo("更改图层样式颜色")
         if target == "grad_from" and self.active:
             self.active.grad_from = c.name()
         elif target == "grad_to" and self.active:
@@ -5286,7 +5634,7 @@ class ImageEditorWidget(QWidget):
 
     def _redraw(self):
         img = self._render_composite(for_export=False)
-        if self._compare_active and self._compare_before is not None:
+        if self._compare_active and self._compare_before_image is not None:
             try:
                 self._draw_compare_overlay(img)
             except Exception as _e:
@@ -5506,6 +5854,7 @@ class ImageEditorWidget(QWidget):
         return best
 
     def _toggle_grid(self):
+        self._push_undo("切换网格")
         self.project.show_grid = not self.project.show_grid
         self._redraw()
 
@@ -5520,6 +5869,10 @@ class ImageEditorWidget(QWidget):
         self.view.viewport().update()
 
     def _toggle_grid_action(self, action=None):
+        target = action.isChecked() if action is not None else not self.project.show_grid
+        if target == self.project.show_grid:
+            return
+        self._push_undo("切换网格")
         if action is not None:
             self.project.show_grid = action.isChecked()
         else:
@@ -5539,6 +5892,7 @@ class ImageEditorWidget(QWidget):
 
     def _add_guide_at(self, pt):
         """在指定文档坐标添加参考线（优先水平，垂直备选）"""
+        self._push_undo("添加参考线")
         dx = min(abs(pt.x() - gx) for gx in self.project.v_guides) if self.project.v_guides else 999
         dy = min(abs(pt.y() - gy) for gy in self.project.h_guides) if self.project.h_guides else 999
         if dy <= dx:
@@ -5548,6 +5902,9 @@ class ImageEditorWidget(QWidget):
         self._redraw()
 
     def _clear_guides(self):
+        if not self.project.h_guides and not self.project.v_guides:
+            return
+        self._push_undo("清除参考线")
         self.project.h_guides.clear()
         self.project.v_guides.clear()
         self._redraw()
@@ -5763,6 +6120,8 @@ class ImageEditorWidget(QWidget):
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
         if self.selection is not None:
+            menu.addAction("✨ AI 局部修改…", self._prompt_ai_inpaint)
+            menu.addSeparator()
             menu.addAction("🗑 删除选区", lambda: self.delete_selection(silent=True))
             menu.addAction("🎨 填充选区", self.fill_selection)
             menu.addAction("🔁 反选选区", self._invert_selection)
@@ -5779,6 +6138,73 @@ class ImageEditorWidget(QWidget):
                 menu.addSeparator()
                 menu.addAction("🗑 删除画板", lambda: self._delete_artboard(self.active_artboard))
         menu.exec(global_pos)
+
+    def _prompt_ai_inpaint(self):
+        """选区右键入口：输入一句修改描述并直接提交局部重绘。"""
+        if self.selection is None or not self.selection.any():
+            QMessageBox.information(self, "AI 局部修改", "请先框选需要修改的区域。")
+            return
+        dialog = AIInpaintPromptDialog(self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        prompt = dialog.prompt()
+        if not prompt:
+            return
+        panel = getattr(self, "_ai_image_panel", None)
+        if panel is None:
+            # 局部重绘是精修能力，按需创建无界面后端；
+            # 不再把完整生图面板挂回图片工作台。
+            try:
+                from ai.ui.image_ai_panel import ImageAIPanel
+                panel = ImageAIPanel(parent=self, host=self)
+                panel.hide()
+                self._ai_image_panel = panel
+            except Exception as error:
+                QMessageBox.warning(self, "AI 局部修改", str(error))
+                return
+        self._begin_ai_compare("AI 局部修改")
+        if panel.generate_inpaint(prompt):
+            self.status_tool.setText("AI 正在修改选区…")
+        else:
+            self._cancel_ai_compare()
+
+    def add_ai_inpaint_result(self, path, selection, name="AI 局部修改"):
+        """把完整的 inpaint 返回图裁成透明选区图层并叠回当前画板。"""
+        from PIL import Image as PILImage, ImageFilter
+        mask = np.asarray(selection, dtype=bool)
+        mh, mw = mask.shape
+        image = PILImage.open(path).convert("RGBA")
+        if image.size != (mw, mh):
+            image = image.resize((mw, mh), PILImage.Resampling.LANCZOS)
+        pixels = np.array(image, dtype=np.uint8)
+
+        # AI 返回的是整张重绘图。回贴时使用只向选区内部渐隐的软边蒙版，
+        # 避免矩形选区在脸部、衣物等连续纹理上形成生硬拼贴接缝。
+        feather_radius = max(4, min(18, int(min(mw, mh) * 0.012)))
+        hard_mask = PILImage.fromarray(mask.astype(np.uint8) * 255, mode="L")
+        soft_mask = np.asarray(
+            hard_mask.filter(ImageFilter.GaussianBlur(feather_radius)),
+            dtype=np.float32,
+        ) / 255.0
+        soft_mask *= mask.astype(np.float32)  # 不允许修改泄漏到用户选区外
+        pixels[:, :, 3] = np.clip(
+            pixels[:, :, 3].astype(np.float32) * soft_mask, 0, 255
+        ).astype(np.uint8)
+
+        layer = ImageLayer(name, pixels=pixels, w=mw, h=mh, kind="image")
+        layer.x = mw / 2.0
+        layer.y = mh / 2.0
+        layer.scale = 1.0
+        self._push_undo("AI 局部修改")
+        if self.active_artboard is not None:
+            self.active_artboard.layers.append(layer)
+        else:
+            self.project.add_layer(layer)
+        self.set_active(layer)
+        self._refresh_layers()
+        self._redraw()
+        self._finish_ai_compare()
+        self.status_tool.setText("AI 局部修改完成")
 
     def _handle_move(self, name, pt, orig):
         """拖拽变换手柄：旋转 / 缩放。画板模式下 pt 是文档坐标，需转为本地坐标。"""
@@ -7380,6 +7806,9 @@ class ImageEditorWidget(QWidget):
     def _choose_bg_color(self):
         c = QColorDialog.getColor(self.project.bg_color, self)
         if c.isValid():
+            if c == self.project.bg_color:
+                return
+            self._push_undo("更改背景色")
             self.project.bg_color = c
             self._redraw()
 
@@ -7387,6 +7816,9 @@ class ImageEditorWidget(QWidget):
     def _set_shape_fill_on(self, on):
         self.shape_fill_on = on
         if self.active and self.active.kind == "shape":
+            if self.active.filled == on:
+                return
+            self._push_undo("切换形状填充")
             self.active.filled = on
             self._redraw()
 
@@ -7396,6 +7828,9 @@ class ImageEditorWidget(QWidget):
             self.shape_stroke_w = 2
             self._sh_stroke_w.setValue(2)
         if self.active and self.active.kind == "shape":
+            if self.active.stroke_on == on:
+                return
+            self._push_undo("切换形状描边")
             self.active.stroke_on = on
             if on:
                 self.active.stroke_w = max(self.active.stroke_w, 1)
@@ -7404,6 +7839,9 @@ class ImageEditorWidget(QWidget):
     def _set_shape_stroke_w(self, v):
         self.shape_stroke_w = v
         if self.active and self.active.kind == "shape":
+            if self.active.stroke_w == v:
+                return
+            self._queue_property_undo("调整形状描边宽度")
             self.active.stroke_w = v
             self._redraw()
 
@@ -7415,6 +7853,7 @@ class ImageEditorWidget(QWidget):
             if hasattr(self, "_swatch_btn"):
                 self._update_color_btn(self._swatch_btn, c)
             if self.active and self.active.kind == "shape":
+                self._push_undo("更改形状填充色")
                 self.active.fill_color = c.name()
                 self._redraw()
 
@@ -7424,12 +7863,16 @@ class ImageEditorWidget(QWidget):
             self.shape_stroke_color = c
             self._update_color_btn(self._sh_stroke_btn, c)
             if self.active and self.active.kind == "shape":
+                self._push_undo("更改形状描边色")
                 self.active.color = c.name()
                 self._redraw()
 
     def _set_shape_gradient_on(self, on):
         self.shape_gradient_on = on
         if self.active and self.active.kind == "shape":
+            if self.active.gradient == on:
+                return
+            self._queue_property_undo("切换形状渐变")
             self.active.gradient = on
             self._redraw()
 
@@ -7439,6 +7882,7 @@ class ImageEditorWidget(QWidget):
             self.shape_grad_from = c
             self._update_color_btn(self._sh_grad_from_btn, c)
             if self.active and self.active.kind == "shape":
+                self._push_undo("更改渐变起始色")
                 self.active.grad_from = c.name()
                 self._redraw()
 
@@ -7448,6 +7892,7 @@ class ImageEditorWidget(QWidget):
             self.shape_grad_to = c
             self._update_color_btn(self._sh_grad_to_btn, c)
             if self.active and self.active.kind == "shape":
+                self._push_undo("更改渐变结束色")
                 self.active.grad_to = c.name()
                 self._redraw()
 
@@ -7930,8 +8375,8 @@ class ImageEditorWidget(QWidget):
     # ═══════ 剪切蒙版 / 图层蒙版 / 栅格化 / 翻转 ═══════
     def _toggle_clip(self, layer):
         """切换图层的剪切蒙版状态。"""
-        layer.clip = not layer.clip
         self._push_undo("剪切蒙版")
+        layer.clip = not layer.clip
         self._redraw()
         self._refresh_layers()
 
@@ -7941,8 +8386,8 @@ class ImageEditorWidget(QWidget):
             QMessageBox.information(self, "提示", "只有图片图层可以添加蒙版。")
             return
         cw, ch = self._ctx_size()
-        layer.mask = np.ones((ch, cw), dtype=np.uint8) * 255
         self._push_undo("添加图层蒙版")
+        layer.mask = np.ones((ch, cw), dtype=np.uint8) * 255
         self._redraw()
         self._refresh_layers()
 
@@ -8204,19 +8649,13 @@ class ImageEditorWidget(QWidget):
         if self._ai_enh_busy:
             QMessageBox.information(self, "请稍候", "上一个 AI 任务仍在进行中…")
             return
+        self._ai_enh_pre_snap = self._snapshot()
         self._ai_enh_busy = True
         self._ai_enh_layer = layer
         self._ai_enh_kind = "upscale"
         self._ai_enh_factor = factor
         self._ai_enh_src_w = w
-        # 记录放大前原图：用于历史「原图」快照 + 前后对比
-        self._compare_before = layer.pixels.copy()
-        self._compare_layer = layer
-        self._compare_active = False
-        self._compare_is_real_ai = False
-        if self._compare_btn is not None:
-            self._compare_btn.setChecked(False)
-            self._compare_btn.setEnabled(False)
+        self._begin_ai_compare(f"AI 高清放大 {factor}×")
         self.ai_status.setText("🤖 AI 超分准备中…")
         self.ai_status.setVisible(True)
         QApplication.processEvents()
@@ -8250,10 +8689,12 @@ class ImageEditorWidget(QWidget):
         if self._ai_enh_busy:
             QMessageBox.information(self, "请稍候", "上一个 AI 任务仍在进行中…")
             return
+        self._ai_enh_pre_snap = self._snapshot()
         self._ai_enh_busy = True
         self._ai_enh_layer = layer
         self._ai_enh_kind = "face"
         self._ai_enh_sel = self.selection.copy() if self.selection is not None else None
+        self._begin_ai_compare("AI 人脸修复")
         self.ai_status.setText("🤖 AI 人脸修复准备中…")
         self.ai_status.setVisible(True)
         QApplication.processEvents()
@@ -8274,10 +8715,12 @@ class ImageEditorWidget(QWidget):
         if self._ai_enh_busy:
             QMessageBox.information(self, "请稍候", "上一个 AI 任务仍在进行中…")
             return
+        self._ai_enh_pre_snap = self._snapshot()
         self._ai_enh_busy = True
         self._ai_enh_layer = layer
         self._ai_enh_kind = "birefnet"
         self._ai_enh_sel = None
+        self._begin_ai_compare("AI 智能抠图")
         self.ai_status.setText("🤖 AI 智能抠图准备中…")
         self.ai_status.setVisible(True)
         QApplication.processEvents()
@@ -8293,24 +8736,21 @@ class ImageEditorWidget(QWidget):
         self._ai_enh_busy = False
         layer = getattr(self, "_ai_enh_layer", None)
         kind = getattr(self, "_ai_enh_kind", "")
+        if layer is None or out_arr is None or layer not in self._all_layers():
+            self._ai_enh_pre_snap = None
+            self._cancel_ai_compare()
+            self.ai_status.setText("⚠ AI 处理完成，但原图层已被删除")
+            self.ai_status.setVisible(True)
+            QTimer.singleShot(3000, lambda: self.ai_status.setVisible(False))
+            return
         if layer is not None and out_arr is not None:
             if kind == "upscale":
                 ow = getattr(self, "_ai_enh_src_w", out_arr.shape[1])
-                # 先入栈「原图」快照，保证可一步回溯到放大前
-                self._push_undo("原图（放大前）")
                 layer.pixels = out_arr
                 layer.h, layer.w = out_arr.shape[0], out_arr.shape[1]
                 if out_arr.shape[1]:
                     layer.scale = layer.scale * ow / out_arr.shape[1]
                 self._refresh_layers()
-                # 启用前后对比
-                self._compare_layer = layer
-                self._compare_active = False
-                self._compare_is_real_ai = ("Lanczos" not in engine
-                                            and "未启用" not in engine)
-                if self._compare_btn is not None:
-                    self._compare_btn.setEnabled(True)
-                    self._compare_btn.setChecked(False)
             elif kind == "birefnet":
                 layer.pixels = out_arr  # 同尺寸，仅替换 alpha 通道
                 self._refresh_layers()
@@ -8323,14 +8763,17 @@ class ImageEditorWidget(QWidget):
                 else:
                     layer.pixels = out_arr
             self._redraw()
-            # 历史记录：在结果真正写入图层后再入栈，快照才反映放大/修复后的状态
-            # （异步操作若在点击时入栈，会存到操作前的旧状态，导致撤销错位）
+            pre_snap = getattr(self, "_ai_enh_pre_snap", None)
             if kind == "upscale":
-                self._push_undo(f"AI 高清放大 {getattr(self, '_ai_enh_factor', 2)}×")
+                name = f"AI 高清放大 {getattr(self, '_ai_enh_factor', 2)}×"
             elif kind == "birefnet":
-                self._push_undo("AI 智能抠图 (BiRefNet)")
+                name = "AI 智能抠图 (BiRefNet)"
             else:
-                self._push_undo("AI 人脸修复")
+                name = "AI 人脸修复"
+            self._push_undo_snapshot(name, pre_snap or self._snapshot())
+            self._history[self._history_idx]["post"] = self._snapshot()
+            self._finish_ai_compare()
+        self._ai_enh_pre_snap = None
         self.ai_status.setText("✅ " + engine)
         QTimer.singleShot(3500, lambda: self.ai_status.setVisible(False))
         if kind == "upscale":
@@ -8352,76 +8795,100 @@ class ImageEditorWidget(QWidget):
 
     def _on_ai_enh_err(self, msg):
         self._ai_enh_busy = False
+        self._ai_enh_pre_snap = None
+        self._cancel_ai_compare()
         self.ai_status.setText("❌ AI 任务失败")
         QTimer.singleShot(4000, lambda: self.ai_status.setVisible(False))
         QMessageBox.warning(self, "失败", "AI 处理出错：\n" + msg)
 
-    # ───────────── 前后对比（高清放大后） ─────────────
+    # ───────────── 通用 AI 前后对比 ─────────────
+    def _reset_ai_compare(self):
+        """清除当前文档对比状态，避免新建/恢复文档后串用旧快照。"""
+        self._compare_before_image = None
+        self._compare_pending_image = None
+        self._compare_pending_label = ""
+        self._compare_label = "AI 处理"
+        self._compare_active = False
+        button = getattr(self, "_compare_btn", None)
+        if button is not None:
+            button.blockSignals(True)
+            button.setChecked(False)
+            button.setEnabled(False)
+            button.blockSignals(False)
+
+    def _begin_ai_compare(self, label="AI 处理"):
+        """暂存 AI 操作前的整张画布；任务成功后才成为有效对比。"""
+        try:
+            self._compare_pending_image = self._render_composite(for_export=False).copy()
+            self._compare_pending_label = label
+        except Exception:
+            self._compare_pending_image = None
+            self._compare_pending_label = ""
+        self._compare_active = False
+        if self._compare_btn is not None:
+            self._compare_btn.blockSignals(True)
+            self._compare_btn.setChecked(False)
+            self._compare_btn.blockSignals(False)
+            self._compare_btn.setEnabled(False)
+
+    def _finish_ai_compare(self):
+        """AI 操作成功：启用本次处理前后的对比。"""
+        if self._compare_pending_image is not None:
+            self._compare_before_image = self._compare_pending_image
+            self._compare_label = self._compare_pending_label or "AI 处理"
+        self._compare_pending_image = None
+        self._compare_pending_label = ""
+        self._compare_active = False
+        if self._compare_btn is not None:
+            self._compare_btn.blockSignals(True)
+            self._compare_btn.setChecked(False)
+            self._compare_btn.blockSignals(False)
+            self._compare_btn.setEnabled(self._compare_before_image is not None)
+
+    def _cancel_ai_compare(self):
+        """AI 操作失败：丢弃本次暂存，保留上一次成功结果。"""
+        self._compare_pending_image = None
+        self._compare_pending_label = ""
+        if self._compare_btn is not None:
+            self._compare_btn.setEnabled(self._compare_before_image is not None)
+
     def _on_compare_toggle(self, checked):
-        """前后对比开关：开启时画布显示放大前原图，关闭显示 AI 结果。"""
+        """开启显示最近一次 AI 操作前快照，关闭显示当前结果。"""
         self._compare_active = checked
-        if checked:
-            if self.project.artboards:
-                self.ai_status.setText("⚠ 画板模式下暂不支持前后对比")
-                self.ai_status.setVisible(True)
-                QTimer.singleShot(2500, lambda: self.ai_status.setVisible(False))
-                self._compare_active = False
-                if self._compare_btn is not None:
-                    self._compare_btn.setChecked(False)
-                return
-            if self._compare_layer is None or self._compare_before is None:
-                self.ai_status.setText("⚠ 没有可对比的原图，请先做一次「高清放大」")
-                self.ai_status.setVisible(True)
-                QTimer.singleShot(2800, lambda: self.ai_status.setVisible(False))
-                self._compare_active = False
-                if self._compare_btn is not None:
-                    self._compare_btn.setChecked(False)
-                return
-            if not self._compare_is_real_ai:
-                self.ai_status.setText("⚠ 本次是传统 Lanczos 放大，与原图几乎无差别；"
-                                            "请先下载 Real-ESRGAN 模型再做前后对比")
-                self.ai_status.setVisible(True)
-                QTimer.singleShot(3200, lambda: self.ai_status.setVisible(False))
-                self._compare_active = False
-                if self._compare_btn is not None:
-                    self._compare_btn.setChecked(False)
-                return
-            self.ai_status.setText("👁 显示：原图（放大前）— 再次点击切回 AI 结果")
+        if checked and self._compare_before_image is None:
+            self.ai_status.setText("⚠ 暂无可对比内容，请先完成一次 AI 修改")
             self.ai_status.setVisible(True)
-            QTimer.singleShot(2500, lambda: self.ai_status.setVisible(False))
+            QTimer.singleShot(2800, lambda: self.ai_status.setVisible(False))
+            self._compare_active = False
+            if self._compare_btn is not None:
+                self._compare_btn.setChecked(False)
+            return
+        if checked:
+            self.ai_status.setText(
+                f"👁 显示：{self._compare_label}前 — 再次点击切回当前结果")
+        else:
+            self.ai_status.setText(f"✨ 显示：{self._compare_label}后")
+        self.ai_status.setVisible(True)
+        QTimer.singleShot(2200, lambda: self.ai_status.setVisible(False))
         self._redraw()
 
     def _draw_compare_overlay(self, img):
-        """在合成结果上叠加放大前原图（覆盖被放大层的画布区域），实现前后对比。
-
-        注意：仅普通画布模式生效；画板模式下图层变换基准不同，避免错位故跳过。"""
-        if self.project.artboards:
+        """用最近一次 AI 操作前的整画布快照覆盖当前预览。"""
+        before = self._compare_before_image
+        if before is None:
             return
-        layer = self._compare_layer
-        if layer is None or self._compare_before is None:
-            return
-        # 项目已切换 / 图层被删 → 不再叠加（避免引用悬空图层的变换）
-        if not self.project.artboards and layer not in self.project.layers:
-            return
-        bbox = self._layer_bbox(layer)
-        if bbox is None or bbox.width() < 2 or bbox.height() < 2:
-            return
-        before = qimage_from_numpy(self._compare_before)
         p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        rect = QRectF(int(round(bbox.x())), int(round(bbox.y())),
-                      int(round(bbox.width())), int(round(bbox.height())))
-        p.drawImage(rect, before)
-        # 角标提示当前为「原图」
-        p.setPen(QPen(QColor("#00eaff"), 2))
-        p.setBrush(QColor(0, 0, 0, 160))
-        badge = QRectF(rect.x() + 6, rect.y() + 6, 140, 24)
-        p.drawRoundedRect(badge, 4, 4)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+        p.drawImage(QRectF(0, 0, img.width(), img.height()), before)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
+        badge = QRectF(8, 8, 150, 26)
+        p.setPen(QPen(QColor("#00eaff"), 1))
+        p.setBrush(QColor(0, 0, 0, 175))
+        p.drawRoundedRect(badge, 5, 5)
         p.setPen(QColor("#00eaff"))
-        p.setFont(QFont("Microsoft YaHei", 12))
-        p.drawText(badge.adjusted(8, 0, 0, 0),
-                   Qt.AlignmentFlag.AlignVCenter, "原图（放大前）")
+        p.setFont(QFont("Microsoft YaHei", 10))
+        p.drawText(badge.adjusted(9, 0, 0, 0),
+                   Qt.AlignmentFlag.AlignVCenter, "AI 处理前")
         p.end()
 
     def _open_model_manager(self):
@@ -8570,8 +9037,9 @@ class ImageEditorWidget(QWidget):
         if getattr(self, "_ai_busy", False):
             QMessageBox.information(self, "请稍候", "上一次 AI 抠图仍在处理中…")
             return
-        # pre-state 快照（撤销点），随后异步应用结果
-        self._push_undo("AI 抠图")
+        # 暂存 pre-state；仅在任务成功并写回图层后登记历史。
+        self._ai_remove_bg_pre_snap = self._snapshot()
+        self._begin_ai_compare("AI 抠图")
         self._ai_busy = True
         self._ai_layer_ref = layer
         # 记录当前选区（抠图结果只应用到选区内）
@@ -8599,7 +9067,7 @@ class ImageEditorWidget(QWidget):
     def _on_ai_done(self, out_arr):
         self._ai_busy = False
         layer = getattr(self, "_ai_layer_ref", None)
-        if layer is not None and out_arr is not None:
+        if layer is not None and out_arr is not None and layer in self._all_layers():
             sel_mask = getattr(self, "_ai_selection", None)
             if sel_mask is not None:
                 # 只更新选区内的像素
@@ -8609,6 +9077,17 @@ class ImageEditorWidget(QWidget):
             else:
                 layer.pixels = out_arr
             self._redraw()
+            pre_snap = getattr(self, "_ai_remove_bg_pre_snap", None)
+            if pre_snap is not None:
+                self._push_undo_snapshot("AI 抠图", pre_snap)
+                self._history[self._history_idx]["post"] = self._snapshot()
+            self._finish_ai_compare()
+        else:
+            self._cancel_ai_compare()
+            self.ai_status.setText("⚠ AI 抠图完成，但原图层已被删除")
+            self._ai_remove_bg_pre_snap = None
+            return
+        self._ai_remove_bg_pre_snap = None
         self.ai_status.setText("✅ AI 抠图完成，透明通道已更新")
         QTimer.singleShot(2500, lambda: self.ai_status.setVisible(False))
         QMessageBox.information(
@@ -8617,6 +9096,8 @@ class ImageEditorWidget(QWidget):
 
     def _on_ai_err(self, msg):
         self._ai_busy = False
+        self._ai_remove_bg_pre_snap = None
+        self._cancel_ai_compare()
         self.ai_status.setText("❌ AI 抠图失败")
         QTimer.singleShot(4000, lambda: self.ai_status.setVisible(False))
         QMessageBox.warning(self, "失败", "AI 抠图出错：\n" + msg)
@@ -8756,11 +9237,15 @@ class ImageEditorWidget(QWidget):
             bg=(self.project.bg_color.red(), self.project.bg_color.green(),
                 self.project.bg_color.blue()),
             transparent=self.project.transparent,
+            h_guides=list(self.project.h_guides),
+            v_guides=list(self.project.v_guides),
+            show_grid=self.project.show_grid,
+            grid_size=self.project.grid_size,
             active_id=self.active.id if self.active else None,
             active_artboard_id=self.active_artboard.id if self.active_artboard else None,
             artboards=[dict(
                 id=ab.id, name=ab.name, x=ab.x, y=ab.y, w=ab.w, h=ab.h,
-                transparent=ab.transparent,
+                transparent=ab.transparent, collapsed=ab.collapsed,
                 bg=(ab.bg_color.red(), ab.bg_color.green(), ab.bg_color.blue()),
                 layers=[self._ser_layer(l, with_pixels=True) for l in ab.layers],
             ) for ab in self.project.artboards],
@@ -8781,7 +9266,27 @@ class ImageEditorWidget(QWidget):
                  shape=l.shape, rect=[l.rect.x(), l.rect.y(), l.rect.width(), l.rect.height()],
                  fill_color=l.fill_color, stroke_w=l.stroke_w, stroke_on=l.stroke_on,
                  filled=l.filled, locked=getattr(l, 'locked', False),
-                 group_id=getattr(l, 'group_id', None))
+                 group_id=getattr(l, 'group_id', None),
+                 inner_shadow=getattr(l, 'inner_shadow', False),
+                 inner_shadow_dx=getattr(l, 'inner_shadow_dx', 0),
+                 inner_shadow_dy=getattr(l, 'inner_shadow_dy', 0),
+                 inner_shadow_blur=getattr(l, 'inner_shadow_blur', 4),
+                 inner_shadow_color=getattr(l, 'inner_shadow_color', '#000000'),
+                 inner_shadow_opacity=getattr(l, 'inner_shadow_opacity', 0.4),
+                 outer_glow=getattr(l, 'outer_glow', False),
+                 outer_glow_size=getattr(l, 'outer_glow_size', 8),
+                 outer_glow_color=getattr(l, 'outer_glow_color', '#00eaff'),
+                 outer_glow_opacity=getattr(l, 'outer_glow_opacity', 0.5),
+                 bevel_emboss=getattr(l, 'bevel_emboss', False),
+                 bevel_size=getattr(l, 'bevel_size', 3),
+                 bevel_highlight=getattr(l, 'bevel_highlight', '#ffffff'),
+                 bevel_shadow=getattr(l, 'bevel_shadow', '#000000'),
+                 bevel_depth=getattr(l, 'bevel_depth', 0.5),
+                 skew_x=getattr(l, 'skew_x', 0.0), skew_y=getattr(l, 'skew_y', 0.0),
+                 perspective_x=getattr(l, 'perspective_x', 0.0),
+                 perspective_y=getattr(l, 'perspective_y', 0.0))
+        if with_pixels and getattr(l, "mask", None) is not None:
+            o["mask"] = l.mask.copy()
         if getattr(l, 'adjust', None):
             o["adjust"] = dict(l.adjust)
         if getattr(l, 'smart', False):
@@ -8797,15 +9302,22 @@ class ImageEditorWidget(QWidget):
 
     def _rebuild_from_snap(self, d):
         """从快照/工程字典重建完整状态（撤销重做与打开工程共用）。"""
+        if hasattr(self, "_compare_before_image"):
+            self._reset_ai_compare()
         self.project = ImageProject(d["w"], d["h"])
         self.project.transparent = d["transparent"]
         self.project.bg_color = QColor(*d["bg"])
+        self.project.h_guides = list(d.get("h_guides", []))
+        self.project.v_guides = list(d.get("v_guides", []))
+        self.project.show_grid = bool(d.get("show_grid", False))
+        self.project.grid_size = int(d.get("grid_size", 60))
         self.project.artboards = []
         ab_by_id = {}
         for a in d.get("artboards", []):
             ab = Artboard(a["name"], a["x"], a["y"], a["w"], a["h"])
             ab.id = a["id"]
             ab.transparent = a.get("transparent", False)
+            ab.collapsed = a.get("collapsed", False)
             ab.bg_color = QColor(*a.get("bg", (255, 255, 255)))
             ab.layers = [self._deser_layer(o) for o in a.get("layers", [])]
             self.project.artboards.append(ab)
@@ -8824,7 +9336,11 @@ class ImageEditorWidget(QWidget):
             self.ch.setValue(self.active_artboard.h)
         else:
             self.cw.setValue(d["w"]); self.ch.setValue(d["h"])
-        self.trans_chk.setChecked(self.project.transparent)
+        self.trans_chk.blockSignals(True)
+        self.trans_chk.setChecked(
+            self.active_artboard.transparent if self.active_artboard is not None
+            else self.project.transparent)
+        self.trans_chk.blockSignals(False)
         self._refresh_layers()
         self._redraw()
         self.view.fit_view()
@@ -8857,6 +9373,18 @@ class ImageEditorWidget(QWidget):
         l.filled = o.get("filled", True)
         l.locked = o.get("locked", False)
         l.group_id = o.get("group_id")
+        l.mask = o["mask"].copy() if o.get("mask") is not None else None
+        for attr, default in (
+                ("inner_shadow", False), ("inner_shadow_dx", 0),
+                ("inner_shadow_dy", 0), ("inner_shadow_blur", 4),
+                ("inner_shadow_color", "#000000"), ("inner_shadow_opacity", 0.4),
+                ("outer_glow", False), ("outer_glow_size", 8),
+                ("outer_glow_color", "#00eaff"), ("outer_glow_opacity", 0.5),
+                ("bevel_emboss", False), ("bevel_size", 3),
+                ("bevel_highlight", "#ffffff"), ("bevel_shadow", "#000000"),
+                ("bevel_depth", 0.5), ("skew_x", 0.0), ("skew_y", 0.0),
+                ("perspective_x", 0.0), ("perspective_y", 0.0)):
+            setattr(l, attr, o.get(attr, default))
         l.smart = o.get("smart", False)
         l.smart_source = o.get("smart_source")
         if o.get("adjust"):
@@ -8872,10 +9400,36 @@ class ImageEditorWidget(QWidget):
         """保存当前状态到线性历史（PS 风格）；之后可撤销。
         采用 pre-state 模型：快照记录「本次操作之前」的状态，
         因此每次撤销都精确回退一步，不会跳步（修复「直接跳到上上一步」）。"""
+        self._commit_property_history()
         self._push_undo_snapshot(name, self._snapshot() if snap is None else snap)
+
+    def _queue_property_undo(self, name):
+        """合并滑杆/数值框的连续变化，同时保证最终产生历史记录。"""
+        pending = self._pending_property_history
+        active_id = self.active.id if self.active else None
+        if pending is not None and (pending[0] != name or pending[2] != active_id):
+            self._commit_property_history()
+            pending = None
+        if pending is None:
+            self._pending_property_history = (name, self._snapshot(), active_id)
+        self._property_history_timer.start()
+
+    def _commit_property_history(self):
+        pending = self._pending_property_history
+        if pending is None:
+            return
+        self._property_history_timer.stop()
+        self._pending_property_history = None
+        self._committing_property_history = True
+        try:
+            self._push_undo_snapshot(pending[0], pending[1])
+        finally:
+            self._committing_property_history = False
 
     def _push_undo_snapshot(self, name, snap):
         """以给定快照入栈（供「操作后」才确定是否入栈的操作复用，保持 pre-state 一致）。"""
+        if not self._committing_property_history:
+            self._commit_property_history()
         self._history_idx += 1
         # 截断 redo 分支（新操作后旧 redo 不可达）
         self._history = self._history[:self._history_idx]
@@ -8887,6 +9441,7 @@ class ImageEditorWidget(QWidget):
 
     def undo(self):
         """撤销到上一步（pre-state 模型：历史[idx] 即本步操作前的状态）。"""
+        self._commit_property_history()
         if self._history_idx <= 0:
             return
         # 保存当前实时状态，供重做（redo）恢复（pre-state 不存 after-state）
@@ -8902,13 +9457,29 @@ class ImageEditorWidget(QWidget):
 
     def redo(self):
         """重做到下一步（pre-state 模型：用撤销时保存的 after-state 恢复）。"""
+        self._commit_property_history()
         if self._history_idx >= len(self._history) - 1:
             return
-        self._history_idx += 1
-        entry = self._history[self._history_idx]
-        snap = entry.get("post") or entry["snapshot"]
+        next_idx = self._history_idx + 1
+        snap = self._history_state_after(next_idx)
+        self._history_idx = next_idx
         self._restore(snap)
         self._refresh_history_panel()
+
+    def _history_state_after(self, idx):
+        """返回历史面板第 idx 项所代表的操作后状态。"""
+        if idx <= 0:
+            return self._history[0]["snapshot"]
+        entry = self._history[idx]
+        if entry.get("post") is not None:
+            return entry["post"]
+        # 下一操作的 pre-state，恰好就是本操作完成后的状态。
+        if idx + 1 < len(self._history):
+            return self._history[idx + 1]["snapshot"]
+        # 最新状态尚未固化时只有当前实时画布可作为 after-state。
+        if idx == self._history_idx:
+            return self._snapshot()
+        return entry["snapshot"]
 
     def _history_jump_to(self, idx):
         """PS 风格：点击历史面板任意条目跳转到该状态。"""
@@ -8918,8 +9489,9 @@ class ImageEditorWidget(QWidget):
                 self._history[self._history_idx]["post"] = self._snapshot()
             except Exception:
                 pass
+            target = self._history_state_after(idx)
             self._history_idx = idx
-            self._restore(self._history[idx]["snapshot"])
+            self._restore(target)
             self._refresh_history_panel()
 
 
@@ -9022,6 +9594,7 @@ class ImageEditorContainer(QWidget):
     """PS 风格多文档容器：每个标签页是一个独立 ImageEditorWidget（独立工程 / 图层 /
     撤销栈），互不干扰。文件 → 新建画布 与 裁剪生成新画布 都通过它开新标签。"""
     add_layer_to_media_requested = pyqtSignal(str)  # 透传子文档信号到主窗口
+    storyboard_refined_ready = pyqtSignal(str, str, bool)  # shot_id, png, 立即图生视频
 
     def __init__(self):
         super().__init__()
@@ -9045,6 +9618,43 @@ class ImageEditorContainer(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
+
+        self._storyboard_bar = QWidget()
+        self._storyboard_bar.setFixedHeight(38)
+        self._storyboard_bar.setStyleSheet(
+            "background:#211b31;border-bottom:1px solid #4b3b6d;"
+        )
+        sbl = QHBoxLayout(self._storyboard_bar)
+        sbl.setContentsMargins(10, 4, 10, 4)
+        self._storyboard_label = QLabel("分镜图片精修")
+        self._storyboard_label.setStyleSheet("color:#c7b6f5;font-weight:bold;")
+        sbl.addWidget(self._storyboard_label)
+        sbl.addStretch()
+        btn_return = QPushButton("保存并返回分镜")
+        btn_return.setStyleSheet(
+            "QPushButton{background:#345b49;color:#b8efd4;border:1px solid #4b8068;"
+            "border-radius:4px;padding:4px 12px;}QPushButton:hover{background:#416f5a;}"
+        )
+        btn_return.clicked.connect(lambda: self._finish_storyboard_refine(False))
+        sbl.addWidget(btn_return)
+        btn_video = QPushButton("保存并以此图生成视频")
+        btn_video.setStyleSheet(
+            "QPushButton{background:#28517a;color:#d2e8ff;border:1px solid #3f76a9;"
+            "border-radius:4px;padding:4px 12px;}QPushButton:hover{background:#336796;}"
+        )
+        btn_video.clicked.connect(lambda: self._finish_storyboard_refine(True))
+        sbl.addWidget(btn_video)
+        btn_cancel = QPushButton("退出精修模式")
+        btn_cancel.clicked.connect(self._close_storyboard_refine)
+        btn_cancel.setStyleSheet(
+            "QPushButton{background:transparent;color:#888;border:1px solid #45404f;"
+            "border-radius:4px;padding:4px 10px;}QPushButton:hover{color:#ccc;}"
+        )
+        sbl.addWidget(btn_cancel)
+        self._storyboard_bar.hide()
+        self._storyboard_shot_id = ""
+        outer.addWidget(self._storyboard_bar)
+
         self.tab = QTabWidget()
         self.tab.setTabsClosable(True)
         self.tab.setMovable(True)
@@ -9092,6 +9702,50 @@ class ImageEditorContainer(QWidget):
         w = self.current_widget()
         if w is not None:
             w.add_image_from_path(path)
+
+    def open_ai_generation(self, prompt: str, aspect: str = "1:1"):
+        """旧入口兼容：完整生图已迁移到 AI 制片画布。"""
+        QMessageBox.information(
+            self, "AI 生图已迁移",
+            "请在 AI 制片画布中使用“多图生成图片”节点。\n"
+            "生成后右键图片选择“发送到图片工作台”进行精修。")
+        return None
+
+    def open_storyboard_refine(self, path: str, shot_id: str):
+        """从分镜进入可选PS精修；顶部提供明确的返回与图生视频动作。"""
+        image = QImage(path)
+        if image.isNull():
+            return False
+        doc = self.new_document(image.width(), image.height(), name="分镜精修")
+        doc.add_image_from_path(path)
+        self._storyboard_shot_id = shot_id
+        self._storyboard_label.setText(f"分镜图片精修 · {shot_id}")
+        self._storyboard_bar.show()
+        return True
+
+    def _finish_storyboard_refine(self, make_video: bool):
+        doc = self.current_widget()
+        shot_id = self._storyboard_shot_id
+        if doc is None or not shot_id:
+            return
+        try:
+            from config import OUTPUT_DIR
+            folder = os.path.join(str(OUTPUT_DIR), "ai_images")
+        except Exception:
+            folder = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                                  "work_temp", "ai_assets")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, f"storyboard_refined_{int(time.time() * 1000)}.png")
+        image = doc._render_composite(for_export=True)
+        if image.isNull() or not image.save(path, "PNG"):
+            QMessageBox.warning(self, "保存失败", "无法导出当前精修画布。")
+            return
+        self.storyboard_refined_ready.emit(shot_id, path, make_video)
+        self._close_storyboard_refine()
+
+    def _close_storyboard_refine(self):
+        self._storyboard_shot_id = ""
+        self._storyboard_bar.hide()
 
     def _on_close_tab(self, idx):
         """关闭文档标签；至少保留一个（最后一张改为清空而非销毁）。"""

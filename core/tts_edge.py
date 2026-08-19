@@ -122,9 +122,11 @@ class EdgeTTSEngine:
     # ------------------------------------------------------------
     # 工具方法
     # ------------------------------------------------------------
-    def get_audio_duration(self, audio_path: Path) -> float:
-        """获取音频文件时长（秒）"""
-        import subprocess, json
+    @staticmethod
+    def get_audio_duration(audio_path: Path) -> float:
+        """获取音频文件时长（秒）。优先 ffprobe；若项目未附带 ffprobe.exe 则回退 ffmpeg 解析。"""
+        import subprocess, json, re
+        # 1) ffprobe（部分分发里没有 ffprobe.exe，会直接抛 FileNotFoundError）
         try:
             result = subprocess.run(
                 [FFPROBE_BIN, "-v", "quiet", "-show_entries", "format=duration",
@@ -132,7 +134,24 @@ class EdgeTTSEngine:
                 capture_output=True, text=True
             )
             if result.returncode == 0:
-                return float(json.loads(result.stdout)["format"]["duration"])
+                try:
+                    d = float(json.loads(result.stdout)["format"]["duration"])
+                    if d > 0:
+                        return d
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        # 2) 回退：ffmpeg -i 解析 stderr 中的 Duration 行
+        try:
+            r = subprocess.run([FFMPEG_BIN, "-i", str(audio_path)],
+                               capture_output=True, text=True)
+            m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
+            if m:
+                h, mi, s = m.groups()
+                d = int(h) * 3600 + int(mi) * 60 + float(s)
+                if d > 0:
+                    return d
         except Exception:
             pass
         return 0.0
