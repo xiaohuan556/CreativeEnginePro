@@ -13,6 +13,8 @@ nul
 *.zip
 *.7z
 .env
+server/.venv/
+server/creative_engine_server.db
 
 # Local canvas/media state and development diagnostics
 .tmpframes/
