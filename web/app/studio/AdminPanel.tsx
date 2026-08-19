@@ -6,6 +6,7 @@ import { useControlPlane } from "./ControlPlane";
 
 type ManagedUser = {
   id: string; username: string; display_name: string; role: string; status: string;
+  active_sessions?: number; last_login_at?: string | null;
   limits?: { daily_tasks: number; daily_credits: number; concurrent_tasks: number; allow_paid_models: boolean; allowed_models: string[] };
 };
 type UsageRow = { id: string; username: string; display_name: string; tasks: number; credits: number };
@@ -79,6 +80,14 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
     if (response.ok) await load(); setBusy(false);
   };
 
+  const forceLogout = async (user: ManagedUser) => {
+    setBusy(true); setMessage("");
+    const response = await apiFetch(`/api/admin/users/${user.id}/revoke-sessions`, { method: "POST" });
+    const data = await response.json() as { revoked?: number; detail?: string };
+    setMessage(response.ok ? `${user.username} 的 ${data.revoked || 0} 个登录会话已下线` : data.detail || "会话下线失败");
+    if (response.ok) await load(); setBusy(false);
+  };
+
   const totalTasks = Object.values(statuses).reduce((sum, value) => sum + value, 0);
   const totalCredits = usage.reduce((sum, item) => sum + Number(item.credits), 0);
   const loginFailures = events.filter((item) => item.action === "auth.login_failed").length;
@@ -99,23 +108,23 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
             <label><span>登录账号</span><input name="username" required placeholder="例如 editor.01" /></label><label><span>显示名称</span><input name="display_name" required /></label>
             <label className="wide"><span>初始密码</span><input name="password" type="password" minLength={12} required autoComplete="new-password" placeholder="12 位以上，至少三类字符" /></label>
             <label><span>角色</span><select name="role" defaultValue="producer">{roles.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
-            <label><span>每日任务</span><input name="daily_tasks" type="number" min="0" defaultValue="50" /></label><label><span>每日费用额度</span><input name="daily_credits" type="number" min="0" defaultValue="5000" /></label><label><span>最大并发</span><input name="concurrent_tasks" type="number" min="0" max="50" defaultValue="2" /></label>
-            <label className="wide"><span>允许引擎或 provider:model（逗号分隔；留空不限）</span><input name="allowed_models" placeholder="seedream, seedance, deepseek" /></label>
+            <label><span>每日任务</span><input name="daily_tasks" type="number" min="0" defaultValue="0" /></label><label><span>每日费用额度</span><input name="daily_credits" type="number" min="0" defaultValue="0" /></label><label><span>最大并发</span><input name="concurrent_tasks" type="number" min="0" max="50" defaultValue="0" /></label>
+            <label className="wide"><span>允许引擎或 provider:model（逗号分隔；留空则禁止外部模型）</span><input name="allowed_models" placeholder="seedream, seedance, deepseek" /></label>
           </div>
-          <div className="admin-checks"><label><input name="approved" type="checkbox" defaultChecked /> 创建后立即允许登录</label><label><input name="allow_paid_models" type="checkbox" /> 允许付费模型</label><button disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}确认创建</button></div>
+          <div className="admin-checks"><label><input name="approved" type="checkbox" /> 我已确认账号和密码，创建后允许登录</label><label><input name="allow_paid_models" type="checkbox" /> 允许付费模型</label><button disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}确认创建</button></div>
         </form>
 
         <div className="admin-section-title"><Users size={15} /><span>已有账号 · {users.length}</span></div>
         {message && <p className="admin-message">{message}</p>}
         {busy && users.length === 0 ? <div className="admin-loading"><LoaderCircle className="spin" size={20} />读取账号…</div> : <div className="user-list">{users.map((user) =>
           <form key={user.id} className="user-row" onSubmit={(event) => { event.preventDefault(); void save(user, event.currentTarget); }}>
-            <div className="user-identity"><span>{(user.display_name || user.username).slice(0, 1)}</span><div><strong>{user.username}</strong><input name="display_name" defaultValue={user.display_name} aria-label="显示名称" /></div></div>
+            <div className="user-identity"><span>{(user.display_name || user.username).slice(0, 1)}</span><div><strong>{user.username}</strong><small>{user.active_sessions || 0} 个在线会话{user.last_login_at ? ` · ${new Date(user.last_login_at).toLocaleDateString("zh-CN")}` : " · 尚未登录"}</small><input name="display_name" defaultValue={user.display_name} aria-label="显示名称" /></div></div>
             <select name="role" defaultValue={user.role} aria-label="角色">{roles.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
             <select name="status" defaultValue={user.status} aria-label="状态"><option value="active">允许登录</option><option value="pending">等待批准</option><option value="suspended">已停用</option></select>
             <div className="quota-fields"><input name="daily_tasks" type="number" min="0" defaultValue={user.limits?.daily_tasks ?? 0} title="每日任务" /><input name="daily_credits" type="number" min="0" defaultValue={user.limits?.daily_credits ?? 0} title="每日费用额度" /><input name="concurrent_tasks" type="number" min="0" defaultValue={user.limits?.concurrent_tasks ?? 0} title="并发任务" /></div>
-            <input className="models-field" name="allowed_models" defaultValue={(user.limits?.allowed_models || []).join(", ")} placeholder="允许引擎；留空不限" />
+            <input className="models-field" name="allowed_models" defaultValue={(user.limits?.allowed_models || []).join(", ")} placeholder="允许引擎；留空禁用" />
             <label className="paid-check"><input name="allow_paid_models" type="checkbox" defaultChecked={user.limits?.allow_paid_models} />付费</label>
-            <div className="password-reset"><KeyRound size={13} /><input name="password" type="password" minLength={12} placeholder="新密码（可空）" autoComplete="new-password" /></div><button className="user-save" disabled={busy}>保存</button>
+            <div className="password-reset"><KeyRound size={13} /><input name="password" type="password" minLength={12} placeholder="新密码（可空）" autoComplete="new-password" /></div><div className="user-row-actions"><button type="button" disabled={busy || !user.active_sessions} onClick={() => void forceLogout(user)}>下线</button><button className="user-save" disabled={busy}>保存</button></div>
           </form>)}</div>}
       </div>
     </section>

@@ -73,6 +73,8 @@ def sync_task_to_canvas(task_id: str) -> None:
             "completed": "生成完成",
             "failed": "生成失败",
             "cancelled": "已取消",
+            "paused": "任务已暂停",
+            "queued": "正在排队",
         }.get(task.status, "正在处理")
         data["progress"] = task.progress
         payload["server_task_id"] = task.id

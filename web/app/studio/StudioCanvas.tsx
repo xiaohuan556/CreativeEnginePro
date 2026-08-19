@@ -18,6 +18,7 @@ import { buildSkillPrompts, canConnect, CREATION_GROUPS, NODE_SPEC_BY_KEY, NODE_
 import { PulseEdge } from "./PulseEdge";
 import { useControlPlane } from "./ControlPlane";
 import { AdminPanel } from "./AdminPanel";
+import { TeamPanel } from "./TeamPanel";
 
 type StudioData = {
   title: string;
@@ -35,8 +36,9 @@ type StudioData = {
 type StudioNode = Node<StudioData, "studio">;
 type ProviderInfo = { name: string; capabilities: string[]; profile?: Record<string, unknown> };
 type LibraryAsset = { id: string; name: string; kind: string; size: number; content_type?: string; contentType?: string; in_library?: boolean };
-type QueueTask = { id: string; node_id: string; kind: string; provider: string; status: string; progress: number; error_message?: string };
+type QueueTask = { id: string; node_id: string; kind: string; provider: string; status: string; progress: number; managed_by?: "task" | "workflow" | "production"; error_message?: string };
 type PendingTask = { action: string; model: string; credits: number; run: () => Promise<void> };
+type WorkflowTemplate = { id: string; name: string; definition: { nodes?: StudioNode[]; edges?: Edge[] } };
 
 const kindIcons: Record<StudioNodeKind, typeof Sparkles> = {
   project: Clapperboard,
@@ -151,11 +153,15 @@ function CanvasApp() {
   const [createOpen, setCreateOpen] = useState(false);
   const [notice, setNotice] = useState("所有更改已保存");
   const [adminOpen, setAdminOpen] = useState(false);
+  const [teamOpen, setTeamOpen] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [sideView, setSideView] = useState<"canvas" | "assets" | "tasks">("canvas");
   const [libraryAssets, setLibraryAssets] = useState<LibraryAsset[]>([]);
   const [queueTasks, setQueueTasks] = useState<QueueTask[]>([]);
   const [pendingTask, setPendingTask] = useState<PendingTask | null>(null);
+  const [workflowTemplates, setWorkflowTemplates] = useState<WorkflowTemplate[]>([]);
+  const [projectRole, setProjectRole] = useState("");
+  const [projectConflict, setProjectConflict] = useState(false);
   const [projectTitle, setProjectTitle] = useState("雨夜最后一封信");
   const [projectId, setProjectId] = useState("");
   const [hydrated, setHydrated] = useState(false);
@@ -167,6 +173,8 @@ function CanvasApp() {
 
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedId) ?? nodes[0], [nodes, selectedId]);
   const incomingNodes = useMemo(() => edges.filter((edge) => edge.target === selectedId).map((edge) => nodes.find((node) => node.id === edge.source)).filter((node): node is StudioNode => Boolean(node)), [edges, nodes, selectedId]);
+  const canWrite = !controlled || (["admin", "producer", "director", "editor"].includes(user.role) && ["owner", "editor"].includes(projectRole));
+  const canReview = canWrite || (user.role === "reviewer" && projectRole === "reviewer");
 
   useEffect(() => {
     if (!selectedNode || selectedNode.data.specKey !== "multi_director" || !incomingNodes.length) return;
@@ -222,7 +230,25 @@ function CanvasApp() {
   }, [apiFetch, controlled]);
 
   useEffect(() => {
-    if (!hydrated || !projectId) return;
+    if (!controlled || !projectId) return;
+    void apiFetch(`/api/projects/${projectId}/members`, { cache: "no-store" }).then(async (response) => {
+      if (!response.ok) return;
+      const data = await response.json() as { members?: Array<{ user_id: string; role: string }> };
+      setProjectRole(data.members?.find((member) => member.user_id === user.id)?.role || (user.role === "admin" ? "owner" : "viewer"));
+    });
+  }, [apiFetch, controlled, projectId, user.id, user.role]);
+
+  useEffect(() => {
+    if (!controlled || !createOpen) return;
+    void apiFetch("/api/workflow-templates", { cache: "no-store" }).then(async (response) => {
+      if (!response.ok) return;
+      const data = await response.json() as { templates?: WorkflowTemplate[] };
+      setWorkflowTemplates(data.templates || []);
+    });
+  }, [apiFetch, controlled, createOpen]);
+
+  useEffect(() => {
+    if (!hydrated || !projectId || !canWrite) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       setNotice("正在保存…");
@@ -231,15 +257,24 @@ function CanvasApp() {
         body: JSON.stringify({ title: projectTitle, canvas: toWebCanvas(nodes, edges), expectedVersion: versionRef.current }),
       }).then(async (response) => {
         const data = await response.json() as { project?: { version: number }; currentVersion?: number };
-        if (response.status === 409) { versionRef.current = data.currentVersion || versionRef.current; setNotice("检测到成员更新 · 请重新载入"); return; }
+        if (response.status === 409) { versionRef.current = data.currentVersion || versionRef.current; setProjectConflict(true); setNotice("检测到其他成员更新 · 当前自动保存已暂停"); return; }
         if (!response.ok || !data.project) throw new Error("save failed");
-        versionRef.current = data.project.version; setNotice("所有更改已保存");
+        versionRef.current = data.project.version; setProjectConflict(false); setNotice("所有更改已保存");
       }).catch(() => setNotice("保存失败 · 将自动重试"));
     }, 700);
     return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
-  }, [apiFetch, edges, hydrated, nodes, projectId, projectTitle]);
+  }, [apiFetch, canWrite, edges, hydrated, nodes, projectId, projectTitle]);
+
+  const reloadProject = async () => {
+    if (!projectId) return;
+    const response = await apiFetch(`/api/projects/${projectId}`, { cache: "no-store" });
+    const data = await response.json() as { project?: { title: string; version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } }; detail?: string };
+    if (!response.ok || !data.project) { setNotice(data.detail || "项目重新载入失败"); return; }
+    versionRef.current = data.project.version; setProjectTitle(data.project.title); setNodes(data.project.canvas.nodes.map(normalizeStudioNode)); setEdges(data.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }))); setProjectConflict(false); setNotice("已载入服务器上的最新版本");
+  };
 
   const onConnect = useCallback((connection: Connection) => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能创建连线"); return; }
     const source = nodes.find((node) => node.id === connection.source);
     const target = nodes.find((node) => node.id === connection.target);
     if (!source || !target || source.id === target.id || !canConnect(source.data.specKey, target.data.specKey)) {
@@ -251,9 +286,10 @@ function CanvasApp() {
       markerEnd: { type: MarkerType.ArrowClosed, color: "#77839c" },
     }, current));
     setNotice("连线已保存");
-  }, [nodes, setEdges]);
+  }, [canWrite, nodes, setEdges]);
 
   const addNode = (item: (typeof creationItems)[number], uniqueId: string) => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能新建节点"); return; }
     const id = `${item.key}-${uniqueId}`;
     const offset = nodes.length * 24;
     setNodes((current) => [...current, {
@@ -264,12 +300,14 @@ function CanvasApp() {
   };
 
   const updateSelected = (key: "title" | "description", value: string) => {
+    if (!canWrite) { setNotice("当前项目是只读状态"); return; }
     setNodes((current) => current.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, [key]: value } } : node));
     setNotice("正在保存…");
     window.setTimeout(() => setNotice("所有更改已保存"), 450);
   };
 
   const updatePayload = (key: string, value: unknown) => {
+    if (!canWrite) { setNotice("当前项目是只读状态"); return; }
     setNodes((current) => current.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, desktopPayload: { ...(node.data.desktopPayload || {}), [key]: value } } } : node));
   };
 
@@ -283,14 +321,68 @@ function CanvasApp() {
   };
 
   const createDerivedNode = (source: StudioNode, targetKey: string, relation: string, overrides: Record<string, unknown> = {}) => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能创建衍生节点"); return; }
     const target = NODE_SPEC_BY_KEY[targetKey], id = `${targetKey}-${crypto.randomUUID()}`;
     setNodes((current) => [...current, { id, type: "studio", position: { x: source.position.x + 380, y: source.position.y + 30 }, data: { title: target.title, description: target.description, kind: target.kind, specKey: target.key, desktopType: target.desktopType, status: relation === "last_frame" ? "尾帧已设置 · 还需连接首帧" : "已继承上游参考", meta: "从图片节点创建", accent: target.accent, desktopPayload: { ...target.defaults, ...overrides } } }]);
     setEdges((current) => addEdge({ id: `${relation}-${source.id}-${id}`, source: source.id, target: id, type: "pulse", data: { relation } }, current)); setSelectedId(id); setNotice(`${target.title}已创建并连接`);
   };
 
+  const buildWorkflowItems = (group: StudioNode) => {
+    const childIds = Array.isArray(group.data.desktopPayload?.group_nodes) ? group.data.desktopPayload.group_nodes.map(String) : [];
+    return childIds.map((childId) => nodes.find((node) => node.id === childId)).filter((node): node is StudioNode => Boolean(node)).map((node) => {
+      const payload = node.data.desktopPayload || {};
+      const sources = edges.filter((edge) => edge.target === node.id).map((edge) => nodes.find((item) => item.id === edge.source)).filter((item): item is StudioNode => Boolean(item));
+      const references = sources.map((source) => ({ node_id: source.id, title: source.data.title, asset_id: source.data.desktopPayload?.asset_id || (Array.isArray(source.data.desktopPayload?.output_asset_ids) ? source.data.desktopPayload.output_asset_ids[0] : undefined) })).filter((item) => item.asset_id);
+      const mappings: Record<string, { kind: string; provider: string; model: string }> = {
+        script: { kind: "chat", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        copywriting: { kind: "chat", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        multi_image: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        scene_reference: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        character_reference: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        element_reference: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        video: { kind: references.length ? "image_to_video" : "text_to_video", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        multi_director: { kind: references.length ? "image_to_video" : "text_to_video", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
+        audio: { kind: String(payload.editor_action || "") === "音效" ? "text_to_audio" : "text_to_speech", provider: String(payload.provider_name || ""), model: String(payload.voice || "") },
+        analysis: { kind: "video_breakdown", provider: "local", model: "local" },
+        shot: { kind: String(payload.editor_action || "") === "生成视频" ? (references.length ? "image_to_video" : "text_to_video") : String(payload.editor_action || "") === "生成对白" ? "text_to_speech" : references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || payload.voice || "") },
+      };
+      const mapping = mappings[node.data.specKey];
+      if (!mapping) return null;
+      return { node_id: node.id, kind: mapping.kind, provider: mapping.provider, model: mapping.model, input: { inputs: { prompt: node.data.description, references }, params: payload, action: String(payload.editor_action || "生成"), use_cache: false } };
+    }).filter((item): item is NonNullable<typeof item> => Boolean(item));
+  };
+
+  async function pollWorkflowRun(runId: string, group: StudioNode) {
+    for (let attempt = 0; attempt < 7200; attempt += 1) {
+      await new Promise((resolve) => window.setTimeout(resolve, 2000));
+      const response = await apiFetch(`/api/workflow-runs/${runId}`, { cache: "no-store" });
+      if (!response.ok) return;
+      const data = await response.json() as { run: { status: string; current_index: number; total_items: number; progress: number; error_message?: string } };
+      setNodes((current) => current.map((node) => node.id === group.id ? { ...node, data: { ...node.data, status: data.run.status === "completed" ? "工作流完成" : data.run.status === "paused" ? "工作流已暂停" : data.run.status === "failed" ? "工作流失败" : `顺序执行 · ${data.run.current_index + 1}/${data.run.total_items}`, progress: data.run.progress, desktopPayload: { ...(node.data.desktopPayload || {}), workflow_run_id: runId, workflow_status: data.run.status } } } : node));
+      if (["completed", "failed", "paused", "cancelled"].includes(data.run.status)) {
+        for (const childId of Array.isArray(group.data.desktopPayload?.group_nodes) ? group.data.desktopPayload.group_nodes.map(String) : []) await mergeServerResult(childId);
+        setNotice(data.run.error_message || (data.run.status === "completed" ? "工作流已完成，所有结果已写回画布" : `工作流：${data.run.status}`)); return;
+      }
+    }
+  }
+
+  const instantiateWorkflowTemplate = (template: WorkflowTemplate) => {
+    const sourceNodes = (template.definition.nodes || []).map(normalizeStudioNode);
+    if (!sourceNodes.length) { setNotice("该模板没有可用节点"); return; }
+    const idMap = new Map(sourceNodes.map((node) => [node.id, `${node.data.specKey}-${crypto.randomUUID()}`]));
+    const minX = Math.min(...sourceNodes.map((node) => node.position.x)), minY = Math.min(...sourceNodes.map((node) => node.position.y));
+    const created = sourceNodes.map((node) => ({ ...node, id: idMap.get(node.id)!, position: { x: 320 + node.position.x - minX, y: 180 + node.position.y - minY }, data: { ...node.data, status: "由模板创建", desktopPayload: { ...(node.data.desktopPayload || {}), ...(Array.isArray(node.data.desktopPayload?.group_nodes) ? { group_nodes: node.data.desktopPayload.group_nodes.map((id) => idMap.get(String(id))).filter(Boolean) } : {}) } } }));
+    const templateEdges = (template.definition.edges || []).filter((edge) => idMap.has(edge.source) && idMap.has(edge.target)).map((edge) => ({ ...edge, id: `template-edge-${crypto.randomUUID()}`, source: idMap.get(edge.source)!, target: idMap.get(edge.target)!, type: "pulse" }));
+    setNodes((current) => [...current, ...created]); setEdges((current) => [...current, ...templateEdges]); setSelectedId(created[0].id); setCreateOpen(false); setNotice(`工作流模板“${template.name}”已写入画布`);
+  };
+
   const handleNodeAction = async (action: string) => {
     if (!selectedNode) return;
     const payload = selectedNode.data.desktopPayload || {};
+    const reviewAction = ["采用", "驳回", "接受风险并继续"].includes(action);
+    const readOnlyAction = ["复制文案", "导出拉片报告"].includes(action);
+    if (reviewAction && !canReview) { setNotice("当前账号没有该项目的审片权限"); return; }
+    if (!reviewAction && !readOnlyAction && !canWrite) { setNotice("当前项目是只读状态，不能修改或提交生成任务"); return; }
     if (action === "保存到资产库") {
       const ids = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean).map(String);
       if (!controlled || !ids.length) { setNotice(ids.length ? "公司服务器接入后才能同步资产库副本" : "该节点还没有可保存的媒体结果"); return; }
@@ -323,13 +415,53 @@ function CanvasApp() {
       setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: statusText, desktopPayload: { ...(node.data.desktopPayload || {}), review_decision: action, review_at: new Date().toISOString() } } } : node));
       setNotice(`${selectedNode.data.title} · ${statusText}`); return;
     }
-    if (selectedNode.data.specKey === "task" && ["取消", "重试"].includes(action)) {
+    if (selectedNode.data.specKey === "workflow") {
+      const groupIds = Array.isArray(payload.group_nodes) ? payload.group_nodes.map(String) : [];
+      if (action === "保存工作流模板") {
+        if (!controlled) { setNotice("接入公司服务器后才能保存持久模板"); return; }
+        const allIds = new Set([selectedNode.id, ...groupIds]);
+        const definition = { nodes: nodes.filter((node) => allIds.has(node.id)), edges: edges.filter((edge) => allIds.has(edge.source) && allIds.has(edge.target)) };
+        const response = await apiFetch("/api/workflow-templates", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: selectedNode.data.title, definition }) });
+        const data = await response.json() as { detail?: string };
+        setNotice(response.ok ? "工作流模板已保存，可从“新建”再次使用" : data.detail || "工作流模板保存失败"); return;
+      }
+      const runId = String(payload.workflow_run_id || "");
+      const commandByAction: Record<string, string> = { "暂停工作流": "pause", "继续工作流": "resume", "取消工作流": "cancel" };
+      if (commandByAction[action]) {
+        if (!runId) { setNotice("该工作流还没有运行记录"); return; }
+        const response = await apiFetch(`/api/workflow-runs/${runId}/command`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: commandByAction[action] }) });
+        const data = await response.json() as { run?: { status: string }; detail?: string };
+        if (!response.ok || !data.run) { setNotice(data.detail || `${action}失败`); return; }
+        setNotice(`工作流状态：${data.run.status}`); if (action === "继续工作流") void pollWorkflowRun(runId, selectedNode); return;
+      }
+      if (action === "执行工作流") {
+        if (!controlled || !projectId) { setNotice("接入公司服务器后才能执行持久工作流"); return; }
+        if (payload.workflow_status === "failed" && runId) {
+          const response = await apiFetch(`/api/workflow-runs/${runId}/command`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "retry" }) });
+          const data = await response.json() as { run?: { status: string }; detail?: string }; if (!response.ok || !data.run) { setNotice(data.detail || "工作流重试失败"); return; } void pollWorkflowRun(runId, selectedNode); return;
+        }
+        const items = buildWorkflowItems(selectedNode);
+        if (!items.length) { setNotice("工作流中没有可执行的生成节点"); return; }
+        if (items.some((item) => item.provider !== "local" && !item.provider)) { setNotice("工作流中有节点尚未锁定生成引擎"); return; }
+        const requestPayload = { project_id: projectId, node_id: selectedNode.id, items };
+        const quoteResponse = await apiFetch("/api/workflow-runs/quote", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestPayload) });
+        const quoteData = await quoteResponse.json() as { quote?: { items: number; credits: number }; detail?: string };
+        if (!quoteResponse.ok || !quoteData.quote) { setNotice(quoteData.detail || "工作流额度校验失败"); return; }
+        setPendingTask({ action: `顺序执行 ${quoteData.quote.items} 个工作流节点`, model: "按节点锁定引擎，不自动切换", credits: quoteData.quote.credits, run: async () => {
+          setPendingTask(null); const response = await apiFetch("/api/workflow-runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(requestPayload) });
+          const data = await response.json() as { run?: { id: string; status: string }; detail?: string }; if (!response.ok || !data.run) { setNotice(data.detail || "工作流启动失败"); return; }
+          setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: "工作流已启动", progress: 0, desktopPayload: { ...(node.data.desktopPayload || {}), workflow_run_id: data.run!.id, workflow_status: data.run!.status } } } : node)); setNotice("持久工作流已启动，关闭网页也会继续"); void pollWorkflowRun(data.run.id, selectedNode);
+        } }); return;
+      }
+    }
+    if (selectedNode.data.specKey === "task" && ["暂停", "继续", "取消", "重试"].includes(action)) {
       const taskId = String(payload.server_task_id || "");
       if (!taskId || !controlled) { setNotice("该任务没有可操作的公司队列记录"); return; }
-      const response = await apiFetch(`/api/tasks/${taskId}/${action === "取消" ? "cancel" : "retry"}`, { method: "POST" });
+      const operation = action === "暂停" ? "pause" : action === "继续" ? "resume" : action === "取消" ? "cancel" : "retry";
+      const response = await apiFetch(`/api/tasks/${taskId}/${operation}`, { method: "POST" });
       const data = await response.json() as { task?: { id: string; status: string }; detail?: string };
       if (!response.ok || !data.task) { setNotice(data.detail || `${action}失败`); return; }
-      setNotice(action === "重试" ? "重试任务已进入队列" : "任务已取消");
+      setNotice(action === "重试" ? "重试任务已进入队列" : action === "继续" ? "任务已恢复排队" : action === "暂停" ? "任务已暂停" : "任务已取消");
       return;
     }
     if (selectedNode.data.specKey === "image_asset") {
@@ -338,6 +470,7 @@ function CanvasApp() {
       if (action === "让这张图动起来（首帧）") { createDerivedNode(selectedNode, "video", "first_frame"); return; }
       if (action === "作为视频尾帧") { createDerivedNode(selectedNode, "video", "last_frame", { last_frame_asset_id: assetId }); return; }
     }
+    if (selectedNode.data.specKey === "shot" && action === "保存镜头修改") { setNotice("镜头修改已保存到画布节点"); return; }
     updatePayload("editor_action", action); setNotice(`已选择“${action}”`);
   };
 
@@ -356,13 +489,14 @@ function CanvasApp() {
   };
 
   const copyAssetToCanvas = (asset: LibraryAsset) => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能把资产复制到画布"); return; }
     const spec = asset.kind === "video" ? NODE_SPEC_BY_KEY.video : asset.kind === "audio" ? NODE_SPEC_BY_KEY.audio : NODE_SPEC_BY_KEY.image_asset;
     const id = `library-${asset.kind}-${crypto.randomUUID()}`;
     setNodes((current) => [...current, { id, type: "studio", position: { x: 330, y: 240 }, data: { title: asset.name.replace(/\.[^.]+$/, ""), description: "从资产库复制到画布；后续修改不会反向改变资产库副本", kind: spec.kind, specKey: spec.key, desktopType: spec.desktopType, status: "资产副本", meta: asset.content_type || asset.contentType || asset.kind, accent: spec.accent, desktopPayload: { ...spec.defaults, asset_id: asset.id, size: asset.size } } }]);
     setSelectedId(id); setSideView("canvas"); setNotice("资产副本已写入画布节点");
   };
 
-  const mergeServerResult = useCallback(async (nodeId: string) => {
+  async function mergeServerResult(nodeId: string) {
     if (!projectId) return;
     const response = await apiFetch(`/api/projects/${projectId}`, { cache: "no-store" });
     if (!response.ok) return;
@@ -388,9 +522,9 @@ function CanvasApp() {
       const existing = new Set(current.map((edge) => edge.id));
       return [...current, ...detail.project!.canvas.edges.filter((edge) => !existing.has(edge.id)).map((edge) => ({ ...edge, type: "pulse" }))];
     });
-  }, [apiFetch, projectId, setEdges, setNodes]);
+  }
 
-  const pollTask = useCallback(async (taskId: string, nodeId: string) => {
+  async function pollTask(taskId: string, nodeId: string) {
     for (let attempt = 0; attempt < 1800; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
       try {
@@ -407,9 +541,9 @@ function CanvasApp() {
         if (["failed", "cancelled"].includes(data.task.status)) { await mergeServerResult(nodeId); setNotice(data.task.error_message || "任务已停止"); return; }
       } catch { return; }
     }
-  }, [apiFetch, mergeServerResult, setNodes]);
+  }
 
-  const pollProduction = useCallback(async (runId: string, nodeId: string) => {
+  async function pollProduction(runId: string, nodeId: string) {
     for (let attempt = 0; attempt < 3600; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
       const response = await apiFetch(`/api/production-runs/${runId}`, { cache: "no-store" });
@@ -418,10 +552,11 @@ function CanvasApp() {
       setNodes((current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, status: data.run.status === "waiting_review" ? `等待确认 · ${data.run.stage_name}` : data.run.status === "complete" ? "全流程完成" : data.run.status === "paused" ? "流程已暂停" : data.run.status === "failed" ? "阶段失败" : `AI 制片中 · ${data.run.stage}/7`, progress: Math.round(data.run.completed_stage / 7 * 100), desktopPayload: { ...(node.data.desktopPayload || {}), production_run_id: runId, pipeline_stage: data.run.stage, production_status: data.run.status } } } : node));
       if (["waiting_review", "complete", "paused", "failed"].includes(data.run.status)) { await mergeServerResult(nodeId); setNotice(data.run.error_message || (data.run.status === "waiting_review" ? "到达确认节点：审片通过或接受风险后才会继续" : `制片流程：${data.run.status}`)); return; }
     }
-  }, [apiFetch, mergeServerResult, setNodes]);
+  }
 
   const productionCommand = async (command: string, targetStage?: number) => {
     if (!selectedNode || !controlled || !projectId) return;
+    if (["approve", "accept_risk"].includes(command) ? !canReview : !canWrite) { setNotice(["approve", "accept_risk"].includes(command) ? "当前账号没有该项目的审片权限" : "当前账号没有该项目的编辑权限"); return; }
     let runId = String(selectedNode.data.desktopPayload?.production_run_id || "");
     if (!runId) {
       const planning = String(selectedNode.data.desktopPayload?.planning_provider || ""), image = String(selectedNode.data.desktopPayload?.image_provider || ""), video = String(selectedNode.data.desktopPayload?.video_provider || "");
@@ -440,6 +575,7 @@ function CanvasApp() {
   const submitSelected = async () => {
     if (!selectedNode || !projectId) { setNotice("项目尚未同步完成，请稍后再试"); return; }
     if (!controlled) { setNotice("当前是私有预览；连接公司服务器后即可提交真实生成任务"); return; }
+    if (!canWrite) { setNotice("当前项目是只读状态，不能提交生成任务"); return; }
     if (selectedNode.data.specKey === "storyboard") {
       await productionCommand("start");
       return;
@@ -468,23 +604,23 @@ function CanvasApp() {
       }
     }
     const mapping: Record<string, { provider: string; operation: string; model: string }> = {
-      storyboard: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || payload.planning_model || "") },
-      script: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || "") },
-      copywriting: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || "") },
-      multi_image: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
-      scene_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
-      character_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
-      element_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
-      multi_director: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || "seedance"), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : hasDirectorFrame ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
-      video: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || "seedance"), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : incomingNodes.length ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
-      audio: { provider: String(payload.provider_name || "edge_tts"), operation: "text_to_speech", model: String(payload.voice || "") },
+      storyboard: { provider: String(payload.provider_name || ""), operation: "chat", model: String(payload.model || payload.planning_model || "") },
+      script: { provider: String(payload.provider_name || ""), operation: "chat", model: String(payload.model || "") },
+      copywriting: { provider: String(payload.provider_name || ""), operation: "chat", model: String(payload.model || "") },
+      multi_image: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
+      scene_reference: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
+      character_reference: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
+      element_reference: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
+      multi_director: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : hasDirectorFrame ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
+      video: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : incomingNodes.length ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
+      audio: { provider: String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "音效" ? "text_to_audio" : "text_to_speech", model: String(payload.voice || "") },
       analysis: { provider: "local", operation: "video_breakdown", model: "local" },
-      skill: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || "") },
-      shot: { provider: String(payload.provider_name || "seedream"), operation: "text_to_image", model: String(payload.model || "") },
+      skill: { provider: String(payload.provider_name || ""), operation: "chat", model: String(payload.model || "") },
+      shot: { provider: String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "生成视频" ? (incomingNodes.length ? "image_to_video" : "text_to_video") : String(payload.editor_action || "") === "生成对白" ? "text_to_speech" : incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || payload.voice || "") },
     };
     const task = mapping[specKey];
     if (!task) { setNotice("该运行节点由上游工作流自动驱动，不能单独提交"); return; }
-    if (task.provider !== "local" && !payload.provider_name) { setNotice("请先在节点设置中明确选择生成引擎；系统不会替你静默切换模型"); return; }
+    if (task.provider !== "local" && !task.provider) { setNotice("请先在节点设置中明确选择生成引擎；系统不会替你静默切换模型"); return; }
     if (specKey === "video" && payload.last_frame_asset_id) {
       const firstAvailable = incomingNodes.some((node) => String(node.data.desktopPayload?.asset_id || "") !== String(payload.last_frame_asset_id));
       if (!firstAvailable) { setNotice("尾帧不能单独生成视频，请再连接一张图片作为首帧"); return; }
@@ -528,6 +664,7 @@ function CanvasApp() {
   };
 
   const importDesktopProject = async (file: File) => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能导入工程"); return; }
     try {
       const imported = desktopProjectToWeb(JSON.parse(await file.text()));
       setNodes((imported.canvas.nodes as StudioNode[]).map(normalizeStudioNode));
@@ -541,6 +678,7 @@ function CanvasApp() {
   };
 
   const importMedia = async (files: File[]) => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能导入素材"); return; }
     if (!projectId) { setNotice("项目尚未同步完成，请稍后导入"); return; }
     let imported = 0;
     for (const [index, file] of files.entries()) {
@@ -560,13 +698,30 @@ function CanvasApp() {
     setNotice(imported ? `已导入 ${imported} 个素材节点 · 未自动保存到资产库` : "没有可导入的媒体文件");
   };
 
+  const arrangeCanvas = () => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能整理节点"); return; }
+    setNodes((current) => current.map((node, index) => ({ ...node, position: { x: 90 + (index % 4) * 350, y: 90 + Math.floor(index / 4) * 245 } })));
+    setNotice("节点已按网格整理并保存");
+  };
+
+  const commandQueueTask = async (task: QueueTask, operation: "pause" | "resume" | "cancel" | "retry") => {
+    if (!canWrite) { setNotice("当前项目是只读状态，不能操作任务"); return; }
+    const response = await apiFetch(`/api/tasks/${task.id}/${operation}`, { method: "POST" });
+    const data = await response.json() as { task?: { id: string; status: string }; detail?: string };
+    if (!response.ok || !data.task) { setNotice(data.detail || "任务操作失败"); return; }
+    const labels = { pause: "任务已暂停", resume: "任务已恢复排队", cancel: "任务已取消", retry: "重试任务已进入队列" };
+    setNotice(labels[operation]);
+    if (["resume", "retry"].includes(operation)) void pollTask(data.task.id, task.node_id);
+    void openSideView("tasks");
+  };
+
   return (
     <main className="studio-shell">
       <header className="topbar">
         <div className="brand-mark"><Clapperboard size={18} /></div>
         <div className="project-heading"><strong>Creative Engine</strong><span className="project-separator">/</span><button className="project-name">{projectTitle} <ChevronDown size={14} /></button></div>
-        <div className="topbar-center"><span className="live-dot" /><span>{notice}</span></div>
-        <div className="topbar-actions"><button className="team-button"><Users size={15} /> {user.role === "admin" ? "管理员" : "制片组"}</button><button className="icon-button" aria-label={user.role === "admin" ? "账号与权限" : "设置"} onClick={() => { if (user.role === "admin" && controlled) setAdminOpen(true); }}><Settings2 size={17} /></button><button className="avatar" title={controlled ? `${user.display_name} · 点击退出` : user.display_name} onClick={() => { if (controlled) void signOut(); }}>{(user.display_name || user.username || "制").slice(0, 1)}</button></div>
+        <div className="topbar-center"><span className="live-dot" /><span>{notice}</span>{projectConflict && <button onClick={() => void reloadProject()}>重新载入</button>}</div>
+        <div className="topbar-actions"><button className="team-button" onClick={() => { if (controlled && projectId) setTeamOpen(true); else setNotice("连接公司服务器后可管理项目成员"); }}><Users size={15} /> {user.role === "admin" ? "管理员" : "制片组"}</button><button className="icon-button" aria-label={user.role === "admin" ? "账号与权限" : "设置"} onClick={() => { if (user.role === "admin" && controlled) setAdminOpen(true); }}><Settings2 size={17} /></button><button className="avatar" title={controlled ? `${user.display_name} · 点击退出` : user.display_name} onClick={() => { if (controlled) void signOut(); }}>{(user.display_name || user.username || "制").slice(0, 1)}</button></div>
       </header>
 
       <section className="workspace">
@@ -575,42 +730,44 @@ function CanvasApp() {
           <button className={`rail-button ${sideView === "assets" ? "is-active" : ""}`} onClick={() => void openSideView("assets")}><FolderOpen size={18} /><span>资产</span></button>
           <button className={`rail-button ${sideView === "tasks" ? "is-active" : ""}`} onClick={() => void openSideView("tasks")}><Zap size={18} /><span>任务</span></button>
           <div className="rail-spacer" />
-          <button className="rail-button"><Menu size={18} /><span>菜单</span></button>
+          <button className="rail-button" onClick={() => { if (controlled && projectId) setTeamOpen(true); }}><Menu size={18} /><span>成员</span></button>
         </aside>
 
         <div className="canvas-wrap">
           <div className="canvas-context"><span>AI 制片画布</span><span className="context-divider" /><span>{nodes.length} 个节点</span><span>{edges.length} 条工作流连接</span></div>
           <ReactFlow<StudioNode, Edge>
             nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
-            onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect}
+            onNodesChange={canWrite ? onNodesChange : undefined} onEdgesChange={canWrite ? onEdgesChange : undefined} onConnect={onConnect}
             onNodeClick={(_, node) => setSelectedId(node.id)} onPaneClick={() => setCreateOpen(false)}
             fitView fitViewOptions={{ padding: 0.18 }} minZoom={0.18} maxZoom={1.8}
-            proOptions={{ hideAttribution: true }} deleteKeyCode={["Backspace", "Delete"]}>
+            nodesDraggable={canWrite} nodesConnectable={canWrite} edgesReconnectable={canWrite}
+            proOptions={{ hideAttribution: true }} deleteKeyCode={canWrite ? ["Backspace", "Delete"] : null}>
             <Background color="#2b2f38" gap={28} size={1} variant={BackgroundVariant.Dots} />
             <Controls position="bottom-left" showInteractive={false} />
             <MiniMap position="bottom-right" nodeColor={(node) => (node.data as StudioData).accent} maskColor="rgba(8, 10, 14, .72)" pannable zoomable />
           </ReactFlow>
-          {sideView !== "canvas" && <aside className="canvas-side-panel"><header><div><strong>{sideView === "assets" ? "资产库副本" : "公司任务队列"}</strong><span>{sideView === "assets" ? "只有主动保存的媒体才进入这里" : "查看生成进度、失败原因并阻止重复提交"}</span></div><button onClick={() => setSideView("canvas")}><X size={16} /></button></header>{sideView === "assets" ? <div className="side-list">{libraryAssets.length ? libraryAssets.map((asset) => <article key={asset.id}><span className="side-kind">{asset.kind}</span><div><strong>{asset.name}</strong><small>{Math.max(1, Math.round(asset.size / 1024))} KB</small></div><button onClick={() => copyAssetToCanvas(asset)}>复制到画布</button></article>) : <p>还没有保存到资产库的媒体。</p>}</div> : <div className="side-list">{queueTasks.length ? queueTasks.map((task) => <article key={task.id}><span className={`task-state state-${task.status}`}>{task.progress}%</span><div><strong>{task.kind} · {task.provider || "local"}</strong><small>{task.status}{task.error_message ? ` · ${task.error_message}` : ""}</small></div>{["queued", "running", "paused"].includes(task.status) ? <button onClick={async () => { await apiFetch(`/api/tasks/${task.id}/cancel`, { method: "POST" }); void openSideView("tasks"); }}>取消</button> : ["failed", "cancelled"].includes(task.status) ? <button onClick={async () => { const response = await apiFetch(`/api/tasks/${task.id}/retry`, { method: "POST" }); const data = await response.json() as { task?: { id: string }; detail?: string }; if (!response.ok || !data.task) { setNotice(data.detail || "重试失败"); return; } setNotice("重试任务已进入队列"); void pollTask(data.task.id, task.node_id); void openSideView("tasks"); }}>重试</button> : null}</article>) : <p>当前项目还没有任务。</p>}</div>}</aside>}
+          {sideView !== "canvas" && <aside className="canvas-side-panel"><header><div><strong>{sideView === "assets" ? "资产库副本" : "公司任务队列"}</strong><span>{sideView === "assets" ? "只有主动保存的媒体才进入这里" : "查看生成进度、失败原因并阻止重复提交"}</span></div><button onClick={() => setSideView("canvas")}><X size={16} /></button></header>{sideView === "assets" ? <div className="side-list">{libraryAssets.length ? libraryAssets.map((asset) => <article key={asset.id}><span className="side-kind">{asset.kind}</span><div><strong>{asset.name}</strong><small>{Math.max(1, Math.round(asset.size / 1024))} KB</small></div><button onClick={() => copyAssetToCanvas(asset)}>复制到画布</button></article>) : <p>还没有保存到资产库的媒体。</p>}</div> : <div className="side-list">{queueTasks.length ? queueTasks.map((task) => <article key={task.id}><span className={`task-state state-${task.status}`}>{task.progress}%</span><div><strong>{task.kind} · {task.provider || "local"}</strong><small>{task.status === "workflow_waiting" ? "工作流中等待前序节点" : task.status}{task.error_message ? ` · ${task.error_message}` : ""}{task.managed_by !== "task" && ["failed", "cancelled"].includes(task.status) ? " · 请在所属流程节点恢复" : ""}</small></div><span className="task-actions">{task.managed_by === "task" && task.status === "queued" && <button onClick={() => void commandQueueTask(task, "pause")}>暂停</button>}{task.managed_by === "task" && task.status === "paused" && <button onClick={() => void commandQueueTask(task, "resume")}>继续</button>}{task.managed_by === "task" && ["queued", "running", "paused"].includes(task.status) && <button onClick={() => void commandQueueTask(task, "cancel")}>取消</button>}{task.managed_by === "task" && ["failed", "cancelled"].includes(task.status) && <button onClick={() => void commandQueueTask(task, "retry")}>重试</button>}</span></article>) : <p>当前项目还没有任务。</p>}</div>}</aside>}
 
           <div className="dock-wrap">
             <nav className="creation-dock" aria-label="画布程序坞">
               <button className="dock-primary" onClick={() => setCreateOpen((value) => !value)}><Plus size={17} /> 新建</button>
-              <button><CirclePlay size={16} /> 开始制片</button><button><Redo2 size={16} /> 重做</button>
+              <button onClick={() => { if (selectedNode?.data.specKey === "storyboard") void submitSelected(); else { const story = nodes.find((node) => node.data.specKey === "storyboard"); if (story) { setSelectedId(story.id); setNotice("已定位 AI 故事板，请锁定三个引擎后开始制片"); } else setNotice("请先新建 AI 故事板节点"); } }}><CirclePlay size={16} /> 开始制片</button><button onClick={() => { if (selectedNode?.data.specKey === "storyboard") void productionCommand("rewind", Number(selectedNode.data.desktopPayload?.rewind_stage || 1)); else setNotice("请选择一个 AI 故事板节点再重做"); }}><Redo2 size={16} /> 重做</button>
               <button onClick={() => projectInputRef.current?.click()}><FolderOpen size={16} /> 工程</button><button onClick={() => importInputRef.current?.click()}><Import size={16} /> 导入</button>
-              <button><LayoutGrid size={16} /> 整理</button><button><Boxes size={16} /> 资产</button>
+              <button onClick={arrangeCanvas}><LayoutGrid size={16} /> 整理</button><button onClick={() => void openSideView("assets")}><Boxes size={16} /> 资产</button>
             </nav>
             <input ref={projectInputRef} className="hidden-file-input" type="file" accept=".cepstudio,.json,application/json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importDesktopProject(file); event.currentTarget.value = ""; }} />
             <input ref={importInputRef} className="hidden-file-input" type="file" multiple accept="image/*,video/*,audio/*" onChange={(event) => { const files = [...(event.target.files || [])]; if (files.length) void importMedia(files); event.currentTarget.value = ""; }} />
             {createOpen && <div className="create-popover">
               <div className="popover-heading"><div><strong>创建画布节点</strong><span>高频创作能力</span></div><button className="icon-button" onClick={() => setCreateOpen(false)}><X size={16} /></button></div>
-              <div className="creation-list">{CREATION_GROUPS.map((group) => <section key={group.key} className="creation-group"><h4>{group.label}</h4>{creationItems.filter((item) => item.group === group.key).map((item) => { const Icon = kindIcons[item.kind]; return <button key={item.key} onClick={() => addNode(item, crypto.randomUUID())}><span className="creation-icon" style={{ color: item.accent }}><Icon size={17} /></span><span><strong>{item.title}</strong><small>{item.description}</small></span></button>; })}</section>)}</div>
+              <div className="creation-list">{workflowTemplates.length > 0 && <section className="creation-group workflow-template-group"><h4>我的工作流模板</h4>{workflowTemplates.map((template) => <button key={template.id} onClick={() => instantiateWorkflowTemplate(template)}><span className="creation-icon template-icon"><Workflow size={17} /></span><span><strong>{template.name}</strong><small>恢复整组节点与内部连线</small></span></button>)}</section>}{CREATION_GROUPS.map((group) => <section key={group.key} className="creation-group"><h4>{group.label}</h4>{creationItems.filter((item) => item.group === group.key).map((item) => { const Icon = kindIcons[item.kind]; return <button key={item.key} onClick={() => addNode(item, crypto.randomUUID())}><span className="creation-icon" style={{ color: item.accent }}><Icon size={17} /></span><span><strong>{item.title}</strong><small>{item.description}</small></span></button>; })}</section>)}</div>
             </div>}
           </div>
         </div>
 
         <aside className="inspector">
           <div className="inspector-heading"><div><span>节点设置</span><strong>{selectedNode?.data.title}</strong></div><button className="icon-button"><MoreHorizontal size={18} /></button></div>
-          {selectedNode && <div className="inspector-body">
+          {selectedNode && <div className={`inspector-body ${!canWrite ? "is-readonly" : ""}`}>
+            {!canWrite && <p className="readonly-banner">当前权限：{canReview ? "仅审片" : "只读"}。生成、连线和修改均由服务器禁止。</p>}
             <div className="selected-kind" style={{ "--node-accent": selectedNode.data.accent } as React.CSSProperties}>
               {(() => { const Icon = kindIcons[selectedNode.data.kind]; return <Icon size={18} />; })()}
               <div><strong>{selectedNode.data.status}</strong><span>{selectedNode.data.meta}</span></div>
@@ -633,6 +790,7 @@ function CanvasApp() {
       </section>
       {pendingTask && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPendingTask(null); }}><section className="task-confirm" role="dialog" aria-modal="true" aria-labelledby="task-confirm-title"><header><div><Zap size={18} /><span><strong id="task-confirm-title">确认提交生成任务</strong><small>由公司服务器校验账号、模型和额度</small></span></div><button onClick={() => setPendingTask(null)} aria-label="关闭"><X size={17} /></button></header><div className="task-confirm-body"><dl><div><dt>操作</dt><dd>{pendingTask.action}</dd></div><div><dt>锁定模型</dt><dd>{pendingTask.model}</dd></div><div><dt>额度预估</dt><dd>{pendingTask.credits} credits</dd></div></dl><p>提交后不会静默换模型；重复请求会通过幂等键拦截。生成结果先进入画布，只有手动点击才会复制到资产库。</p><div><button onClick={() => setPendingTask(null)}>取消</button><button className="confirm-primary" onClick={() => void pendingTask.run()}>确认并提交</button></div></div></section></div>}
       {adminOpen && <AdminPanel onClose={() => setAdminOpen(false)} />}
+      {teamOpen && <TeamPanel projectId={projectId} onClose={() => setTeamOpen(false)} />}
     </main>
   );
 }

@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from creative_server.database import SessionLocal, create_schema  # noqa: E402
 from creative_server.main import app  # noqa: E402
-from creative_server.models import Asset, GenerationTask, Project, UsageLimit, User  # noqa: E402
+from creative_server.models import Asset, GenerationTask, ProductionRun, Project, WorkflowRun, UsageLimit, User  # noqa: E402
 from creative_server.security import hash_password  # noqa: E402
 
 
@@ -24,7 +24,7 @@ def seed_admin() -> None:
         if existing: return
         admin = User(username="admin", display_name="管理员", password_hash=hash_password("Correct-Horse-42!"), role="admin", status="active")
         db.add(admin); db.flush()
-        db.add(UsageLimit(user_id=admin.id, daily_tasks=100, daily_credits=100000, concurrent_tasks=10, allow_paid_models=True, allowed_models_json="[]"))
+        db.add(UsageLimit(user_id=admin.id, daily_tasks=100, daily_credits=100000, concurrent_tasks=10, allow_paid_models=True, allowed_models_json='["openai","seedream","seedream-v4","seedance","veo","gptimage"]'))
         db.commit()
 
 
@@ -39,7 +39,7 @@ def test_admin_controls_accounts_and_task_limits() -> None:
     with TestClient(app) as admin_client:
         admin_csrf = login(admin_client, "admin", "Correct-Horse-42!")
         created = admin_client.post("/api/admin/users", headers={"x-csrf-token": admin_csrf}, json={
-            "username": "artist.one", "display_name": "美术一号", "password": "Artist-Secure-42!", "role": "viewer",
+            "username": "artist.one", "display_name": "美术一号", "password": "Artist-Secure-42!", "role": "viewer", "approved": True,
             "daily_tasks": 2, "daily_credits": 20, "concurrent_tasks": 1, "allow_paid_models": False,
         })
         assert created.status_code == 201, created.text
@@ -195,3 +195,88 @@ def test_provider_reference_limit_is_enforced_without_silent_truncation() -> Non
             response = client.post("/api/tasks", headers={"x-csrf-token": csrf, "idempotency-key": "too-many-references"}, json={"project_id": project_id, "node_id": "director-1", "kind": "text_to_video", "provider": "seedance", "input": {"inputs": {"prompt": "test", "references": references}}})
             assert response.status_code == 422
             assert "不会静默丢图" in response.json()["detail"]
+
+
+def test_durable_workflow_reserves_all_children_and_runs_sequentially() -> None:
+    seed_admin()
+    with TestClient(app) as client:
+        csrf = login(client, "admin", "Correct-Horse-42!")
+        project = client.post("/api/projects", headers={"x-csrf-token": csrf}, json={"title": "持久工作流", "canvas": {"protocol": "creative-engine-canvas", "version": 1, "nodes": [], "edges": []}})
+        project_id = project.json()["project"]["id"]
+        items = [{"node_id": f"audio-{index}", "kind": "text_to_speech", "provider": "edge_tts", "input": {"inputs": {"prompt": f"第{index}段"}}} for index in range(1, 4)]
+        created = client.post("/api/workflow-runs", headers={"x-csrf-token": csrf}, json={"project_id": project_id, "node_id": "workflow-1", "items": items})
+        assert created.status_code == 201, created.text
+        run_id = created.json()["run"]["id"]
+        with SessionLocal() as db:
+            run = db.get(WorkflowRun, run_id)
+            tasks = db.query(GenerationTask).filter(GenerationTask.idempotency_key.like(f"workflow:{run_id}:%")).order_by(GenerationTask.created_at).all()
+            assert len(tasks) == 3
+            assert [task.status for task in tasks] == ["queued", "workflow_waiting", "workflow_waiting"]
+            first_id, second_id, third_id = [task.id for task in tasks]
+            assert run.active_task_id == first_id
+
+        paused = client.post(f"/api/workflow-runs/{run_id}/command", headers={"x-csrf-token": csrf}, json={"command": "pause"})
+        assert paused.json()["run"]["status"] == "paused"
+        with SessionLocal() as db:
+            assert db.get(GenerationTask, first_id).status == "paused"
+        resumed = client.post(f"/api/workflow-runs/{run_id}/command", headers={"x-csrf-token": csrf}, json={"command": "resume"})
+        assert resumed.json()["run"]["status"] == "running"
+        with SessionLocal.begin() as db:
+            db.get(GenerationTask, first_id).status = "completed"
+        from creative_server.workflows import on_workflow_task_finished
+        on_workflow_task_finished(first_id, True)
+        with SessionLocal() as db:
+            assert db.get(WorkflowRun, run_id).active_task_id == second_id
+            assert db.get(GenerationTask, second_id).status == "queued"
+            db.get(GenerationTask, second_id).status = "failed"; db.commit()
+        on_workflow_task_finished(second_id, False, "模拟失败")
+        failed = client.get(f"/api/workflow-runs/{run_id}").json()["run"]
+        assert failed["status"] == "failed" and failed["current_index"] == 1
+        retried = client.post(f"/api/workflow-runs/{run_id}/command", headers={"x-csrf-token": csrf}, json={"command": "retry"})
+        assert retried.status_code == 200, retried.text
+        retry_id = retried.json()["run"]["active_task_id"]
+        assert retry_id not in (first_id, second_id, third_id)
+        with SessionLocal.begin() as db:
+            db.get(GenerationTask, retry_id).status = "completed"
+        on_workflow_task_finished(retry_id, True)
+        with SessionLocal() as db:
+            run = db.get(WorkflowRun, run_id)
+            assert run.active_task_id == third_id
+            assert db.get(GenerationTask, third_id).status == "queued"
+            db.get(GenerationTask, third_id).status = "completed"; db.commit()
+        on_workflow_task_finished(third_id, True)
+        assert client.get(f"/api/workflow-runs/{run_id}").json()["run"]["status"] == "completed"
+
+
+def test_project_membership_reviewer_and_template_permissions() -> None:
+    seed_admin()
+    with TestClient(app) as admin_client:
+        csrf = login(admin_client, "admin", "Correct-Horse-42!")
+        project = admin_client.post("/api/projects", headers={"x-csrf-token": csrf}, json={"title": "协作权限", "canvas": {"protocol": "creative-engine-canvas", "version": 1, "nodes": [], "edges": []}})
+        project_id = project.json()["project"]["id"]
+        for username, role in (("review.one", "reviewer"), ("view.one", "viewer")):
+            created = admin_client.post("/api/admin/users", headers={"x-csrf-token": csrf}, json={"username": username, "display_name": username, "password": "Member-Secure-42!", "role": role, "approved": True})
+            assert created.status_code == 201, created.text
+            member = admin_client.post(f"/api/projects/{project_id}/members", headers={"x-csrf-token": csrf}, json={"username": username, "role": "reviewer" if role == "reviewer" else "viewer"})
+            assert member.status_code == 201, member.text
+        template = admin_client.post("/api/workflow-templates", headers={"x-csrf-token": csrf}, json={"name": "两段式模板", "definition": {"nodes": [{"id": "a"}], "edges": []}})
+        assert template.status_code == 201, template.text
+        assert any(item["name"] == "两段式模板" for item in admin_client.get("/api/workflow-templates").json()["templates"])
+        with SessionLocal() as db:
+            admin = db.query(User).filter(User.username == "admin").first()
+            run = ProductionRun(project_id=project_id, node_id="story-1", owner_id=admin.id, status="waiting_review", stage=2, completed_stage=1)
+            db.add(run); db.commit(); run_id = run.id
+
+    with TestClient(app) as reviewer:
+        reviewer_csrf = login(reviewer, "review.one", "Member-Secure-42!")
+        members = reviewer.get(f"/api/projects/{project_id}/members")
+        assert members.status_code == 200 and members.json()["can_manage"] is False
+        approved = reviewer.post(f"/api/production-runs/{run_id}/command", headers={"x-csrf-token": reviewer_csrf}, json={"command": "accept_risk"})
+        assert approved.status_code == 200, approved.text
+        forbidden = reviewer.patch(f"/api/projects/{project_id}", headers={"x-csrf-token": reviewer_csrf}, json={"title": "越权", "canvas": {"protocol": "creative-engine-canvas", "version": 1, "nodes": [], "edges": []}, "expectedVersion": 1})
+        assert forbidden.status_code == 403
+
+    with TestClient(app) as viewer:
+        viewer_csrf = login(viewer, "view.one", "Member-Secure-42!")
+        forbidden = viewer.post(f"/api/projects/{project_id}/members", headers={"x-csrf-token": viewer_csrf}, json={"username": "review.one", "role": "editor"})
+        assert forbidden.status_code == 403

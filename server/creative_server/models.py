@@ -187,3 +187,31 @@ class ProductionEvent(Base):
     stage: Mapped[int] = mapped_column(Integer)
     detail_json: Mapped[str] = mapped_column(Text, default="{}")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class WorkflowRun(Base):
+    __tablename__ = "workflow_runs"
+    __table_args__ = (Index("idx_workflow_run_project_created", "project_id", "created_at"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    project_id: Mapped[str] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    node_id: Mapped[str] = mapped_column(String(128), index=True)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    status: Mapped[str] = mapped_column(String(24), default="ready", index=True)
+    current_index: Mapped[int] = mapped_column(Integer, default=0)
+    total_items: Mapped[int] = mapped_column(Integer, default=0)
+    active_task_id: Mapped[str | None] = mapped_column(String(32), nullable=True, index=True)
+    items_json: Mapped[str] = mapped_column(Text, default="[]")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
+class WorkflowTemplate(Base):
+    __tablename__ = "workflow_templates"
+    __table_args__ = (Index("idx_workflow_template_owner_created", "owner_id", "created_at"),)
+    id: Mapped[str] = mapped_column(String(32), primary_key=True, default=new_id)
+    owner_id: Mapped[str] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(160))
+    definition_json: Mapped[str] = mapped_column(Text, default="{}")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)

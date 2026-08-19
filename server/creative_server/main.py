@@ -16,14 +16,16 @@ from .audit import client_ip, record_audit
 from .config import Settings, get_settings
 from .database import create_schema, get_db
 from .dependencies import current_user, require_admin, require_csrf
-from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, UsageLimit, User
+from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, UsageLimit, User, WorkflowRun, WorkflowTemplate
 from .production import handle_command
 from .production_state import STAGES
 from .provider_catalog import available_providers
-from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate
+from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectMemberCreate, ProjectMemberUpdate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate, WorkflowCommand, WorkflowRunCreate, WorkflowTemplateCreate
 from .security import DUMMY_PASSWORD_HASH, expiry, hash_password, opaque_token, token_hash, utcnow, validate_password, validate_username, verify_password
 from .storage import media_kind, resolve_object, save_upload
-from .task_policy import enforce_task_policy, estimate_task_credits, require_project_read, require_project_write
+from .task_policy import enforce_existing_task_policy, enforce_task_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
+from .task_validation import validate_task_request
+from .workflows import command_workflow, initialize_workflow_tasks, prepare_workflow_items, public_workflow_run
 
 
 def _aware(value):
@@ -49,6 +51,14 @@ def public_asset(asset: Asset) -> dict:
 
 def public_run(run: ProductionRun) -> dict:
     return {"id": run.id, "project_id": run.project_id, "node_id": run.node_id, "automation_mode": run.automation_mode, "provider_locks": json.loads(run.provider_locks_json or "{}"), "status": run.status, "resume_status": run.resume_status, "stage": run.stage, "stage_name": STAGES.get(run.stage, ""), "completed_stage": run.completed_stage, "active_task_id": run.active_task_id, "risk_accepted_stages": json.loads(run.risk_accepted_json or "[]"), "error_message": run.error_message, "updated_at": run.updated_at.isoformat()}
+
+
+def require_project_membership_admin(db: Session, project_id: str, user: User) -> Project:
+    project = db.get(Project, project_id)
+    if not project: raise HTTPException(status.HTTP_404_NOT_FOUND, "项目不存在")
+    if project.owner_id != user.id and user.role != "admin":
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "只有项目所有者或管理员可以管理成员")
+    return project
 
 
 @asynccontextmanager
@@ -146,8 +156,7 @@ def providers(user: User = Depends(current_user), db: Session = Depends(get_db))
     limits = db.get(UsageLimit, user.id)
     allowed = set(json.loads(limits.allowed_models_json or "[]")) if limits else set()
     values = available_providers()
-    if allowed:
-        values = [item for item in values if item["name"] in allowed or any(str(value).startswith(f"{item['name']}:") for value in allowed)]
+    values = [item for item in values if item["name"] == "edge_tts" or item["name"] in allowed or any(str(value).startswith(f"{item['name']}:") for value in allowed)]
     return {"providers": values, "paid_enabled": bool(limits and limits.allow_paid_models)}
 
 
@@ -161,6 +170,8 @@ def list_projects(user: User = Depends(current_user), db: Session = Depends(get_
 
 @app.post("/api/projects", status_code=201)
 def create_project(payload: ProjectCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    if user.role not in ("admin", "producer", "director", "editor"):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "当前角色不能创建项目，请由制片人创建后再加入成员")
     project = Project(owner_id=user.id, title=payload.title.strip(), canvas_json=payload.canvas.model_dump_json(by_alias=True))
     db.add(project); db.flush(); db.add(ProjectMember(project_id=project.id, user_id=user.id, role="owner"))
     record_audit(db, request, "project.created", user, "project", project.id); db.commit()
@@ -183,6 +194,48 @@ def update_project(project_id: str, payload: ProjectUpdate, request: Request, us
     project.version += 1; project.updated_at = utcnow()
     record_audit(db, request, "project.updated", user, "project", project.id, {"version": project.version}); db.commit()
     return {"project": public_project(project)}
+
+
+@app.get("/api/projects/{project_id}/members")
+def list_project_members(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    project = require_project_read(db, project_id, user)
+    rows = db.execute(select(ProjectMember, User).join(User, User.id == ProjectMember.user_id).where(ProjectMember.project_id == project_id).order_by(ProjectMember.role, User.display_name)).all()
+    return {"can_manage": user.role == "admin" or project.owner_id == user.id, "members": [{"id": member.id, "user_id": account.id, "username": account.username, "display_name": account.display_name, "account_status": account.status, "role": member.role} for member, account in rows]}
+
+
+@app.post("/api/projects/{project_id}/members", status_code=201)
+def add_project_member(project_id: str, payload: ProjectMemberCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    project = require_project_membership_admin(db, project_id, user)
+    account = db.scalar(select(User).where(User.username == payload.username.strip().lower()))
+    if not account: raise HTTPException(status.HTTP_404_NOT_FOUND, "账号不存在，请先由管理员创建账号")
+    if account.status != "active": raise HTTPException(status.HTTP_409_CONFLICT, "该账号尚未获准登录，不能加入项目")
+    if account.id == project.owner_id: raise HTTPException(status.HTTP_409_CONFLICT, "项目所有者已经在成员列表中")
+    member = db.scalar(select(ProjectMember).where(ProjectMember.project_id == project_id, ProjectMember.user_id == account.id))
+    if member: member.role = payload.role
+    else: member = ProjectMember(project_id=project_id, user_id=account.id, role=payload.role); db.add(member); db.flush()
+    record_audit(db, request, "project.member_saved", user, "project_member", member.id, {"project_id": project_id, "username": account.username, "role": member.role}); db.commit()
+    return {"member": {"id": member.id, "user_id": account.id, "username": account.username, "display_name": account.display_name, "account_status": account.status, "role": member.role}}
+
+
+@app.patch("/api/projects/{project_id}/members/{member_id}")
+def update_project_member(project_id: str, member_id: str, payload: ProjectMemberUpdate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    require_project_membership_admin(db, project_id, user)
+    member = db.get(ProjectMember, member_id)
+    if not member or member.project_id != project_id: raise HTTPException(status.HTTP_404_NOT_FOUND, "项目成员不存在")
+    if member.role == "owner": raise HTTPException(status.HTTP_409_CONFLICT, "不能修改项目所有者权限")
+    member.role = payload.role; record_audit(db, request, "project.member_role_updated", user, "project_member", member.id, {"project_id": project_id, "role": member.role}); db.commit()
+    account = db.get(User, member.user_id)
+    return {"member": {"id": member.id, "user_id": account.id, "username": account.username, "display_name": account.display_name, "account_status": account.status, "role": member.role}}
+
+
+@app.delete("/api/projects/{project_id}/members/{member_id}")
+def remove_project_member(project_id: str, member_id: str, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    require_project_membership_admin(db, project_id, user)
+    member = db.get(ProjectMember, member_id)
+    if not member or member.project_id != project_id: raise HTTPException(status.HTTP_404_NOT_FOUND, "项目成员不存在")
+    if member.role == "owner": raise HTTPException(status.HTTP_409_CONFLICT, "不能移除项目所有者")
+    record_audit(db, request, "project.member_removed", user, "project_member", member.id, {"project_id": project_id, "user_id": member.user_id}); db.delete(member); db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/assets")
@@ -252,7 +305,10 @@ def get_production_run(run_id: str, user: User = Depends(current_user), db: Sess
 def command_production_run(run_id: str, payload: ProductionCommand, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
     run = db.get(ProductionRun, run_id)
     if not run: raise HTTPException(status.HTTP_404_NOT_FOUND, "制片流程不存在")
-    require_project_write(db, run.project_id, user)
+    if payload.command in ("approve", "accept_risk"):
+        require_project_review(db, run.project_id, user)
+    else:
+        require_project_write(db, run.project_id, user)
     handle_command(db, run, payload.command, user.id, payload.target_stage)
     record_audit(db, request, f"production.{payload.command}", user, "production_run", run.id, {"stage": run.stage, "target_stage": payload.target_stage}); db.commit()
     return {"run": public_run(run)}
@@ -264,7 +320,15 @@ def list_users(_: User = Depends(current_user), db: Session = Depends(get_db)) -
     if _.role != "admin":
         raise HTTPException(status.HTTP_403_FORBIDDEN, "只有管理员可以查看账号")
     users = db.scalars(select(User).order_by(User.created_at.desc())).all()
-    return {"users": [public_user(user, db.get(UsageLimit, user.id)) for user in users]}
+    now = utcnow()
+    result = []
+    for user in users:
+        payload = public_user(user, db.get(UsageLimit, user.id))
+        payload["active_sessions"] = db.scalar(select(func.count()).select_from(LoginSession).where(LoginSession.user_id == user.id, LoginSession.revoked_at.is_(None), LoginSession.expires_at > now)) or 0
+        last_login = db.scalar(select(func.max(LoginSession.created_at)).where(LoginSession.user_id == user.id))
+        payload["last_login_at"] = last_login.isoformat() if last_login else None
+        result.append(payload)
+    return {"users": result}
 
 
 @app.post("/api/admin/users", status_code=201)
@@ -292,14 +356,21 @@ def update_user(user_id: str, payload: UserUpdate, request: Request, admin: User
         raise HTTPException(status.HTTP_404_NOT_FOUND, "账号不存在")
     if user.id == admin.id and payload.status == "suspended":
         raise HTTPException(status.HTTP_409_CONFLICT, "不能停用当前管理员自己")
+    removing_admin = user.role == "admin" and ((payload.role is not None and payload.role != "admin") or (payload.status is not None and payload.status != "active"))
+    if removing_admin:
+        other_admins = db.scalar(select(func.count()).select_from(User).where(User.id != user.id, User.role == "admin", User.status == "active")) or 0
+        if other_admins == 0:
+            raise HTTPException(status.HTTP_409_CONFLICT, "不能停用或降级最后一个有效管理员")
     values = payload.model_dump(exclude_unset=True)
     for key in ("display_name", "role", "status"):
         if key in values:
             setattr(user, key, values[key])
+    revoke_sessions = bool(payload.password or "role" in values or "status" in values)
     if payload.password:
         try: user.password_hash = hash_password(validate_password(payload.password, user.username))
         except ValueError as error: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(error)) from error
         user.password_changed_at = utcnow()
+    if revoke_sessions:
         db.execute(delete(LoginSession).where(LoginSession.user_id == user.id))
     limits = db.get(UsageLimit, user.id) or UsageLimit(user_id=user.id)
     for key in ("daily_tasks", "daily_credits", "concurrent_tasks", "allow_paid_models"):
@@ -307,6 +378,15 @@ def update_user(user_id: str, payload: UserUpdate, request: Request, admin: User
     if payload.allowed_models is not None: limits.allowed_models_json = json.dumps(payload.allowed_models, ensure_ascii=False)
     db.add(limits); record_audit(db, request, "admin.user_updated", admin, "user", user.id, {"fields": sorted(values)}); db.commit()
     return {"user": public_user(user, limits)}
+
+
+@app.post("/api/admin/users/{user_id}/revoke-sessions")
+def revoke_user_sessions(user_id: str, request: Request, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, user_id)
+    if not user: raise HTTPException(status.HTTP_404_NOT_FOUND, "账号不存在")
+    removed = db.execute(delete(LoginSession).where(LoginSession.user_id == user.id)).rowcount or 0
+    record_audit(db, request, "admin.sessions_revoked", admin, "user", user.id, {"sessions": removed}); db.commit()
+    return {"ok": True, "revoked": removed}
 
 
 @app.get("/api/admin/usage")
@@ -325,6 +405,73 @@ def admin_audit(limit: int = 100, user: User = Depends(current_user), db: Sessio
     return {"events": [{"id": item.id, "actor_id": item.actor_id, "action": item.action, "target_type": item.target_type, "target_id": item.target_id, "ip_address": item.ip_address, "detail": json.loads(item.detail_json or "{}"), "created_at": item.created_at.isoformat()} for item in items]}
 
 
+@app.post("/api/workflow-runs/quote")
+def quote_workflow_run(payload: WorkflowRunCreate, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    require_project_write(db, payload.project_id, user)
+    prepared, total_credits = prepare_workflow_items(db, user, payload)
+    return {"quote": {"items": len(prepared), "credits": total_credits}}
+
+
+@app.post("/api/workflow-runs", status_code=201)
+def create_workflow_run(payload: WorkflowRunCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    require_project_write(db, payload.project_id, user)
+    prepared, total_credits = prepare_workflow_items(db, user, payload)
+    run = WorkflowRun(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, status="ready", current_index=0, total_items=len(prepared), items_json=json.dumps(prepared, ensure_ascii=False, separators=(",", ":")))
+    db.add(run); db.flush(); initialize_workflow_tasks(db, run)
+    record_audit(db, request, "workflow.created", user, "workflow_run", run.id, {"items": len(prepared), "credits": total_credits}); db.commit()
+    return {"run": public_workflow_run(run)}
+
+
+@app.get("/api/workflow-runs")
+def list_workflow_runs(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_project_read(db, project_id, user)
+    items = db.scalars(select(WorkflowRun).where(WorkflowRun.project_id == project_id).order_by(WorkflowRun.created_at.desc()).limit(100)).all()
+    return {"runs": [public_workflow_run(item) for item in items]}
+
+
+@app.get("/api/workflow-runs/{run_id}")
+def get_workflow_run(run_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    run = db.get(WorkflowRun, run_id)
+    if not run: raise HTTPException(status.HTTP_404_NOT_FOUND, "工作流不存在")
+    require_project_read(db, run.project_id, user)
+    return {"run": public_workflow_run(run)}
+
+
+@app.post("/api/workflow-runs/{run_id}/command")
+def command_workflow_run(run_id: str, payload: WorkflowCommand, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    run = db.get(WorkflowRun, run_id)
+    if not run: raise HTTPException(status.HTTP_404_NOT_FOUND, "工作流不存在")
+    require_project_write(db, run.project_id, user)
+    command_workflow(db, run, payload.command, user)
+    record_audit(db, request, f"workflow.{payload.command}", user, "workflow_run", run.id, {"current_index": run.current_index}); db.commit()
+    return {"run": public_workflow_run(run)}
+
+
+@app.get("/api/workflow-templates")
+def list_workflow_templates(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    items = db.scalars(select(WorkflowTemplate).where(WorkflowTemplate.owner_id == user.id).order_by(WorkflowTemplate.updated_at.desc())).all()
+    return {"templates": [{"id": item.id, "name": item.name, "definition": json.loads(item.definition_json or "{}"), "created_at": item.created_at.isoformat(), "updated_at": item.updated_at.isoformat()} for item in items]}
+
+
+@app.post("/api/workflow-templates", status_code=201)
+def create_workflow_template(payload: WorkflowTemplateCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    encoded = json.dumps(payload.definition, ensure_ascii=False, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 1_000_000: raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "工作流模板超过 1 MB")
+    nodes = payload.definition.get("nodes", []) if isinstance(payload.definition, dict) else []
+    if not isinstance(nodes, list) or not nodes or len(nodes) > 50: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "工作流模板必须包含 1–50 个节点")
+    item = WorkflowTemplate(owner_id=user.id, name=payload.name.strip(), definition_json=encoded)
+    db.add(item); db.flush(); record_audit(db, request, "workflow.template_created", user, "workflow_template", item.id, {"name": item.name, "nodes": len(nodes)}); db.commit()
+    return {"template": {"id": item.id, "name": item.name, "definition": payload.definition, "created_at": item.created_at.isoformat(), "updated_at": item.updated_at.isoformat()}}
+
+
+@app.delete("/api/workflow-templates/{template_id}")
+def delete_workflow_template(template_id: str, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    item = db.get(WorkflowTemplate, template_id)
+    if not item or item.owner_id != user.id: raise HTTPException(status.HTTP_404_NOT_FOUND, "工作流模板不存在")
+    record_audit(db, request, "workflow.template_deleted", user, "workflow_template", item.id); db.delete(item); db.commit()
+    return {"ok": True}
+
+
 @app.post("/api/tasks", status_code=202)
 def create_task(payload: TaskCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
     idem = (request.headers.get("idempotency-key") or "").strip()
@@ -334,22 +481,7 @@ def create_task(payload: TaskCreate, request: Request, user: User = Depends(requ
     if existing:
         return {"task": {"id": existing.id, "status": existing.status, "progress": existing.progress}, "deduplicated": True}
     require_project_write(db, payload.project_id, user)
-    profile = next((item for item in available_providers() if item["name"] == payload.provider), None)
-    references = payload.input.get("inputs", {}).get("references", []) if isinstance(payload.input.get("inputs"), dict) else []
-    provider_operation = "image_to_video" if payload.kind == "continue_video" else payload.kind
-    if payload.provider != "local" and (not profile or provider_operation not in profile.get("capabilities", [])):
-        raise HTTPException(status.HTTP_409_CONFLICT, f"已选择引擎 {payload.provider or '空'} 当前不可用或不支持 {provider_operation}；任务未入队，系统不会静默切换")
-    reference_limit = int((profile or {}).get("profile", {}).get("reference_assets") or 0)
-    if reference_limit and isinstance(references, list) and len(references) > reference_limit:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{payload.provider} 当前单次最多支持 {reference_limit} 张参考图；请减少输入或拆成连续段落，系统不会静默丢图")
-    if payload.kind in ("image_edit", "image_to_video", "continue_video", "extract_video_frames", "video_breakdown"):
-        if not isinstance(references, list) or not references:
-            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "该操作必须连接一个已生成或已上传的媒体节点")
-        for reference in references:
-            asset_id = str(reference.get("asset_id") or "") if isinstance(reference, dict) else ""
-            asset = db.get(Asset, asset_id) if asset_id else None
-            if not asset or asset.project_id != payload.project_id:
-                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "参考节点尚无可用媒体，或媒体不属于当前项目；任务未入队")
+    validate_task_request(db, payload.project_id, payload.kind, payload.provider, payload.input)
     credits = estimate_task_credits(payload.kind, payload.provider, payload.estimated_credits)
     enforce_task_policy(db, user, payload.provider, payload.model, credits)
     task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=payload.model, estimated_credits=credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))
@@ -368,7 +500,7 @@ def quote_task(kind: str, provider: str = "", model: str = "", user: User = Depe
 def list_tasks(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_project_read(db, project_id, user)
     items = db.scalars(select(GenerationTask).where(GenerationTask.project_id == project_id).order_by(GenerationTask.created_at.desc()).limit(200)).all()
-    return {"tasks": [{"id": item.id, "node_id": item.node_id, "kind": item.kind, "provider": item.provider, "model": item.model, "status": item.status, "progress": item.progress, "output": json.loads(item.output_json) if item.output_json else None, "error_code": item.error_code, "error_message": item.error_message, "created_at": item.created_at.isoformat()} for item in items]}
+    return {"tasks": [{"id": item.id, "node_id": item.node_id, "kind": item.kind, "provider": item.provider, "model": item.model, "status": item.status, "progress": item.progress, "managed_by": "production" if item.production_run_id else "workflow" if item.idempotency_key.startswith("workflow:") else "task", "output": json.loads(item.output_json) if item.output_json else None, "error_code": item.error_code, "error_message": item.error_message, "created_at": item.created_at.isoformat()} for item in items]}
 
 
 @app.get("/api/tasks/{task_id}")
@@ -385,9 +517,40 @@ def cancel_task(task_id: str, request: Request, user: User = Depends(require_csr
     if not item: raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
     require_project_write(db, item.project_id, user)
     if item.status in ("queued", "running", "paused"):
-        item.status = "cancelled"; record_audit(db, request, "task.cancelled", user, "task", item.id); db.commit()
+        item.status = "cancelled"
+        workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.active_task_id == item.id))
+        if workflow: workflow.status = "cancelled"; workflow.active_task_id = None; workflow.error_message = "子任务已取消"
+        production = db.scalar(select(ProductionRun).where(ProductionRun.active_task_id == item.id))
+        if production: production.status = "paused"; production.resume_status = "ready"; production.active_task_id = None; production.error_message = "当前阶段任务已取消"
+        record_audit(db, request, "task.cancelled", user, "task", item.id); db.commit()
         from .canvas_sync import sync_task_to_canvas
         sync_task_to_canvas(item.id)
+    return {"task": {"id": item.id, "status": item.status}}
+
+
+@app.post("/api/tasks/{task_id}/pause")
+def pause_task(task_id: str, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    item = db.get(GenerationTask, task_id)
+    if not item: raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
+    require_project_write(db, item.project_id, user)
+    if item.status == "running": raise HTTPException(status.HTTP_409_CONFLICT, "供应商已开始执行，单任务不能安全暂停；请暂停所属工作流，或取消任务")
+    if item.status != "queued": raise HTTPException(status.HTTP_409_CONFLICT, "只有排队中的任务可以暂停")
+    item.status = "paused"; record_audit(db, request, "task.paused", user, "task", item.id); db.commit()
+    from .canvas_sync import sync_task_to_canvas
+    sync_task_to_canvas(item.id)
+    return {"task": {"id": item.id, "status": item.status}}
+
+
+@app.post("/api/tasks/{task_id}/resume")
+def resume_task(task_id: str, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    item = db.get(GenerationTask, task_id)
+    if not item: raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
+    require_project_write(db, item.project_id, user)
+    if item.status != "paused": raise HTTPException(status.HTTP_409_CONFLICT, "当前任务没有暂停")
+    enforce_existing_task_policy(db, user, item.provider, item.model, item.estimated_credits)
+    item.status = "queued"; record_audit(db, request, "task.resumed", user, "task", item.id); db.commit()
+    from .canvas_sync import sync_task_to_canvas
+    sync_task_to_canvas(item.id)
     return {"task": {"id": item.id, "status": item.status}}
 
 
@@ -398,6 +561,8 @@ def retry_task(task_id: str, request: Request, user: User = Depends(require_csrf
     require_project_write(db, item.project_id, user)
     if item.status not in ("failed", "cancelled"):
         raise HTTPException(status.HTTP_409_CONFLICT, "只有失败或已取消的任务可以重试")
+    if item.production_run_id or item.idempotency_key.startswith("workflow:"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "该任务属于持久流程，请在对应的制片或工作流节点中恢复，不能脱离流程单独重试")
     credits = estimate_task_credits(item.kind, item.provider, item.estimated_credits)
     enforce_task_policy(db, user, item.provider, item.model, credits)
     attempt = (db.scalar(select(func.count()).select_from(GenerationTask).where(GenerationTask.project_id == item.project_id, GenerationTask.node_id == item.node_id)) or 0) + 1

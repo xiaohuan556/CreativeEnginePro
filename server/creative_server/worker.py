@@ -5,18 +5,27 @@ import sys
 import time
 from pathlib import Path
 
+from fastapi import HTTPException
 from sqlalchemy import select
 
 from .config import get_settings
 from .database import SessionLocal, create_schema
-from .models import Asset, GenerationTask
+from .models import Asset, GenerationTask, ProductionRun, User, WorkflowRun
 from .storage import import_generated_file, media_kind, resolve_object
 from .request_compiler import compile_request
+from .task_policy import enforce_existing_task_policy
 
 
 def _sync_canvas(task_id: str) -> None:
     from .canvas_sync import sync_task_to_canvas
     sync_task_to_canvas(task_id)
+
+
+def _finish_orchestrators(task_id: str, success: bool, error: str = "") -> None:
+    from .production import on_task_finished
+    from .workflows import on_workflow_task_finished
+    on_task_finished(task_id, success, error)
+    on_workflow_task_finished(task_id, success, error)
 
 
 def _desktop_api():
@@ -33,6 +42,18 @@ def claim_task() -> str | None:
         query = select(GenerationTask).where(GenerationTask.status == "queued").order_by(GenerationTask.created_at).with_for_update(skip_locked=True).limit(1)
         task = db.scalar(query)
         if not task: return None
+        user = db.get(User, task.owner_id)
+        try:
+            if not user or user.status != "active":
+                raise HTTPException(403, "账号已被管理员暂停")
+            enforce_existing_task_policy(db, user, task.provider, task.model, task.estimated_credits)
+        except HTTPException as policy_error:
+            task.status = "paused"; task.error_code = "policy_revoked"; task.error_message = str(policy_error.detail)
+            workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.active_task_id == task.id))
+            if workflow: workflow.status = "paused"; workflow.error_message = task.error_message
+            production = db.get(ProductionRun, task.production_run_id) if task.production_run_id else None
+            if production: production.status = "paused"; production.error_message = task.error_message
+            return None
         task.status = "running"; task.progress = 1
         return task.id
 
@@ -103,8 +124,7 @@ def execute_task(task_id: str) -> None:
                     current = db.get(GenerationTask, task_id)
                     current.output_json = json.dumps(serialize_result(current, fake_result), ensure_ascii=False); current.status = "completed"; current.progress = 100
                 _sync_canvas(task_id)
-                from .production import on_task_finished
-                on_task_finished(task_id, True, ""); return
+                _finish_orchestrators(task_id, True, ""); return
             operation = "image_to_video"
             hydrated_inputs["image"] = str(frame_paths[-1])
             hydrated_inputs["reference_assets"] = [{"path": str(frame_paths[-1]), "role": "composition", "label": "上一段视频尾帧"}]
@@ -114,8 +134,7 @@ def execute_task(task_id: str) -> None:
                 current = db.get(GenerationTask, task_id)
                 if current: current.status = "failed"; current.error_code = "video_frame_failed"; current.error_message = str(error)[:4000]
             _sync_canvas(task_id)
-            from .production import on_task_finished
-            on_task_finished(task_id, False, str(error)); return
+            _finish_orchestrators(task_id, False, str(error)); return
     if operation == "video_breakdown":
         breakdown_success = False; breakdown_error = ""
         try:
@@ -134,8 +153,7 @@ def execute_task(task_id: str) -> None:
                 current = db.get(GenerationTask, task_id)
                 if current: current.status = "failed"; current.error_code = "breakdown_failed"; current.error_message = breakdown_error
             _sync_canvas(task_id)
-        from .production import on_task_finished
-        on_task_finished(task_id, breakdown_success, breakdown_error)
+        _finish_orchestrators(task_id, breakdown_success, breakdown_error)
         return
     manager, request_type = _desktop_api()
     succeeded = False; final_error = ""
@@ -163,8 +181,7 @@ def execute_task(task_id: str) -> None:
             current = db.get(GenerationTask, task_id)
             if current: current.status = "failed"; current.error_code = "worker_error"; current.error_message = final_error
     _sync_canvas(task_id)
-    from .production import on_task_finished
-    on_task_finished(task_id, succeeded, final_error)
+    _finish_orchestrators(task_id, succeeded, final_error)
 
 
 def main() -> None:
