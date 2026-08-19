@@ -22,7 +22,7 @@ from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle
 from .production import handle_command
 from .production_state import STAGES
 from .provider_catalog import available_providers
-from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectMemberCreate, ProjectMemberUpdate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate, WorkflowCommand, WorkflowRunCreate, WorkflowTemplateCreate
+from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectMemberCreate, ProjectMemberUpdate, ProjectReviewCreate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate, WorkflowCommand, WorkflowRunCreate, WorkflowTemplateCreate
 from .security import DUMMY_PASSWORD_HASH, expiry, hash_password, opaque_token, token_hash, utcnow, validate_password, validate_username, verify_password
 from .storage import media_kind, resolve_object, save_upload
 from .task_policy import enforce_existing_task_policy, enforce_task_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
@@ -208,6 +208,30 @@ def update_project(project_id: str, payload: ProjectUpdate, request: Request, us
     project.version += 1; project.updated_at = utcnow()
     record_audit(db, request, "project.updated", user, "project", project.id, {"version": project.version}); db.commit()
     return {"project": public_project(project)}
+
+
+@app.post("/api/projects/{project_id}/reviews")
+def review_project_node(project_id: str, payload: ProjectReviewCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    require_project_review(db, project_id, user)
+    project = db.scalar(select(Project).where(Project.id == project_id).with_for_update())
+    if not project: raise HTTPException(status.HTTP_404_NOT_FOUND, "项目不存在")
+    if project.version != payload.expected_version:
+        return Response(content=json.dumps({"error": "version_conflict", "currentVersion": project.version}), media_type="application/json", status_code=409)
+    try: document = json.loads(project.canvas_json or "{}")
+    except json.JSONDecodeError as error: raise HTTPException(status.HTTP_409_CONFLICT, "项目画布数据已损坏，不能写入审片决定") from error
+    nodes = document.get("nodes", []) if isinstance(document, dict) else []
+    node = next((item for item in nodes if isinstance(item, dict) and str(item.get("id")) == payload.node_id), None)
+    if not node: raise HTTPException(status.HTTP_404_NOT_FOUND, "待审节点不存在")
+    data = node.setdefault("data", {}); desktop_payload = data.setdefault("desktopPayload", {})
+    labels = {"adopt": "已采用", "reject": "已驳回", "accept_risk": "风险已接受"}
+    data["status"] = labels[payload.decision]
+    desktop_payload["review_decision"] = payload.decision
+    desktop_payload["reviewed_by"] = user.id
+    desktop_payload["reviewed_at"] = utcnow().isoformat()
+    db.add(ProjectRevision(project_id=project.id, actor_id=user.id, version=project.version, canvas_json=project.canvas_json))
+    project.canvas_json = json.dumps(document, ensure_ascii=False, separators=(",", ":")); project.version += 1; project.updated_at = utcnow()
+    record_audit(db, request, "project.node_reviewed", user, "project_node", payload.node_id, {"project_id": project.id, "decision": payload.decision, "version": project.version}); db.commit()
+    return {"project": public_project(project), "review": {"node_id": payload.node_id, "decision": payload.decision, "status": labels[payload.decision]}}
 
 
 @app.get("/api/projects/{project_id}/members")

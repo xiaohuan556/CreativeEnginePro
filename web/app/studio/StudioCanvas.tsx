@@ -168,6 +168,7 @@ function CanvasApp() {
   const versionRef = useRef(1);
   const bootingRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const suppressNextSaveRef = useRef(false);
   const importInputRef = useRef<HTMLInputElement>(null);
   const projectInputRef = useRef<HTMLInputElement>(null);
 
@@ -198,6 +199,7 @@ function CanvasApp() {
           const response = await apiFetch(`/api/projects/${first.id}`, { cache: "no-store" });
           const detail = await response.json() as { project?: { id: string; title: string; version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
           if (detail.project) {
+            suppressNextSaveRef.current = true;
             setProjectId(detail.project.id); setProjectTitle(detail.project.title);
             versionRef.current = detail.project.version;
             setNodes(detail.project.canvas.nodes.map(normalizeStudioNode));
@@ -248,7 +250,9 @@ function CanvasApp() {
   }, [apiFetch, controlled, createOpen]);
 
   useEffect(() => {
-    if (!hydrated || !projectId || !canWrite) return;
+    if (!hydrated || !projectId) return;
+    if (suppressNextSaveRef.current) { suppressNextSaveRef.current = false; return; }
+    if (!canWrite) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
     saveTimerRef.current = setTimeout(() => {
       setNotice("正在保存…");
@@ -270,6 +274,7 @@ function CanvasApp() {
     const response = await apiFetch(`/api/projects/${projectId}`, { cache: "no-store" });
     const data = await response.json() as { project?: { title: string; version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } }; detail?: string };
     if (!response.ok || !data.project) { setNotice(data.detail || "项目重新载入失败"); return; }
+    suppressNextSaveRef.current = true;
     versionRef.current = data.project.version; setProjectTitle(data.project.title); setNodes(data.project.canvas.nodes.map(normalizeStudioNode)); setEdges(data.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }))); setProjectConflict(false); setNotice("已载入服务器上的最新版本");
   };
 
@@ -412,6 +417,16 @@ function CanvasApp() {
     }
     if (["asset_view", "asset_take", "result"].includes(selectedNode.data.specKey) && ["采用", "驳回", "接受风险并继续"].includes(action)) {
       const statusText = action === "采用" ? "已采用" : action === "驳回" ? "已驳回" : "风险已接受";
+      if (controlled && projectId) {
+        const decision = action === "采用" ? "adopt" : action === "驳回" ? "reject" : "accept_risk";
+        const response = await apiFetch(`/api/projects/${projectId}/reviews`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ node_id: selectedNode.id, decision, expected_version: versionRef.current }) });
+        const result = await response.json() as { project?: { version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } }; currentVersion?: number; detail?: string };
+        if (response.status === 409) { versionRef.current = result.currentVersion || versionRef.current; setProjectConflict(true); setNotice("其他成员已更新画布，请重新载入后再审片"); return; }
+        if (!response.ok || !result.project) { setNotice(result.detail || "审片决定保存失败"); return; }
+        versionRef.current = result.project.version; suppressNextSaveRef.current = true;
+        setNodes(result.project.canvas.nodes.map(normalizeStudioNode)); setEdges(result.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" })));
+        setNotice(`${selectedNode.data.title} · ${statusText}，审片决定已写入服务器`); return;
+      }
       setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: statusText, desktopPayload: { ...(node.data.desktopPayload || {}), review_decision: action, review_at: new Date().toISOString() } } } : node));
       setNotice(`${selectedNode.data.title} · ${statusText}`); return;
     }
@@ -502,6 +517,7 @@ function CanvasApp() {
     if (!response.ok) return;
     const detail = await response.json() as { project?: { version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
     if (!detail.project) return;
+    suppressNextSaveRef.current = true;
     versionRef.current = detail.project.version;
     const serverNodes = detail.project.canvas.nodes.map(normalizeStudioNode);
     const serverSource = serverNodes.find((node) => node.id === nodeId);

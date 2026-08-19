@@ -74,6 +74,12 @@ class ProjectUpdate(BaseModel):
         return value
 
 
+class ProjectReviewCreate(BaseModel):
+    node_id: str = Field(min_length=1, max_length=128)
+    decision: Literal["adopt", "reject", "accept_risk"]
+    expected_version: int = Field(ge=1)
+
+
 class ProductionRunCreate(BaseModel):
     project_id: str
     node_id: str

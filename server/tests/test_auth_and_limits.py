@@ -253,7 +253,8 @@ def test_project_membership_reviewer_and_template_permissions() -> None:
     seed_admin()
     with TestClient(app) as admin_client:
         csrf = login(admin_client, "admin", "Correct-Horse-42!")
-        project = admin_client.post("/api/projects", headers={"x-csrf-token": csrf}, json={"title": "协作权限", "canvas": {"protocol": "creative-engine-canvas", "version": 1, "nodes": [], "edges": []}})
+        review_node = {"id": "take-review-1", "type": "studio", "position": {"x": 10, "y": 10}, "data": {"title": "待审候选", "description": "候选", "kind": "result", "specKey": "result", "desktopType": "shot_take", "status": "待审", "meta": "test", "accent": "#fff", "desktopPayload": {}}}
+        project = admin_client.post("/api/projects", headers={"x-csrf-token": csrf}, json={"title": "协作权限", "canvas": {"protocol": "creative-engine-canvas", "version": 1, "nodes": [review_node], "edges": []}})
         project_id = project.json()["project"]["id"]
         for username, role in (("review.one", "reviewer"), ("view.one", "viewer")):
             created = admin_client.post("/api/admin/users", headers={"x-csrf-token": csrf}, json={"username": username, "display_name": username, "password": "Member-Secure-42!", "role": role, "approved": True})
@@ -272,6 +273,11 @@ def test_project_membership_reviewer_and_template_permissions() -> None:
         reviewer_csrf = login(reviewer, "review.one", "Member-Secure-42!")
         members = reviewer.get(f"/api/projects/{project_id}/members")
         assert members.status_code == 200 and members.json()["can_manage"] is False
+        reviewed = reviewer.post(f"/api/projects/{project_id}/reviews", headers={"x-csrf-token": reviewer_csrf}, json={"node_id": "take-review-1", "decision": "adopt", "expected_version": 1})
+        assert reviewed.status_code == 200, reviewed.text
+        assert reviewed.json()["project"]["canvas"]["nodes"][0]["data"]["status"] == "已采用"
+        stale = reviewer.post(f"/api/projects/{project_id}/reviews", headers={"x-csrf-token": reviewer_csrf}, json={"node_id": "take-review-1", "decision": "reject", "expected_version": 1})
+        assert stale.status_code == 409
         approved = reviewer.post(f"/api/production-runs/{run_id}/command", headers={"x-csrf-token": reviewer_csrf}, json={"command": "accept_risk"})
         assert approved.status_code == 200, approved.text
         forbidden = reviewer.patch(f"/api/projects/{project_id}", headers={"x-csrf-token": reviewer_csrf}, json={"title": "越权", "canvas": {"protocol": "creative-engine-canvas", "version": 1, "nodes": [], "edges": []}, "expectedVersion": 1})
