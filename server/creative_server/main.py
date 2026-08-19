@@ -307,7 +307,7 @@ def create_task(payload: TaskCreate, request: Request, user: User = Depends(requ
     if existing:
         return {"task": {"id": existing.id, "status": existing.status, "progress": existing.progress}, "deduplicated": True}
     require_project_write(db, payload.project_id, user)
-    enforce_task_policy(db, user, payload.model, payload.estimated_credits)
+    enforce_task_policy(db, user, payload.provider, payload.model, payload.estimated_credits)
     task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=payload.model, estimated_credits=payload.estimated_credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))
     db.add(task); record_audit(db, request, "task.queued", user, "task", task.id, {"kind": task.kind, "provider": task.provider, "model": task.model, "credits": task.estimated_credits}); db.commit()
     return {"task": {"id": task.id, "status": task.status, "progress": task.progress}}

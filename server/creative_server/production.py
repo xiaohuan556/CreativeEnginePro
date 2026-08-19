@@ -47,7 +47,7 @@ def enqueue_current_stage(db: Session, run: ProductionRun) -> GenerationTask:
     profile = next((item for item in available_providers() if item["name"] == provider), None)
     if not profile or operation not in profile["capabilities"]:
         raise HTTPException(status.HTTP_409_CONFLICT, f"已锁定引擎 {provider} 当前不可用或不支持 {operation}；流程已停止，不会静默切换")
-    enforce_task_policy(db, user, "", 0)
+    enforce_task_policy(db, user, provider, "", 0)
     attempt = (db.scalar(select(func.count()).select_from(GenerationTask).where(GenerationTask.production_run_id == run.id, GenerationTask.production_stage == run.stage)) or 0) + 1
     inputs = {"prompt": f"执行 AI 制片阶段 {run.stage}：{STAGES[run.stage]}。", "project_canvas": json.loads(project.canvas_json)}
     if run.stage == 6:

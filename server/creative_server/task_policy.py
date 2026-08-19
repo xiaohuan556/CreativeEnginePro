@@ -36,14 +36,15 @@ def require_project_read(db: Session, project_id: str, user: User) -> Project:
     return project
 
 
-def enforce_task_policy(db: Session, user: User, model: str, estimated_credits: int) -> UsageLimit:
+def enforce_task_policy(db: Session, user: User, provider: str, model: str, estimated_credits: int) -> UsageLimit:
     if user.role not in TASK_ROLES:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "当前角色不能提交生成任务")
     limits = db.get(UsageLimit, user.id)
     if not limits:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "账号尚未配置任务额度")
     allowed = json.loads(limits.allowed_models_json or "[]")
-    if allowed and model and model not in allowed:
+    requested = {value for value in (provider, model, f"{provider}:{model}" if provider and model else "") if value}
+    if provider != "local" and allowed and not requested.intersection(allowed):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "该模型不在管理员允许列表中")
     if estimated_credits > 0 and not limits.allow_paid_models:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "管理员尚未为此账号启用付费模型")

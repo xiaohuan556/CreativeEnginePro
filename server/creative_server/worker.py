@@ -11,6 +11,7 @@ from .config import get_settings
 from .database import SessionLocal, create_schema
 from .models import Asset, GenerationTask
 from .storage import import_generated_file, media_kind, resolve_object
+from .request_compiler import compile_request
 
 
 def _desktop_api():
@@ -72,6 +73,39 @@ def execute_task(task_id: str) -> None:
             hydrated_inputs["reference_assets"] = typed_references[:9]
         elif operation == "text_to_speech":
             hydrated_inputs["text"] = hydrated_inputs.pop("prompt", "")
+    if operation in {"extract_video_frames", "continue_video"}:
+        try:
+            if not paths: raise ValueError("请先连接或生成一个可用视频")
+            import cv2
+            source = paths[0]; cap = cv2.VideoCapture(source)
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if frame_count <= 0: raise RuntimeError("无法读取视频帧")
+            indices = [0, max(0, frame_count // 2), max(0, frame_count - 1)] if operation == "extract_video_frames" else [max(0, frame_count - 1)]
+            output_dir = Path(get_settings().storage_dir) / task.project_id[:12] / f"frames-{task.id}"; output_dir.mkdir(parents=True, exist_ok=True)
+            frame_paths = []
+            for index, frame_index in enumerate(indices):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index); ok, frame = cap.read()
+                if not ok: continue
+                target = output_dir / f"frame-{index + 1}.jpg"; cv2.imwrite(str(target), frame); frame_paths.append(target)
+            cap.release()
+            if not frame_paths: raise RuntimeError("视频抽帧失败")
+            if operation == "extract_video_frames":
+                fake_result = type("FrameResult", (), {"data": frame_paths, "cost_credits": 0})()
+                with SessionLocal.begin() as db:
+                    current = db.get(GenerationTask, task_id)
+                    current.output_json = json.dumps(serialize_result(current, fake_result), ensure_ascii=False); current.status = "completed"; current.progress = 100
+                from .production import on_task_finished
+                on_task_finished(task_id, True, ""); return
+            operation = "image_to_video"
+            hydrated_inputs["image"] = str(frame_paths[-1])
+            hydrated_inputs["reference_assets"] = [{"path": str(frame_paths[-1]), "role": "composition", "label": "上一段视频尾帧"}]
+            hydrated_inputs["prompt"] = str(hydrated_inputs.get("prompt") or "从上一段视频的最后状态自然继续，动作、方向、速度、角色身份、场景和光线无缝衔接。")
+        except Exception as error:
+            with SessionLocal.begin() as db:
+                current = db.get(GenerationTask, task_id)
+                if current: current.status = "failed"; current.error_code = "video_frame_failed"; current.error_message = str(error)[:4000]
+            from .production import on_task_finished
+            on_task_finished(task_id, False, str(error)); return
     if operation == "video_breakdown":
         breakdown_success = False; breakdown_error = ""
         try:
@@ -94,7 +128,8 @@ def execute_task(task_id: str) -> None:
     manager, request_type = _desktop_api()
     succeeded = False; final_error = ""
     try:
-        handle = manager.submit(provider, request_type(operation=operation, inputs=hydrated_inputs, params=raw.get("params", {}), metadata={"server_task_id": task_id, "retry_transient_only": True}, use_cache=bool(raw.get("use_cache", False))))
+        compiled_inputs, compiled_params = compile_request(operation, hydrated_inputs, raw.get("params", {}), str(raw.get("action") or ""), task.model)
+        handle = manager.submit(provider, request_type(operation=operation, inputs=compiled_inputs, params=compiled_params, metadata={"server_task_id": task_id, "retry_transient_only": True}, use_cache=bool(raw.get("use_cache", False))))
         while not handle.is_finished:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)

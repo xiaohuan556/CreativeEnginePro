@@ -263,8 +263,13 @@ function CanvasApp() {
       try {
         const response = await apiFetch(`/api/tasks/${taskId}`, { cache: "no-store" });
         if (!response.ok) return;
-        const data = await response.json() as { task: { status: string; progress: number; error_message?: string } };
-        setNodes((current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, status: data.task.status === "completed" ? "生成完成" : data.task.status === "failed" ? "生成失败" : `AI 制片中 · ${data.task.progress}%`, progress: data.task.progress } } : node));
+        const data = await response.json() as { task: { status: string; progress: number; output?: { data?: unknown; asset_ids?: string[]; analysis?: unknown }; error_message?: string } };
+        setNodes((current) => current.map((node) => {
+          if (node.id !== nodeId) return node;
+          const output = data.task.output || {};
+          const text = typeof output.data === "string" ? output.data : "";
+          return { ...node, data: { ...node.data, description: data.task.status === "completed" && text ? text : node.data.description, status: data.task.status === "completed" ? "生成完成" : data.task.status === "failed" ? "生成失败" : `AI 制片中 · ${data.task.progress}%`, progress: data.task.progress, desktopPayload: { ...(node.data.desktopPayload || {}), ...(output.asset_ids ? { output_asset_ids: output.asset_ids } : {}), ...(output.analysis ? { analysis_result: output.analysis } : {}) } } };
+        }));
         if (data.task.status === "completed") { setNotice("生成完成，结果已写回画布节点"); return; }
         if (["failed", "cancelled"].includes(data.task.status)) { setNotice(data.task.error_message || "任务已停止"); return; }
       } catch { return; }
@@ -317,7 +322,7 @@ function CanvasApp() {
       character_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
       element_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
       multi_director: { provider: String(payload.provider_name || "seedance"), operation: "text_to_video", model: String(payload.model || "") },
-      video: { provider: String(payload.provider_name || "seedance"), operation: incomingNodes.length ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
+      video: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || "seedance"), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : incomingNodes.length ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
       audio: { provider: String(payload.provider_name || "edge_tts"), operation: "text_to_speech", model: String(payload.voice || "") },
       analysis: { provider: "local", operation: "video_breakdown", model: "local" },
       skill: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || "") },
@@ -326,11 +331,15 @@ function CanvasApp() {
     const task = mapping[specKey];
     if (!task) { setNotice("该运行节点由上游工作流自动驱动，不能单独提交"); return; }
     if (task.provider !== "local" && !payload.provider_name) { setNotice("请先在节点设置中明确选择生成引擎；系统不会替你静默切换模型"); return; }
-    if (task.provider !== "local" && providers.length && !providers.some((provider) => provider.name === task.provider && provider.capabilities.includes(task.operation))) { setNotice(`“${task.provider}”当前不可用或不支持 ${task.operation}，请在节点中明确选择可用模型`); return; }
+    const providerOperation = task.operation === "continue_video" ? "image_to_video" : task.operation === "extract_video_frames" ? "" : task.operation;
+    if (providerOperation && task.provider !== "local" && providers.length && !providers.some((provider) => provider.name === task.provider && provider.capabilities.includes(providerOperation))) { setNotice(`“${task.provider}”当前不可用或不支持 ${providerOperation}，请在节点中明确选择可用模型`); return; }
     const action = String(payload.editor_action || NODE_SPEC_BY_KEY[specKey]?.actions[0] || "生成");
     if (!window.confirm(`确认提交“${action}”？\n模型：${task.model || task.provider}\n预计费用：由管理员额度控制，服务端不会静默换模型。`)) return;
     setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: "正在排队", progress: 0 } } : node));
-    const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: 0, input: { inputs: { prompt: selectedNode.data.description, references: incomingNodes.map((node) => ({ node_id: node.id, title: node.data.title, asset_id: node.data.desktopPayload?.asset_id })) }, params: payload, action, use_cache: false } }) });
+    const ownAssets = Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids.map((assetId) => ({ node_id: selectedNode.id, title: selectedNode.data.title, asset_id: assetId })) : [];
+    const references = incomingNodes.map((node) => ({ node_id: node.id, title: node.data.title, asset_id: node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : undefined) }));
+    if (["continue_video", "extract_video_frames"].includes(task.operation)) references.unshift(...ownAssets);
+    const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: 0, input: { inputs: { prompt: selectedNode.data.description, references }, params: payload, action, use_cache: false } }) });
     const data = await response.json() as { task?: { id: string }; detail?: string };
     if (!response.ok || !data.task) { setNotice(data.detail || "任务提交失败"); return; }
     setNotice("任务已进入公司队列"); void pollTask(data.task.id, selectedNode.id);
