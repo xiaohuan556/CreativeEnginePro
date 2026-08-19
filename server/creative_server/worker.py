@@ -142,7 +142,9 @@ def execute_task(task_id: str) -> None:
             operation = "image_to_video"
             hydrated_inputs["image"] = str(frame_paths[-1])
             hydrated_inputs["reference_assets"] = [{"path": str(frame_paths[-1]), "role": "composition", "label": "上一段视频尾帧"}]
-            hydrated_inputs["prompt"] = str(hydrated_inputs.get("prompt") or "从上一段视频的最后状态自然继续，动作、方向、速度、角色身份、场景和光线无缝衔接。")
+            continuation_contract = "从上一段视频的最后状态自然继续；第一帧必须匹配尾帧，保持角色身份、空间位置、动作方向与速度、道具、场景结构、光线和镜头轴线连续，不得重新开场或重复上一段动作。"
+            user_direction = str(hydrated_inputs.get("prompt") or "").strip()
+            hydrated_inputs["prompt"] = continuation_contract + (f"\n续写要求：{user_direction}" if user_direction else "")
         except Exception as error:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)

@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import NextImage from "next/image";
 import {
   addEdge, Background, BackgroundVariant, Connection, Controls, Edge, Handle,
   MarkerType, MiniMap, Node, NodeProps, Position, ReactFlow, ReactFlowProvider,
@@ -40,6 +41,7 @@ type QueueTask = { id: string; node_id: string; kind: string; provider: string; 
 type PendingTask = { action: string; model: string; credits: number; run: () => Promise<void> };
 type WorkflowTemplate = { id: string; name: string; definition: { nodes?: StudioNode[]; edges?: Edge[] } };
 type ProjectSummary = { id: string; title: string; version: number; owner_id?: string; updated_at?: string; updatedAt?: string | number };
+type SyncedProjectDraft = { title: string; nodes: StudioNode[]; edges: Edge[] };
 
 const kindIcons: Record<StudioNodeKind, typeof Sparkles> = {
   project: Clapperboard,
@@ -105,6 +107,12 @@ const creationItems = NODE_SPECS.filter((item) => item.creatable);
 
 function StudioNodeCard({ data, selected }: NodeProps<StudioNode>) {
   const Icon = kindIcons[data.kind];
+  const { controlled } = useControlPlane();
+  const payload = data.desktopPayload || {};
+  const assetId = String(payload.asset_id || (Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids[0] : "") || "");
+  const explicitUrl = String(payload.asset_url || "");
+  const controlBase = controlled ? (process.env.NEXT_PUBLIC_CONTROL_PLANE_URL || "").replace(/\/$/, "") : "";
+  const mediaUrl = explicitUrl ? (controlBase && explicitUrl.startsWith("/api/") ? `${controlBase}${explicitUrl}` : explicitUrl) : assetId ? `${controlBase}/api/assets/${assetId}` : "";
   return (
     <article className={`studio-node ${selected ? "is-selected" : ""}`}
       style={{ "--node-accent": data.accent } as React.CSSProperties}>
@@ -115,6 +123,9 @@ function StudioNodeCard({ data, selected }: NodeProps<StudioNode>) {
         <button className="icon-button node-more" aria-label="节点菜单"><MoreHorizontal size={16} /></button>
       </div>
       <h3>{data.title}</h3>
+      {mediaUrl && (["image", "reference"].includes(data.kind) || data.desktopType === "image_node") && <NextImage className="node-media nodrag" src={mediaUrl} alt={data.title} width={254} height={112} unoptimized />}
+      {mediaUrl && data.kind === "video" && <video className="node-media nodrag nowheel" src={mediaUrl} controls muted preload="metadata" aria-label={data.title}><track kind="captions" src="data:text/vtt,WEBVTT%0A%0A" srcLang="zh" label="当前视频没有字幕轨" default /></video>}
+      {mediaUrl && data.kind === "audio" && <audio className="node-audio nodrag nowheel" src={mediaUrl} controls preload="metadata" aria-label={data.title}><track kind="captions" src="data:text/vtt,WEBVTT%0A%0A" srcLang="zh" label="当前音频没有字幕轨" default /></audio>}
       <p>{data.description}</p>
       {typeof data.progress === "number" && <div className="progress-track"><span style={{ width: `${data.progress}%` }} /></div>}
       <div className="node-meta">{data.meta}</div>
@@ -146,6 +157,39 @@ function normalizeStudioNode(node: StudioNode): StudioNode {
   };
 }
 
+function requiredCapability(node: StudioNode, incomingCount: number) {
+  const payload = node.data.desktopPayload || {}, action = String(payload.editor_action || "");
+  if (["script", "copywriting", "skill"].includes(node.data.specKey)) return "chat";
+  if (["multi_image", "scene_reference", "character_reference", "element_reference"].includes(node.data.specKey)) return incomingCount ? "image_edit" : "text_to_image";
+  if (node.data.specKey === "video") return action === "文生视频" ? "text_to_video" : "image_to_video";
+  if (node.data.specKey === "multi_director") {
+    const timeline = Array.isArray(payload.timeline_images) ? payload.timeline_images : [];
+    return action === "基于尾帧续拍" || timeline.some((item) => item && typeof item === "object" && ["first_frame", "last_frame"].includes(String((item as Record<string, unknown>).purpose || ""))) ? "image_to_video" : "text_to_video";
+  }
+  if (node.data.specKey === "audio") return "text_to_speech";
+  if (node.data.specKey === "shot") return action === "生成对白" ? "text_to_speech" : action === "生成视频" ? (incomingCount ? "image_to_video" : "text_to_video") : incomingCount ? "image_edit" : "text_to_image";
+  return "";
+}
+
+function compileShotPrompt(node: StudioNode) {
+  const shot = (node.data.desktopPayload?.shot || {}) as Record<string, unknown>;
+  const invariants = Array.isArray(shot.continuity_invariants) ? shot.continuity_invariants.join("；") : String(shot.continuity_invariants || "");
+  return [
+    node.data.description,
+    shot.story_function && `故事功能：${shot.story_function}`,
+    shot.visual_thesis && `视觉命题：${shot.visual_thesis}`,
+    shot.shot_size && `景别：${shot.shot_size}`,
+    shot.duration && `时长：${shot.duration} 秒`,
+    shot.action_start && `动作起点：${shot.action_start}`,
+    shot.primary_action && `唯一主动作：${shot.primary_action}`,
+    shot.action_end && `动作终点：${shot.action_end}`,
+    shot.dominant_camera_move && `唯一主运镜：${shot.dominant_camera_move}`,
+    invariants && `连续性不变量：${invariants}`,
+    shot.dialogue && `对白：${shot.dialogue}`,
+    shot.generation_risk && `主要生成风险：${shot.generation_risk}`,
+  ].filter(Boolean).join("\n");
+}
+
 function CanvasApp() {
   const { apiFetch, controlled, signOut, user } = useControlPlane();
   const [nodes, setNodes, onNodesChange] = useNodesState<StudioNode>(controlled ? [] : initialNodes);
@@ -172,6 +216,10 @@ function CanvasApp() {
   const bootingRef = useRef(false);
   const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const suppressNextSaveRef = useRef(false);
+  const lastSyncedProjectRef = useRef<SyncedProjectDraft>({ title: controlled ? "未命名项目" : "雨夜最后一封信", nodes: controlled ? [] : initialNodes, edges: controlled ? [] : initialEdges });
+  const nodesRef = useRef(nodes);
+  const edgesRef = useRef(edges);
+  const projectTitleRef = useRef(projectTitle);
   const importInputRef = useRef<HTMLInputElement>(null);
   const projectInputRef = useRef<HTMLInputElement>(null);
 
@@ -180,6 +228,10 @@ function CanvasApp() {
   const canWrite = !controlled || (["admin", "producer", "director", "editor"].includes(user.role) && ["owner", "editor"].includes(projectRole));
   const canReview = canWrite || (user.role === "reviewer" && projectRole === "reviewer");
   const canCreateProject = !controlled || ["admin", "producer", "director", "editor"].includes(user.role);
+
+  useEffect(() => { nodesRef.current = nodes; }, [nodes]);
+  useEffect(() => { edgesRef.current = edges; }, [edges]);
+  useEffect(() => { projectTitleRef.current = projectTitle; }, [projectTitle]);
 
   useEffect(() => {
     if (!selectedNode || selectedNode.data.specKey !== "multi_director" || !incomingNodes.length) return;
@@ -208,8 +260,9 @@ function CanvasApp() {
           setProjectId(detail.project.id); setProjectTitle(detail.project.title);
           versionRef.current = detail.project.version;
           const nextNodes = detail.project.canvas.nodes.map(normalizeStudioNode);
-          setNodes(nextNodes); setSelectedId(nextNodes[0]?.id || "");
-          setEdges(detail.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" })));
+          const nextEdges = detail.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }));
+          lastSyncedProjectRef.current = { title: detail.project.title, nodes: nextNodes, edges: nextEdges };
+          setNodes(nextNodes); setSelectedId(nextNodes[0]?.id || ""); setEdges(nextEdges);
         } else {
           if (!canCreateProject) {
             setNodes([]); setEdges([]); setSelectedId("");
@@ -224,6 +277,7 @@ function CanvasApp() {
           if (!response.ok || !created.project) throw new Error("创建工程失败");
           suppressNextSaveRef.current = true;
           setProjects([created.project]); setProjectId(created.project.id); setProjectTitle(created.project.title);
+          lastSyncedProjectRef.current = { title: created.project.title, nodes: [], edges: [] };
           setNodes([]); setEdges([]); setSelectedId(""); versionRef.current = created.project.version;
         }
         setNotice("服务器项目已同步");
@@ -281,6 +335,7 @@ function CanvasApp() {
         if (response.status === 409) { versionRef.current = data.currentVersion || versionRef.current; setProjectConflict(true); setNotice("检测到其他成员更新 · 当前自动保存已暂停"); return; }
         if (!response.ok || !data.project) throw new Error("save failed");
         versionRef.current = data.project.version;
+        lastSyncedProjectRef.current = { title: projectTitle, nodes, edges };
         setProjects((current) => current.map((item) => item.id === projectId ? { ...item, title: projectTitle, version: data.project!.version } : item));
         setProjectConflict(false); setNotice("所有更改已保存");
       } catch {
@@ -311,6 +366,7 @@ function CanvasApp() {
       }
       if (!response.ok || !data.project) { setNotice(data.detail || "当前工程保存失败，已取消切换"); return false; }
       versionRef.current = data.project.version;
+      lastSyncedProjectRef.current = { title: projectTitle, nodes, edges };
       setProjects((current) => current.map((item) => item.id === projectId ? { ...item, ...data.project } : item));
       setNotice("当前工程已保存");
       return true;
@@ -327,7 +383,9 @@ function CanvasApp() {
     setProjectRole(""); setProjectId(data.project.id); setProjectTitle(data.project.title);
     versionRef.current = data.project.version;
     const nextNodes = (data.project.canvas.nodes || []).map(normalizeStudioNode);
-    setNodes(nextNodes); setEdges((data.project.canvas.edges || []).map((edge) => ({ ...edge, type: "pulse" })));
+    const nextEdges = (data.project.canvas.edges || []).map((edge) => ({ ...edge, type: "pulse" }));
+    lastSyncedProjectRef.current = { title: data.project.title, nodes: nextNodes, edges: nextEdges };
+    setNodes(nextNodes); setEdges(nextEdges);
     setSelectedId(nextNodes[0]?.id || ""); setProjectConflict(false);
     setProjects((current) => current.map((item) => item.id === data.project!.id ? { ...item, ...data.project } : item));
     setNotice(`已打开工程：${data.project.title}`);
@@ -354,6 +412,7 @@ function CanvasApp() {
     if (!response.ok || !data.project) { setNotice(data.detail || "新建工程失败"); return; }
     setProjects((current) => [data.project!, ...current]);
     suppressNextSaveRef.current = true; setProjectRole(""); setProjectId(data.project.id); setProjectTitle(data.project.title);
+    lastSyncedProjectRef.current = { title: data.project.title, nodes: [], edges: [] };
     versionRef.current = data.project.version; setNodes([]); setEdges([]); setSelectedId(""); setProjectConflict(false);
     setNotice("空白工程已创建，请从“新建”添加第一个节点");
   };
@@ -364,7 +423,9 @@ function CanvasApp() {
     const data = await response.json() as { project?: { title: string; version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } }; detail?: string };
     if (!response.ok || !data.project) { setNotice(data.detail || "项目重新载入失败"); return; }
     suppressNextSaveRef.current = true;
-    versionRef.current = data.project.version; setProjectTitle(data.project.title); setNodes(data.project.canvas.nodes.map(normalizeStudioNode)); setEdges(data.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }))); setProjectConflict(false); setNotice("已载入服务器上的最新版本");
+    const nextNodes = data.project.canvas.nodes.map(normalizeStudioNode), nextEdges = data.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }));
+    lastSyncedProjectRef.current = { title: data.project.title, nodes: nextNodes, edges: nextEdges };
+    versionRef.current = data.project.version; setProjectTitle(data.project.title); setNodes(nextNodes); setEdges(nextEdges); setSelectedId(nextNodes[0]?.id || ""); setProjectConflict(false); setNotice("已载入服务器上的最新版本");
   };
 
   const onConnect = useCallback((connection: Connection) => {
@@ -425,8 +486,10 @@ function CanvasApp() {
     const childIds = Array.isArray(group.data.desktopPayload?.group_nodes) ? group.data.desktopPayload.group_nodes.map(String) : [];
     return childIds.map((childId) => nodes.find((node) => node.id === childId)).filter((node): node is StudioNode => Boolean(node)).map((node) => {
       const payload = node.data.desktopPayload || {};
-      const sources = edges.filter((edge) => edge.target === node.id).map((edge) => nodes.find((item) => item.id === edge.source)).filter((item): item is StudioNode => Boolean(item));
-      const references = sources.map((source) => ({ node_id: source.id, title: source.data.title, asset_id: source.data.desktopPayload?.asset_id || (Array.isArray(source.data.desktopPayload?.output_asset_ids) ? source.data.desktopPayload.output_asset_ids[0] : undefined) })).filter((item) => item.asset_id);
+      const sourceEdges = edges.filter((edge) => edge.target === node.id);
+      const sources = sourceEdges.map((edge) => nodes.find((item) => item.id === edge.source)).filter((item): item is StudioNode => Boolean(item));
+      const references = sources.map((source) => { const relation = String((sourceEdges.find((edge) => edge.source === source.id)?.data as Record<string, unknown> | undefined)?.relation || "reference"); return { node_id: source.id, title: source.data.title, asset_id: source.data.desktopPayload?.asset_id || (Array.isArray(source.data.desktopPayload?.output_asset_ids) ? source.data.desktopPayload.output_asset_ids[0] : undefined), role: relation }; }).filter((item) => item.asset_id);
+      const selectedAction = String(payload.editor_action || "");
       const mappings: Record<string, { kind: string; provider: string; model: string }> = {
         script: { kind: "chat", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
         copywriting: { kind: "chat", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
@@ -434,15 +497,20 @@ function CanvasApp() {
         scene_reference: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
         character_reference: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
         element_reference: { kind: references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
-        video: { kind: references.length ? "image_to_video" : "text_to_video", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
-        multi_director: { kind: references.length ? "image_to_video" : "text_to_video", provider: String(payload.provider_name || ""), model: String(payload.model || "") },
-        audio: { kind: String(payload.editor_action || "") === "音效" ? "text_to_audio" : "text_to_speech", provider: String(payload.provider_name || ""), model: String(payload.voice || "") },
+        video: { kind: selectedAction === "基于尾帧续拍" ? "continue_video" : selectedAction === "提取首中尾帧" ? "extract_video_frames" : selectedAction === "图生视频" ? "image_to_video" : "text_to_video", provider: selectedAction === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), model: String(payload.model || "") },
+        multi_director: { kind: selectedAction === "基于尾帧续拍" ? "continue_video" : selectedAction === "提取首中尾帧" ? "extract_video_frames" : references.some((item) => ["first_frame", "last_frame"].includes(item.role)) ? "image_to_video" : "text_to_video", provider: selectedAction === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), model: String(payload.model || "") },
+        audio: { kind: "text_to_speech", provider: String(payload.provider_name || ""), model: String(payload.voice || "") },
         analysis: { kind: "video_breakdown", provider: "local", model: "local" },
-        shot: { kind: String(payload.editor_action || "") === "生成视频" ? (references.length ? "image_to_video" : "text_to_video") : String(payload.editor_action || "") === "生成对白" ? "text_to_speech" : references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || payload.voice || "") },
+        shot: { kind: selectedAction === "生成视频" ? (references.length ? "image_to_video" : "text_to_video") : selectedAction === "生成对白" ? "text_to_speech" : selectedAction === "参考图再生成" ? "image_edit" : references.length ? "image_edit" : "text_to_image", provider: String(payload.provider_name || ""), model: String(payload.model || payload.voice || "") },
       };
       const mapping = mappings[node.data.specKey];
       if (!mapping) return null;
-      return { node_id: node.id, kind: mapping.kind, provider: mapping.provider, model: mapping.model, input: { inputs: { prompt: node.data.description, references }, params: payload, action: String(payload.editor_action || "生成"), use_cache: false } };
+      const taskReferences = [...references];
+      if (["continue_video", "extract_video_frames"].includes(mapping.kind)) {
+        const ownIds = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean);
+        taskReferences.unshift(...ownIds.map((assetId) => ({ node_id: node.id, title: node.data.title, asset_id: assetId, role: "video_source" })));
+      }
+      return { node_id: node.id, kind: mapping.kind, provider: mapping.provider, model: mapping.model, input: { inputs: { prompt: node.data.specKey === "shot" ? compileShotPrompt(node) : node.data.description, references: taskReferences }, params: payload, action: selectedAction || "生成", use_cache: false } };
     }).filter((item): item is NonNullable<typeof item> => Boolean(item));
   };
 
@@ -488,15 +556,30 @@ function CanvasApp() {
     }
     if (selectedNode.data.specKey === "script") {
       const versions = Array.isArray(payload.script_versions) ? [...payload.script_versions] : [];
+      if (action === "采用AI候选稿") {
+        const candidate = String(payload.script_candidate || "").trim();
+        if (!candidate) { setNotice("当前没有可采用的 AI 候选稿"); return; }
+        const now = new Date().toISOString();
+        const nextVersions = [
+          ...versions,
+          { version: versions.length + 1, content: selectedNode.data.description, saved_at: now, note: "采用候选稿前" },
+          { version: versions.length + 2, content: candidate, saved_at: now, note: "采用AI候选稿" },
+        ];
+        setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, description: candidate, status: `剧本 V${nextVersions.length} · 候选稿已采用`, desktopPayload: { ...(node.data.desktopPayload || {}), script_versions: nextVersions, script_version: nextVersions.length, script_locked: false, script_candidate: "", script_review: "" } } } : node));
+        setNotice("AI 候选稿已采用，原稿已保存在节点版本历史中"); return;
+      }
+      if (action === "清除AI结果") {
+        updatePayload("script_candidate", ""); updatePayload("script_review", ""); setNotice("AI 候选稿 / 报告已关闭，原稿未修改"); return;
+      }
       if (action === "保存版本") { versions.push({ version: versions.length + 1, content: selectedNode.data.description, saved_at: new Date().toISOString() }); updatePayload("script_versions", versions); updatePayload("script_version", versions.length); setNotice(`剧本版本 ${versions.length} 已保存到画布节点`); return; }
-      if (action === "恢复上一版") { const previous = versions.at(-1) as { content?: string } | undefined; if (!previous?.content) { setNotice("还没有可恢复的剧本版本"); return; } updateSelected("description", previous.content); setNotice("已恢复上一版，保存后不会删除历史版本"); return; }
+      if (action === "恢复上一版") { const latest = versions.at(-1) as { content?: string } | undefined; const previous = latest?.content === selectedNode.data.description ? versions.at(-2) as { content?: string } | undefined : latest; if (!previous?.content) { setNotice("还没有可恢复的上一版"); return; } updateSelected("description", previous.content); setNotice("已恢复上一版，历史版本没有删除"); return; }
       if (action === "切换剧本定稿") { updatePayload("script_locked", !payload.script_locked); setNotice(payload.script_locked ? "剧本已解除定稿" : "剧本已定稿锁定"); return; }
       if (action === "创建制片项目") { createDerivedNode(selectedNode, "storyboard", "script_source", { source_script_node_id: selectedNode.id }); return; }
     }
     if (selectedNode.data.specKey === "copywriting") {
       if (action === "复制文案") { try { await navigator.clipboard.writeText(selectedNode.data.description); setNotice("文案已复制"); } catch { setNotice("浏览器未授予剪贴板权限，请手动复制"); } return; }
       if (action === "恢复原文") { const original = String(payload.original_text || ""); if (!original) { setNotice("当前节点没有保存原文"); return; } updateSelected("description", original); setNotice("已恢复原文"); return; }
-      if (!payload.original_text) updatePayload("original_text", selectedNode.data.description);
+      if (action === "翻译" && !payload.original_text) updatePayload("original_text", selectedNode.data.description);
     }
     if (selectedNode.data.specKey === "analysis" && action === "导出拉片报告") {
       const report = payload.analysis_result || payload.analysis;
@@ -513,7 +596,9 @@ function CanvasApp() {
         if (response.status === 409) { versionRef.current = result.currentVersion || versionRef.current; setProjectConflict(true); setNotice("其他成员已更新画布，请重新载入后再审片"); return; }
         if (!response.ok || !result.project) { setNotice(result.detail || "审片决定保存失败"); return; }
         versionRef.current = result.project.version; suppressNextSaveRef.current = true;
-        setNodes(result.project.canvas.nodes.map(normalizeStudioNode)); setEdges(result.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" })));
+        const nextNodes = result.project.canvas.nodes.map(normalizeStudioNode), nextEdges = result.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }));
+        lastSyncedProjectRef.current = { title: projectTitle, nodes: nextNodes, edges: nextEdges };
+        setNodes(nextNodes); setEdges(nextEdges);
         setNotice(`${selectedNode.data.title} · ${statusText}，审片决定已写入服务器`); return;
       }
       setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: statusText, desktopPayload: { ...(node.data.desktopPayload || {}), review_decision: action, review_at: new Date().toISOString() } } } : node));
@@ -540,10 +625,13 @@ function CanvasApp() {
       }
       if (action === "执行工作流") {
         if (!controlled || !projectId) { setNotice("接入公司服务器后才能执行持久工作流"); return; }
+        if (!await saveCurrentProjectNow()) return;
         if (payload.workflow_status === "failed" && runId) {
           const response = await apiFetch(`/api/workflow-runs/${runId}/command`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ command: "retry" }) });
           const data = await response.json() as { run?: { status: string }; detail?: string }; if (!response.ok || !data.run) { setNotice(data.detail || "工作流重试失败"); return; } void pollWorkflowRun(runId, selectedNode); return;
         }
+        const unsupportedAudio = groupIds.map((id) => nodes.find((node) => node.id === id)).find((node) => node?.data.specKey === "audio" && node.data.desktopPayload?.editor_action === "音效");
+        if (unsupportedAudio) { setNotice(`“${unsupportedAudio.data.title}”选择了音效，但当前没有独立音效模型；任务未提交，避免错误扣费`); return; }
         const items = buildWorkflowItems(selectedNode);
         if (!items.length) { setNotice("工作流中没有可执行的生成节点"); return; }
         if (items.some((item) => item.provider !== "local" && !item.provider)) { setNotice("工作流中有节点尚未锁定生成引擎"); return; }
@@ -604,28 +692,42 @@ function CanvasApp() {
     if (!projectId) return;
     const response = await apiFetch(`/api/projects/${projectId}`, { cache: "no-store" });
     if (!response.ok) return;
-    const detail = await response.json() as { project?: { version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
+    const detail = await response.json() as { project?: { title: string; version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
     if (!detail.project) return;
-    versionRef.current = detail.project.version;
     const serverNodes = detail.project.canvas.nodes.map(normalizeStudioNode);
+    const serverEdges = detail.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" }));
     const serverSource = serverNodes.find((node) => node.id === nodeId);
-    setNodes((current) => {
-      const existing = new Set(current.map((node) => node.id));
-      const merged = current.map((node) => node.id === nodeId && serverSource ? {
-        ...node,
+    const base = lastSyncedProjectRef.current, latestNodes = nodesRef.current, latestEdges = edgesRef.current;
+    const baseById = new Map(base.nodes.map((node) => [node.id, node])), latestById = new Map(latestNodes.map((node) => [node.id, node]));
+    const changedIds = new Set(latestNodes.filter((node) => JSON.stringify(node) !== JSON.stringify(baseById.get(node.id))).map((node) => node.id));
+    const deletedIds = new Set(base.nodes.filter((node) => !latestById.has(node.id)).map((node) => node.id));
+    const mergedNodes = serverNodes.filter((node) => !deletedIds.has(node.id)).map((serverNode) => {
+      const local = latestById.get(serverNode.id);
+      if (!local) return serverNode;
+      if (serverNode.id === nodeId && serverSource) return {
+        ...local,
         data: {
-          ...node.data,
+          ...local.data,
+          description: serverSource.data.specKey === "copywriting" ? serverSource.data.description : local.data.description,
           status: serverSource.data.status,
           progress: serverSource.data.progress,
-          desktopPayload: { ...(node.data.desktopPayload || {}), ...(serverSource.data.desktopPayload || {}) },
+          desktopPayload: { ...(local.data.desktopPayload || {}), ...(serverSource.data.desktopPayload || {}) },
         },
-      } : node);
-      return [...merged, ...serverNodes.filter((node) => !existing.has(node.id))];
+      };
+      return changedIds.has(serverNode.id) ? local : serverNode;
     });
-    setEdges((current) => {
-      const existing = new Set(current.map((edge) => edge.id));
-      return [...current, ...detail.project!.canvas.edges.filter((edge) => !existing.has(edge.id)).map((edge) => ({ ...edge, type: "pulse" }))];
-    });
+    const serverIds = new Set(serverNodes.map((node) => node.id));
+    mergedNodes.push(...latestNodes.filter((node) => !serverIds.has(node.id) && !baseById.has(node.id)));
+    const edgesChanged = JSON.stringify(latestEdges) !== JSON.stringify(base.edges);
+    const mergedEdges = edgesChanged ? [...latestEdges, ...serverEdges.filter((edge) => !latestEdges.some((current) => current.id === edge.id))] : serverEdges;
+    const latestTitle = projectTitleRef.current;
+    const titleChanged = latestTitle !== base.title;
+    const hasLocalChanges = changedIds.size > 0 || deletedIds.size > 0 || edgesChanged || titleChanged;
+    lastSyncedProjectRef.current = { title: detail.project.title, nodes: serverNodes, edges: serverEdges };
+    if (!hasLocalChanges) suppressNextSaveRef.current = true;
+    versionRef.current = detail.project.version; setProjectTitle(titleChanged ? latestTitle : detail.project.title);
+    setNodes(mergedNodes); setEdges(mergedEdges); setProjectConflict(false);
+    setProjects((current) => current.map((project) => project.id === projectId ? { ...project, title: titleChanged ? latestTitle : detail.project!.title, version: detail.project!.version } : project));
   }
 
   async function pollTask(taskId: string, nodeId: string) {
@@ -638,8 +740,7 @@ function CanvasApp() {
         setNodes((current) => current.map((node) => {
           if (node.id !== nodeId) return node;
           const output = data.task.output || {};
-          const text = typeof output.data === "string" ? output.data : "";
-          return { ...node, data: { ...node.data, description: data.task.status === "completed" && text ? text : node.data.description, status: data.task.status === "completed" ? "生成完成" : data.task.status === "failed" ? "生成失败" : `AI 制片中 · ${data.task.progress}%`, progress: data.task.progress, desktopPayload: { ...(node.data.desktopPayload || {}), ...(output.asset_ids ? { output_asset_ids: output.asset_ids } : {}), ...(output.analysis ? { analysis_result: output.analysis } : {}) } } };
+          return { ...node, data: { ...node.data, status: data.task.status === "completed" ? "生成完成" : data.task.status === "failed" ? "生成失败" : `AI 制片中 · ${data.task.progress}%`, progress: data.task.progress, desktopPayload: { ...(node.data.desktopPayload || {}), ...(output.asset_ids ? { output_asset_ids: output.asset_ids } : {}), ...(output.analysis ? { analysis_result: output.analysis } : {}) } } };
         }));
         if (data.task.status === "completed") { await new Promise((resolve) => window.setTimeout(resolve, 200)); await mergeServerResult(nodeId); setNotice("生成完成，结果已写回画布节点"); return; }
         if (["failed", "cancelled"].includes(data.task.status)) { await mergeServerResult(nodeId); setNotice(data.task.error_message || "任务已停止"); return; }
@@ -680,12 +781,17 @@ function CanvasApp() {
     if (!selectedNode || !projectId) { setNotice("项目尚未同步完成，请稍后再试"); return; }
     if (!controlled) { setNotice("当前是私有预览；连接公司服务器后即可提交真实生成任务"); return; }
     if (!canWrite) { setNotice("当前项目是只读状态，不能提交生成任务"); return; }
+    if (!await saveCurrentProjectNow()) return;
     if (selectedNode.data.specKey === "storyboard") {
       await productionCommand("start");
       return;
     }
     const payload = selectedNode.data.desktopPayload || {};
     const specKey = selectedNode.data.specKey;
+    const selectedAction = String(payload.editor_action || NODE_SPEC_BY_KEY[specKey]?.actions[0] || "生成");
+    if (specKey === "audio" && selectedAction === "音效") {
+      setNotice("当前已接入的是配音引擎，不会把文字伪装成音效；请使用带原生声音的视频模型，或由管理员接入独立音效模型"); return;
+    }
     const directorTimeline = Array.isArray(payload.timeline_images) ? payload.timeline_images as Array<Record<string, unknown>> : [];
     const directorDuration = Number(payload.duration || 10), directorStep = incomingNodes.length ? directorDuration / incomingNodes.length : directorDuration;
     const effectiveDirectorTimeline = incomingNodes.map((node, index) => ({ source_node_id: node.id, start: Number((index * directorStep).toFixed(2)), end: Number(((index + 1) * directorStep).toFixed(2)), purpose: "continuity", action: "推进一个清晰动作", camera: "", ...(directorTimeline.find((item) => item.source_node_id === node.id) || {}) }));
@@ -715,16 +821,29 @@ function CanvasApp() {
       scene_reference: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
       character_reference: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
       element_reference: { provider: String(payload.provider_name || ""), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
-      multi_director: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : hasDirectorFrame ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
-      video: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : incomingNodes.length ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
-      audio: { provider: String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "音效" ? "text_to_audio" : "text_to_speech", model: String(payload.voice || "") },
+      multi_director: { provider: selectedAction === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), operation: selectedAction === "基于尾帧续拍" ? "continue_video" : selectedAction === "提取首中尾帧" ? "extract_video_frames" : hasDirectorFrame ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
+      video: { provider: selectedAction === "提取首中尾帧" ? "local" : String(payload.provider_name || ""), operation: selectedAction === "基于尾帧续拍" ? "continue_video" : selectedAction === "提取首中尾帧" ? "extract_video_frames" : selectedAction === "图生视频" ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
+      audio: { provider: String(payload.provider_name || ""), operation: "text_to_speech", model: String(payload.voice || "") },
       analysis: { provider: "local", operation: "video_breakdown", model: "local" },
       skill: { provider: String(payload.provider_name || ""), operation: "chat", model: String(payload.model || "") },
-      shot: { provider: String(payload.provider_name || ""), operation: String(payload.editor_action || "") === "生成视频" ? (incomingNodes.length ? "image_to_video" : "text_to_video") : String(payload.editor_action || "") === "生成对白" ? "text_to_speech" : incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || payload.voice || "") },
+      shot: { provider: String(payload.provider_name || ""), operation: selectedAction === "生成视频" ? (incomingNodes.length ? "image_to_video" : "text_to_video") : selectedAction === "生成对白" ? "text_to_speech" : selectedAction === "参考图再生成" ? "image_edit" : incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || payload.voice || "") },
     };
     const task = mapping[specKey];
     if (!task) { setNotice("该运行节点由上游工作流自动驱动，不能单独提交"); return; }
     if (task.provider !== "local" && !task.provider) { setNotice("请先在节点设置中明确选择生成引擎；系统不会替你静默切换模型"); return; }
+    const ownAssetIds = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean).map(String);
+    const usableIncoming = incomingNodes.filter((node) => node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) && node.data.desktopPayload.output_asset_ids.length));
+    if (task.operation === "image_to_video" && !usableIncoming.length) { setNotice("图生视频必须连接一个已有媒体的图片节点，并明确首帧职责"); return; }
+    if (specKey === "video" && task.operation === "image_to_video") {
+      const settings = Array.isArray(payload.reference_settings) ? payload.reference_settings as Array<Record<string, unknown>> : [];
+      const roles = incomingNodes.map((node) => { const configured = settings.find((item) => item.source_node_id === node.id); const relation = String((edges.find((edge) => edge.source === node.id && edge.target === selectedNode.id)?.data as Record<string, unknown> | undefined)?.relation || ""); const assetId = node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : ""); return String(configured?.purpose || (relation === "first_frame" ? "first_frame" : relation === "last_frame" || String(assetId || "") === String(payload.last_frame_asset_id || "") ? "last_frame" : "reference")); });
+      const firstCount = roles.filter((role) => role === "first_frame").length, lastCount = roles.filter((role) => role === "last_frame").length;
+      if (firstCount !== 1) { setNotice(firstCount ? "图生视频只能指定一个首帧" : "图生视频需要把一张输入图片明确设为“视频首帧”"); return; }
+      if (lastCount > 1) { setNotice("图生视频只能指定一个尾帧"); return; }
+    }
+    if (["continue_video", "extract_video_frames"].includes(task.operation) && !ownAssetIds.length) { setNotice(task.operation === "continue_video" ? "当前视频节点还没有可用成片，无法取得尾帧续拍" : "当前视频节点还没有可用成片，无法抽帧"); return; }
+    if (task.operation === "video_breakdown" && !usableIncoming.length) { setNotice("请先把一个已上传或已生成的视频节点连接到 AI 拉片节点"); return; }
+    if (specKey === "shot" && selectedAction === "参考图再生成" && !usableIncoming.length) { setNotice("参考图再生成必须先连接一张已有媒体的图片节点"); return; }
     if (specKey === "video" && payload.last_frame_asset_id) {
       const firstAvailable = incomingNodes.some((node) => String(node.data.desktopPayload?.asset_id || "") !== String(payload.last_frame_asset_id));
       if (!firstAvailable) { setNotice("尾帧不能单独生成视频，请再连接一张图片作为首帧"); return; }
@@ -735,31 +854,35 @@ function CanvasApp() {
       if (rows.some((item, index) => index > 0 && item.start < rows[index - 1].end)) { setNotice("导演时间轴存在重叠，请调整每张图的开始与结束秒数"); return; }
       if (rows.some((item) => item.end > Number(payload.duration || 10))) { setNotice("导演时间轴超出视频总时长，请先调整节点时长或时间段"); return; }
       if (effectiveDirectorTimeline.filter((item) => item.purpose === "first_frame").length > 1 || effectiveDirectorTimeline.filter((item) => item.purpose === "last_frame").length > 1) { setNotice("首帧和尾帧各只能指定一张图片"); return; }
+      if (effectiveDirectorTimeline.some((item) => item.purpose === "last_frame") && !effectiveDirectorTimeline.some((item) => item.purpose === "first_frame")) { setNotice("多图导演指定尾帧时也必须指定一个首帧"); return; }
     }
     const providerOperation = task.operation === "continue_video" ? "image_to_video" : task.operation === "extract_video_frames" ? "" : task.operation;
     if (providerOperation && task.provider !== "local" && providers.length && !providers.some((provider) => provider.name === task.provider && provider.capabilities.includes(providerOperation))) { setNotice(`“${task.provider}”当前不可用或不支持 ${providerOperation}，请在节点中明确选择可用模型`); return; }
     const selectedProvider = providers.find((provider) => provider.name === task.provider);
     const referenceLimit = Number(selectedProvider?.profile?.reference_assets || 0);
     if (referenceLimit && incomingNodes.length > referenceLimit) { setNotice(`${task.provider} 单次最多支持 ${referenceLimit} 张参考图；当前连接 ${incomingNodes.length} 张。请减少输入或拆成连续段落，系统不会静默丢图`); return; }
-    const action = String(payload.editor_action || NODE_SPEC_BY_KEY[specKey]?.actions[0] || "生成");
+    const action = selectedAction;
     const quoteResponse = await apiFetch(`/api/tasks/quote?kind=${encodeURIComponent(task.operation)}&provider=${encodeURIComponent(task.provider)}&model=${encodeURIComponent(task.model)}`, { cache: "no-store" });
     const quoteData = await quoteResponse.json() as { quote?: { credits: number }; detail?: string };
     if (!quoteResponse.ok || !quoteData.quote) { setNotice(quoteData.detail || "当前账号没有该任务的可用额度"); return; }
     const run = async () => {
       setPendingTask(null);
       setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: "正在排队", progress: 0 } } : node));
-      const ownAssetIds = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean);
       const ownAssets = ownAssetIds.map((assetId) => ({ node_id: selectedNode.id, title: selectedNode.data.title, asset_id: assetId }));
       const referenceSettings = Array.isArray(payload.reference_settings) ? payload.reference_settings as Array<Record<string, unknown>> : [];
       const timelineSettings = effectiveDirectorTimeline;
       let references = incomingNodes.map((node) => {
         const settings = (specKey === "multi_director" ? timelineSettings : referenceSettings).find((item) => item.source_node_id === node.id) || {};
-        return { node_id: node.id, title: node.data.title, asset_id: node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : undefined), role: String(settings.purpose || "reference"), instruction: settings.instruction || settings.action, camera: settings.camera };
+        const relation = String((edges.find((edge) => edge.source === node.id && edge.target === selectedNode.id)?.data as Record<string, unknown> | undefined)?.relation || "");
+        const assetId = node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : undefined);
+        const inferredRole = relation === "first_frame" ? "first_frame" : relation === "last_frame" || String(assetId || "") === String(payload.last_frame_asset_id || "") ? "last_frame" : "reference";
+        return { node_id: node.id, title: node.data.title, asset_id: assetId, role: String(settings.purpose || inferredRole), instruction: settings.instruction || settings.action, camera: settings.camera };
       });
       if (specKey === "video" && payload.last_frame_asset_id) references = [...references.filter((item) => String(item.asset_id || "") !== String(payload.last_frame_asset_id)), ...references.filter((item) => String(item.asset_id || "") === String(payload.last_frame_asset_id))];
       if (["continue_video", "extract_video_frames"].includes(task.operation)) references.unshift(...ownAssets);
       const taskParams = specKey === "multi_director" ? { ...payload, timeline_images: effectiveDirectorTimeline } : payload;
-      const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: quoteData.quote!.credits, input: { inputs: { prompt: selectedNode.data.description, references }, params: taskParams, action, use_cache: false } }) });
+      const prompt = specKey === "shot" ? compileShotPrompt(selectedNode) : selectedNode.data.description;
+      const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: quoteData.quote!.credits, input: { inputs: { prompt, references }, params: taskParams, action, use_cache: false } }) });
       const data = await response.json() as { task?: { id: string }; detail?: string };
       if (!response.ok || !data.task) { setNotice(data.detail || "任务提交失败"); return; }
       setNotice("任务已进入公司队列"); void pollTask(data.task.id, selectedNode.id);
@@ -888,11 +1011,15 @@ function CanvasApp() {
             </div>
             <label><span>节点名称</span><input value={selectedNode.data.title} onChange={(event) => updateSelected("title", event.target.value)} /></label>
             <label><span>创作要求</span><textarea value={selectedNode.data.description} onChange={(event) => updateSelected("description", event.target.value)} rows={6} /></label>
+            {selectedNode.data.specKey === "script" && Boolean(selectedNode.data.desktopPayload?.script_candidate || selectedNode.data.desktopPayload?.script_review) && <div className="script-result-panel"><strong>{selectedNode.data.desktopPayload?.script_review ? "AI 剧本审阅报告" : "AI 候选稿 · 原稿尚未修改"}</strong><textarea readOnly rows={8} value={String(selectedNode.data.desktopPayload?.script_review || selectedNode.data.desktopPayload?.script_candidate || "")} /><div>{selectedNode.data.desktopPayload?.script_candidate && canWrite && <button onClick={() => void handleNodeAction("采用AI候选稿")}>采用候选稿</button>}{canWrite && <button onClick={() => void handleNodeAction("清除AI结果")}>关闭结果</button>}</div></div>}
             {(["storyboard", "multi_image", "multi_director", "video", "scene_reference", "character_reference", "element_reference"].includes(selectedNode.data.specKey)) && <div className="field-row"><label><span>画面比例</span><select value={String(selectedNode.data.desktopPayload?.ratio || selectedNode.data.desktopPayload?.production_ratio || "16:9")} onChange={(event) => updatePayload(selectedNode.data.specKey === "storyboard" ? "production_ratio" : "ratio", event.target.value)}><option>16:9</option><option>9:16</option><option>1:1</option><option>4:5</option></select></label><label><span>{selectedNode.data.specKey === "storyboard" ? "镜头数" : "候选数量"}</span><input type="number" min="0" max="50" value={Number(selectedNode.data.specKey === "storyboard" ? selectedNode.data.desktopPayload?.shot_count || 0 : selectedNode.data.desktopPayload?.candidate_count || 1)} onChange={(event) => updatePayload(selectedNode.data.specKey === "storyboard" ? "shot_count" : "candidate_count", Number(event.target.value))} /></label></div>}
-            {selectedNode.data.specKey === "copywriting" && <><label><span>产品 / 品牌</span><input value={String(selectedNode.data.desktopPayload?.product_name || "")} onChange={(event) => updatePayload("product_name", event.target.value)} /></label><label><span>产品卖点与必须保留的信息</span><textarea rows={4} value={String(selectedNode.data.desktopPayload?.product_description || "")} onChange={(event) => updatePayload("product_description", event.target.value)} /></label><div className="field-row"><label><span>口播风格</span><select value={String(selectedNode.data.desktopPayload?.copy_style || "激情抓眼球")} onChange={(event) => updatePayload("copy_style", event.target.value)}><option>激情抓眼球</option><option>沉稳放松</option><option>幽默有趣</option><option>高端大气</option><option>情感共鸣</option><option>专业权威</option></select></label><label><span>目标秒数</span><input type="number" min="5" value={Number(selectedNode.data.desktopPayload?.copy_duration || 30)} onChange={(event) => updatePayload("copy_duration", event.target.value)} /></label></div></>}
+            {selectedNode.data.specKey === "copywriting" && <><label><span>产品 / 品牌</span><input value={String(selectedNode.data.desktopPayload?.product_name || "")} onChange={(event) => updatePayload("product_name", event.target.value)} /></label><label><span>产品卖点与必须保留的信息</span><textarea rows={4} value={String(selectedNode.data.desktopPayload?.product_description || "")} onChange={(event) => updatePayload("product_description", event.target.value)} /></label><div className="field-row"><label><span>口播风格</span><select value={String(selectedNode.data.desktopPayload?.copy_style || "激情抓眼球")} onChange={(event) => updatePayload("copy_style", event.target.value)}><option>激情抓眼球</option><option>沉稳放松</option><option>幽默有趣</option><option>高端大气</option><option>情感共鸣</option><option>专业权威</option></select></label><label><span>目标秒数</span><input type="number" min="5" value={Number(selectedNode.data.desktopPayload?.copy_duration || 30)} onChange={(event) => updatePayload("copy_duration", event.target.value)} /></label></div><label><span>翻译目标语言</span><select value={String(selectedNode.data.desktopPayload?.copy_language || "英语")} onChange={(event) => updatePayload("copy_language", event.target.value)}><option>英语</option><option>日语</option><option>韩语</option><option>西班牙语</option><option>法语</option><option>德语</option><option>泰语</option><option>阿拉伯语</option></select></label></>}
+            {["video", "multi_director"].includes(selectedNode.data.specKey) && <><div className="field-row"><label><span>视频时长（秒）</span><input type="number" min="2" max="15" step="1" value={Number(selectedNode.data.desktopPayload?.duration || 10)} onChange={(event) => updatePayload("duration", Number(event.target.value))} /></label><label><span>输出清晰度</span><select value={String(selectedNode.data.desktopPayload?.resolution || "720p")} onChange={(event) => updatePayload("resolution", event.target.value)}><option>720p</option><option>1080p</option></select></label></div><label className="toggle-line"><input type="checkbox" checked={selectedNode.data.desktopPayload?.generate_audio !== false} onChange={(event) => updatePayload("generate_audio", event.target.checked)} /><span>请求模型生成原生声音（仅支持有原生音频能力的模型）</span></label>{selectedNode.data.desktopPayload?.generate_audio !== false && <label><span>声音计划</span><textarea rows={3} placeholder="对白、环境声、动作声及出现时间；不要只写‘有声音’" value={String(selectedNode.data.desktopPayload?.audio_prompt || "")} onChange={(event) => updatePayload("audio_prompt", event.target.value)} /></label>}</>}
+            {selectedNode.data.specKey === "shot" && <div className="shot-contract"><div><strong>导演合同</strong><span>字段会直接进入关键帧和视频提示词</span></div>{([['story_function','故事功能','观众通过本镜新知道或感受到什么'],['visual_thesis','视觉命题','本镜的核心画面表达'],['action_start','动作起点','姿态、位置与朝向'],['primary_action','唯一主动作','一个动作、速度与方向'],['action_end','动作终点','动作结束后的稳定状态'],['dominant_camera_move','唯一主运镜','固定，或一种推拉摇移跟'],['dialogue','对白','本镜需要生成的对白'],['generation_risk','主要生成风险','身份、空间、动作或物理风险']] as const).map(([key,label,placeholder]) => <label key={key}><span>{label}</span><input placeholder={placeholder} value={String(((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>)[key] || '')} onChange={(event) => updatePayload('shot', { ...((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>), [key]: event.target.value })} /></label>)}<div className="field-row"><label><span>景别</span><select value={String(((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>).shot_size || '中景')} onChange={(event) => updatePayload('shot', { ...((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>), shot_size: event.target.value })}><option>远景</option><option>全景</option><option>中景</option><option>近景</option><option>特写</option></select></label><label><span>镜头时长</span><input type="number" min="0.5" max="15" step="0.5" value={Number(((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>).duration || 5)} onChange={(event) => updatePayload('shot', { ...((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>), duration: Number(event.target.value) })} /></label></div><label><span>连续性不变量（每行一条）</span><textarea rows={4} value={Array.isArray(((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>).continuity_invariants) ? (((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>).continuity_invariants as unknown[]).join('\n') : String(((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>).continuity_invariants || '')} onChange={(event) => updatePayload('shot', { ...((selectedNode.data.desktopPayload?.shot || {}) as Record<string, unknown>), continuity_invariants: event.target.value.split('\n').map((value) => value.trim()).filter(Boolean) })} /></label></div>}
             {controlled && selectedNode.data.specKey === "storyboard" && <div className="provider-locks"><label><span>拆镜 / 编剧引擎</span><select value={String(selectedNode.data.desktopPayload?.planning_provider || "")} onChange={(event) => updatePayload("planning_provider", event.target.value)}><option value="">明确选择</option>{providers.filter((item) => item.capabilities.includes("chat")).map((item) => <option key={item.name}>{item.name}</option>)}</select></label><label><span>图片引擎</span><select value={String(selectedNode.data.desktopPayload?.image_provider || "")} onChange={(event) => updatePayload("image_provider", event.target.value)}><option value="">明确选择</option>{providers.filter((item) => item.capabilities.includes("text_to_image")).map((item) => <option key={item.name}>{item.name}</option>)}</select></label><label><span>视频引擎</span><select value={String(selectedNode.data.desktopPayload?.video_provider || "")} onChange={(event) => updatePayload("video_provider", event.target.value)}><option value="">明确选择</option>{providers.filter((item) => item.capabilities.includes("text_to_video")).map((item) => <option key={item.name}>{item.name}</option>)}</select></label></div>}
-            {controlled && !["storyboard", "analysis", "image_asset", "workflow", "task", "result", "project"].includes(selectedNode.data.specKey) && <label><span>生成引擎（明确锁定，不自动切换）</span><select value={String(selectedNode.data.desktopPayload?.provider_name || "")} onChange={(event) => updatePayload("provider_name", event.target.value)}><option value="">请选择可用引擎</option>{providers.map((provider) => <option key={provider.name} value={provider.name}>{provider.name} · {provider.capabilities.join(" / ")}</option>)}</select></label>}
+            {controlled && !["storyboard", "analysis", "image_asset", "workflow", "task", "result", "project"].includes(selectedNode.data.specKey) && <label><span>生成引擎（明确锁定，不自动切换）</span><select value={String(selectedNode.data.desktopPayload?.provider_name || "")} onChange={(event) => updatePayload("provider_name", event.target.value)}><option value="">请选择支持当前操作的引擎</option>{providers.filter((provider) => { const capability = requiredCapability(selectedNode, incomingNodes.length); return !capability || provider.capabilities.includes(capability); }).map((provider) => <option key={provider.name} value={provider.name}>{provider.name} · {provider.capabilities.join(" / ")}</option>)}</select></label>}
             {selectedNode.data.specKey === "multi_image" && <div className="reference-purpose-editor"><div><strong>逐张定义参考用途</strong><span>{incomingNodes.length} 张输入</span></div>{incomingNodes.length ? incomingNodes.map((node) => { const settings = ((selectedNode.data.desktopPayload?.reference_settings as Array<Record<string, unknown>> | undefined) || []).find((item) => item.source_node_id === node.id) || {}; return <div className="purpose-row" key={node.id}><span>{node.data.title}</span><select aria-label={`${node.data.title}用途`} value={String(settings.purpose || "subject")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { purpose: event.target.value })}><option value="subject">主体身份</option><option value="scene">场景结构</option><option value="composition">构图机位</option><option value="element">道具元素</option><option value="style">视觉风格</option></select><input aria-label={`${node.data.title}补充要求`} placeholder="例如：只参考服装和五官" value={String(settings.instruction || "")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { instruction: event.target.value })} /></div>; }) : <p>把图片节点连入后，会在这里逐张设置用途。</p>}</div>}
+            {selectedNode.data.specKey === "video" && incomingNodes.length > 0 && <div className="reference-purpose-editor"><div><strong>视频输入职责</strong><span>首帧、尾帧与资产参考必须明确</span></div>{incomingNodes.map((node) => { const settings = ((selectedNode.data.desktopPayload?.reference_settings as Array<Record<string, unknown>> | undefined) || []).find((item) => item.source_node_id === node.id) || {}; const relation = String((edges.find((edge) => edge.source === node.id && edge.target === selectedNode.id)?.data as Record<string, unknown> | undefined)?.relation || ""); const assetId = node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : ""); const inferred = relation === "first_frame" ? "first_frame" : relation === "last_frame" || String(assetId || "") === String(selectedNode.data.desktopPayload?.last_frame_asset_id || "") ? "last_frame" : "reference"; return <div className="purpose-row" key={node.id}><span>{node.data.title}</span><select aria-label={`${node.data.title}视频职责`} value={String(settings.purpose || inferred)} onChange={(event) => updateReferenceRow("reference_settings", node.id, { purpose: event.target.value })}><option value="first_frame">视频首帧</option><option value="last_frame">视频尾帧</option><option value="reference">普通参考</option><option value="subject">主体身份</option><option value="scene">场景结构</option><option value="composition">构图机位</option><option value="element">道具元素</option></select><input aria-label={`${node.data.title}视频补充要求`} placeholder="例如：仅保持人物身份" value={String(settings.instruction || "")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { instruction: event.target.value })} /></div>; })}</div>}
             {selectedNode.data.specKey === "multi_director" && <div className="timeline-editor"><div><strong>导演时间轴</strong><span>{incomingNodes.length}/50 张图片 · 当前引擎上限 {Number(providers.find((item) => item.name === selectedNode.data.desktopPayload?.provider_name)?.profile?.reference_assets || 0) || "待选择"}</span></div>{incomingNodes.map((node, index) => { const settings = ((selectedNode.data.desktopPayload?.timeline_images as Array<Record<string, unknown>> | undefined) || []).find((item) => item.source_node_id === node.id) || {}; const start = Number(settings.start ?? index * 3), end = Number(settings.end ?? Math.min(Number(selectedNode.data.desktopPayload?.duration || 10), index * 3 + 3)); return <div className="timeline-row" key={node.id}><span>{index + 1}</span><div className="timeline-source"><strong>{node.data.title}</strong><select aria-label={`${node.data.title}参考用途`} value={String(settings.purpose || "continuity")} onChange={(event) => updateReferenceRow("timeline_images", node.id, { purpose: event.target.value, start, end })}><option value="first_frame">首帧</option><option value="last_frame">尾帧</option><option value="continuity">连续性</option><option value="subject">主体身份</option><option value="scene">场景</option><option value="composition">构图</option></select></div><div className="timeline-time"><input type="number" min="0" step="0.1" aria-label={`${node.data.title}开始秒`} value={start} onChange={(event) => updateReferenceRow("timeline_images", node.id, { start: Number(event.target.value), end })} /><span>—</span><input type="number" min="0" step="0.1" aria-label={`${node.data.title}结束秒`} value={end} onChange={(event) => updateReferenceRow("timeline_images", node.id, { start, end: Number(event.target.value) })} /></div><input aria-label={`${node.data.title}动作`} placeholder="主体动作" value={String(settings.action || settings.instruction || "推进一个清晰动作")} onChange={(event) => updateReferenceRow("timeline_images", node.id, { action: event.target.value, start, end })} /><input aria-label={`${node.data.title}运镜`} placeholder="运镜，例如缓慢推近" value={String(settings.camera || "")} onChange={(event) => updateReferenceRow("timeline_images", node.id, { camera: event.target.value, start, end })} /></div>; })}</div>}
             {selectedNode.data.specKey === "storyboard" && <div className="production-controls"><label><span>制片方式</span><select value={String(selectedNode.data.desktopPayload?.automation_mode || "checkpoints")} onChange={(event) => updatePayload("automation_mode", event.target.value)}><option value="checkpoints">关键节点确认（推荐）</option><option value="auto">全自动</option><option value="manual">逐步控制</option></select></label><div><button onClick={() => void productionCommand("approve")}>审片通过并继续</button><button onClick={() => void productionCommand("accept_risk")}>接受风险并继续</button></div><div><button onClick={() => void productionCommand(selectedNode.data.desktopPayload?.production_status === "paused" ? "resume" : "pause")}>{selectedNode.data.desktopPayload?.production_status === "paused" ? "继续已暂停流程" : "暂停流程"}</button><select aria-label="重做阶段" value={Number(selectedNode.data.desktopPayload?.rewind_stage || 1)} onChange={(event) => updatePayload("rewind_stage", Number(event.target.value))}>{[1,2,3,4,5,6,7].map((stage) => <option key={stage} value={stage}>从第 {stage} 阶段重做</option>)}</select><button onClick={() => void productionCommand("rewind", Number(selectedNode.data.desktopPayload?.rewind_stage || 1))}>确认重做</button></div></div>}
             <div className="reference-box"><div><strong>参考输入 · {incomingNodes.length}</strong><span>{incomingNodes.length ? incomingNodes.map((node) => node.data.title).join("、") : "从其他节点连线后自动出现"}</span></div><button onClick={() => importInputRef.current?.click()}><Upload size={15} /> 导入</button></div>

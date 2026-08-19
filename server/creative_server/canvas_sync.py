@@ -67,6 +67,11 @@ def sync_task_to_canvas(task_id: str) -> None:
             nodes.append(source)
 
         output = json.loads(task.output_json) if task.output_json else {}
+        try:
+            task_input = json.loads(task.input_json or "{}")
+        except json.JSONDecodeError:
+            task_input = {}
+        action = str(task_input.get("action") or "") if isinstance(task_input, dict) else ""
         data = source.setdefault("data", {})
         payload = data.setdefault("desktopPayload", {})
         data["status"] = {
@@ -83,7 +88,25 @@ def sync_task_to_canvas(task_id: str) -> None:
         if "analysis" in output:
             payload["analysis"] = output["analysis"]
         if "data" in output:
-            payload["generated_data"] = output["data"]
+            generated = output["data"]
+            generated_text = generated if isinstance(generated, str) else json.dumps(generated, ensure_ascii=False, indent=2)
+            payload["generated_data"] = generated
+            spec_key = str(data.get("specKey") or "")
+            if spec_key == "copywriting":
+                if action == "翻译" and not payload.get("original_text"):
+                    payload["original_text"] = str(data.get("description") or "")
+                data["description"] = generated_text
+                data["status"] = f"{action or '口播生成'}完成"
+                payload.pop("script_candidate", None); payload.pop("script_review", None)
+            elif spec_key == "script":
+                if action in {"剧本体检", "制片可行性检查"}:
+                    payload["script_review"] = generated_text
+                    payload.pop("script_candidate", None)
+                    data["status"] = f"{action}完成 · 展开节点查看报告"
+                else:
+                    payload["script_candidate"] = generated_text
+                    payload.pop("script_review", None)
+                    data["status"] = "AI 候选稿待确认 · 原稿未修改"
         if task.error_message:
             payload["error_message"] = task.error_message
 

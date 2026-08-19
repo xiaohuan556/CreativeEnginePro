@@ -305,7 +305,9 @@ def get_asset(asset_id: str, user: User = Depends(current_user), db: Session = D
     require_project_read(db, asset.project_id, user)
     path = resolve_object(asset.object_key)
     if not path.is_file(): raise HTTPException(status.HTTP_404_NOT_FOUND, "资产文件已丢失")
-    return FileResponse(path, media_type=asset.content_type, filename=asset.name)
+    return FileResponse(path, media_type=asset.content_type, filename=asset.name,
+                        content_disposition_type="inline",
+                        headers={"Cache-Control": "private, max-age=3600", "X-Content-Type-Options": "nosniff"})
 
 
 @app.post("/api/assets/{asset_id}/save-to-library")

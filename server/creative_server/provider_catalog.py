@@ -23,4 +23,14 @@ def available_providers() -> list[dict]:
             {"name": "seedream", "capabilities": ["text_to_image", "image_edit"], "profile": {"reference_assets": 10}},
             {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"], "profile": {"reference_assets": 9, "native_audio": True}},
         ])
+    try:
+        from api_config import get as api_get
+        for name in ("fish_audio", "elevenlabs", "siliconflow", "deepgram"):
+            if api_get(name).value():
+                capabilities = ["text_to_speech", "clone_voice"] if name == "fish_audio" else ["text_to_speech"]
+                result.append({"name": name, "capabilities": capabilities, "profile": {"cost": "paid"}})
+    except Exception:
+        # The free Edge provider remains usable even when optional desktop TTS
+        # configuration is unavailable in a minimal server image.
+        pass
     return result

@@ -155,6 +155,52 @@ def test_worker_completes_a_persisted_task_and_writes_result() -> None:
         assert project.version == 2
 
 
+def test_text_results_preserve_script_original_and_update_copywriting() -> None:
+    seed_admin()
+    script_node = {"id": "script-result-1", "type": "studio", "position": {"x": 0, "y": 0}, "data": {"title": "剧本", "description": "原始剧本", "kind": "script", "specKey": "script", "desktopType": "text_node", "status": "草稿", "meta": "", "accent": "#fff", "desktopPayload": {}}}
+    copy_node = {"id": "copy-result-1", "type": "studio", "position": {"x": 0, "y": 0}, "data": {"title": "口播", "description": "中文原文", "kind": "copywriting", "specKey": "copywriting", "desktopType": "text_node", "status": "草稿", "meta": "", "accent": "#fff", "desktopPayload": {"copywriting_workbench": True, "copy_language": "英语"}}}
+    canvas = {"protocol": "creative-engine-canvas", "version": 1, "nodes": [script_node, copy_node], "edges": []}
+    with SessionLocal() as db:
+        admin = db.query(User).filter(User.username == "admin").first()
+        project = Project(owner_id=admin.id, title="文本写回", canvas_json=__import__("json").dumps(canvas, ensure_ascii=False))
+        db.add(project); db.flush()
+        script_task = GenerationTask(project_id=project.id, node_id=script_node["id"], owner_id=admin.id, kind="chat", provider="openai", model="test", idempotency_key="script-result-writeback", input_json='{"action":"改写优化"}', output_json='{"data":"AI 修订稿"}', status="completed", progress=100)
+        copy_task = GenerationTask(project_id=project.id, node_id=copy_node["id"], owner_id=admin.id, kind="chat", provider="openai", model="test", idempotency_key="copy-result-writeback", input_json='{"action":"翻译"}', output_json='{"data":"English voiceover"}', status="completed", progress=100)
+        db.add_all([script_task, copy_task]); db.commit(); project_id, script_task_id, copy_task_id = project.id, script_task.id, copy_task.id
+    from creative_server.canvas_sync import sync_task_to_canvas
+    sync_task_to_canvas(script_task_id); sync_task_to_canvas(copy_task_id)
+    with SessionLocal() as db:
+        document = __import__("json").loads(db.get(Project, project_id).canvas_json)
+        script = next(node for node in document["nodes"] if node["id"] == script_node["id"])["data"]
+        copy = next(node for node in document["nodes"] if node["id"] == copy_node["id"])["data"]
+        assert script["description"] == "原始剧本"
+        assert script["desktopPayload"]["script_candidate"] == "AI 修订稿"
+        assert script["status"].startswith("AI 候选稿待确认")
+        assert copy["description"] == "English voiceover"
+        assert copy["desktopPayload"]["original_text"] == "中文原文"
+
+
+def test_media_operations_reject_wrong_asset_kinds() -> None:
+    seed_admin()
+    with SessionLocal() as db:
+        admin = db.query(User).filter(User.username == "admin").first()
+        project = Project(owner_id=admin.id, title="媒体类型校验", canvas_json='{"protocol":"creative-engine-canvas","version":1,"nodes":[],"edges":[]}')
+        db.add(project); db.flush()
+        image = Asset(project_id=project.id, owner_id=admin.id, node_id="image-source", name="frame.png", kind="image", object_key="media-validation/frame.png", content_type="image/png", size=10, sha256="b" * 64)
+        video = Asset(project_id=project.id, owner_id=admin.id, node_id="video-source", name="clip.mp4", kind="video", object_key="media-validation/clip.mp4", content_type="video/mp4", size=10, sha256="c" * 64)
+        db.add_all([image, video]); db.commit(); project_id, image_id, video_id = project.id, image.id, video.id
+    with TestClient(app) as client:
+        csrf = login(client, "admin", "Correct-Horse-42!")
+        wrong_breakdown = client.post("/api/tasks", headers={"x-csrf-token": csrf, "idempotency-key": "wrong-breakdown-media"}, json={"project_id": project_id, "node_id": "analysis-1", "kind": "video_breakdown", "provider": "local", "input": {"inputs": {"references": [{"asset_id": image_id}]}}})
+        assert wrong_breakdown.status_code == 422
+        assert "只接受视频节点" in wrong_breakdown.json()["detail"]
+        provider_profile = [{"name": "gptimage", "capabilities": ["image_edit"], "profile": {"reference_assets": 10}}]
+        with patch("creative_server.task_validation.available_providers", return_value=provider_profile):
+            wrong_image_edit = client.post("/api/tasks", headers={"x-csrf-token": csrf, "idempotency-key": "wrong-image-edit-media"}, json={"project_id": project_id, "node_id": "image-edit-1", "kind": "image_edit", "provider": "gptimage", "input": {"inputs": {"references": [{"asset_id": video_id}]}}})
+        assert wrong_image_edit.status_code == 422
+        assert "只接受图片节点" in wrong_image_edit.json()["detail"]
+
+
 def test_asset_library_is_explicit_and_retry_is_a_new_queued_task() -> None:
     seed_admin()
     with SessionLocal() as db:

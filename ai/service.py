@@ -63,10 +63,11 @@ def _build_registry() -> ProviderRegistry:
 
     # 3) Fish Audio（声音克隆）
     try:
-        from config import FISH_AUDIO_KEY
-        if FISH_AUDIO_KEY:
+        from api_config import get as _api_get
+        fish_audio_key = _api_get("fish_audio").value()
+        if fish_audio_key:
             from .providers.voice import FishAudioProvider
-            reg.register(FishAudioProvider(api_key=FISH_AUDIO_KEY))
+            reg.register(FishAudioProvider(api_key=fish_audio_key))
     except Exception:
         pass
 

@@ -15,3 +15,21 @@ def test_image_and_director_video_params_match_desktop_contract() -> None:
     video_inputs, video_params = compile_request("text_to_video", {"prompt": "连续动作"}, {"multi_image_director": True, "duration": 9, "timeline_images": [{"start": 0, "end": 3, "instruction": "推镜"}]})
     assert "0–3秒" in video_inputs["prompt"]
     assert video_params["duration"] == 9
+
+
+def test_video_request_carries_native_audio_contract() -> None:
+    inputs, params = compile_request(
+        "text_to_video",
+        {"prompt": "机器人穿过雨巷"},
+        {"duration": 8, "generate_audio": True, "audio_prompt": "0秒雨声；2秒脚步声；5秒机器人说‘到了’"},
+    )
+    assert "声音计划：0秒雨声" in inputs["prompt"]
+    assert params["generate_audio"] is True
+
+    silent_inputs, silent_params = compile_request(
+        "text_to_video",
+        {"prompt": "无声空镜"},
+        {"generate_audio": False, "audio_prompt": "不应进入提示词"},
+    )
+    assert "声音计划" not in silent_inputs["prompt"]
+    assert silent_params["generate_audio"] is False
