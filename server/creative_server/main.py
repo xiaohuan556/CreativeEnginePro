@@ -25,7 +25,7 @@ from .provider_catalog import available_providers, resolve_provider_model
 from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectMemberCreate, ProjectMemberUpdate, ProjectReviewCreate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate, WorkflowCommand, WorkflowRunCreate, WorkflowTemplateCreate
 from .security import DUMMY_PASSWORD_HASH, expiry, hash_password, opaque_token, token_hash, utcnow, validate_password, validate_username, verify_password
 from .storage import media_kind, resolve_object, save_upload
-from .task_policy import enforce_existing_task_policy, enforce_task_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
+from .task_policy import enforce_existing_task_policy, enforce_task_policy, enforce_workflow_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
 from .task_validation import validate_task_request
 from .workflows import command_workflow, initialize_workflow_tasks, prepare_workflow_items, public_workflow_run
 
@@ -56,6 +56,37 @@ def public_asset(asset: Asset) -> dict:
 
 def public_run(run: ProductionRun) -> dict:
     return {"id": run.id, "project_id": run.project_id, "node_id": run.node_id, "automation_mode": run.automation_mode, "provider_locks": json.loads(run.provider_locks_json or "{}"), "status": run.status, "resume_status": run.resume_status, "stage": run.stage, "stage_name": STAGES.get(run.stage, ""), "completed_stage": run.completed_stage, "active_task_id": run.active_task_id, "risk_accepted_stages": json.loads(run.risk_accepted_json or "[]"), "error_message": run.error_message, "updated_at": run.updated_at.isoformat()}
+
+
+def quote_production_plan(db: Session, user: User, supplied_locks: dict[str, str]) -> dict:
+    """Validate and quote the complete seven-stage run before any paid task exists."""
+    locks = {str(key): str(value or "").strip() for key, value in supplied_locks.items()}
+    required_locks = ("planning", "planning_model", "image", "image_model", "video", "video_model")
+    missing_locks = [key for key in required_locks if not locks.get(key)]
+    if missing_locks:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"开始制片前必须明确锁定引擎和模型：{', '.join(missing_locks)}")
+    profiles = {item["name"]: item for item in available_providers()}
+    stages = []
+    requests = []
+    stage_specs = {
+        1: (locks["planning"], locks["planning_model"], "chat"),
+        2: (locks["image"], locks["image_model"], "text_to_image"),
+        3: (locks["planning"], locks["planning_model"], "chat"),
+        4: (locks["planning"], locks["planning_model"], "chat"),
+        5: (locks["image"], locks["image_model"], "text_to_image"),
+        6: (locks["video"], locks["video_model"], "image_to_video"),
+        7: ("edge_tts", "", "text_to_speech"),
+    }
+    for stage, (provider, requested_model, operation) in stage_specs.items():
+        profile = profiles.get(provider)
+        if not profile or operation not in profile.get("capabilities", []):
+            raise HTTPException(status.HTTP_409_CONFLICT, f"第 {stage} 阶段锁定引擎 {provider} 当前不可用或不支持 {operation}；流程未创建")
+        model = resolve_provider_model(provider, requested_model)
+        credits = estimate_task_credits(operation, provider)
+        stages.append({"stage": stage, "name": STAGES[stage], "provider": provider, "model": model, "operation": operation, "credits": credits})
+        requests.append((provider, model, credits))
+    enforce_workflow_policy(db, user, requests)
+    return {"credits": sum(item[2] for item in requests), "tasks": len(stages), "locks": locks, "stages": stages}
 
 
 def require_project_membership_admin(db: Session, project_id: str, user: User) -> Project:
@@ -327,16 +358,7 @@ def create_production_run(payload: ProductionRunCreate, request: Request, user: 
     require_project_write(db, payload.project_id, user)
     run = db.scalar(select(ProductionRun).where(ProductionRun.project_id == payload.project_id, ProductionRun.node_id == payload.node_id))
     supplied_locks = payload.provider_locks or (json.loads(run.provider_locks_json or "{}") if run else {})
-    locks = {str(key): str(value or "").strip() for key, value in supplied_locks.items()}
-    required_locks = ("planning", "planning_model", "image", "image_model", "video", "video_model")
-    missing_locks = [key for key in required_locks if not locks.get(key)]
-    if missing_locks:
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"开始制片前必须明确锁定引擎和模型：{', '.join(missing_locks)}")
-    profiles = {item["name"]: item for item in available_providers()}
-    for key, capability in (("planning", "chat"), ("image", "text_to_image"), ("video", "text_to_video")):
-        provider = locks[key]
-        if provider not in profiles or capability not in profiles[provider].get("capabilities", []):
-            raise HTTPException(status.HTTP_409_CONFLICT, f"已锁定引擎 {provider} 当前不可用或不支持 {capability}；流程未创建")
+    locks = quote_production_plan(db, user, supplied_locks)["locks"]
     if not run:
         run = ProductionRun(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, automation_mode=payload.automation_mode, provider_locks_json=json.dumps(locks, ensure_ascii=False))
         db.add(run); db.flush(); record_audit(db, request, "production.created", user, "production_run", run.id)
@@ -344,6 +366,12 @@ def create_production_run(payload: ProductionRunCreate, request: Request, user: 
         run.automation_mode = payload.automation_mode
         run.provider_locks_json = json.dumps(locks, ensure_ascii=False)
     db.commit(); return {"run": public_run(run)}
+
+
+@app.post("/api/production-runs/quote")
+def quote_production_run(payload: ProductionRunCreate, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    require_project_write(db, payload.project_id, user)
+    return {"quote": quote_production_plan(db, user, payload.provider_locks)}
 
 
 @app.get("/api/production-runs/{run_id}")

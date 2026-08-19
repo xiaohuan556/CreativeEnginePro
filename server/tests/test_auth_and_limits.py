@@ -111,9 +111,19 @@ def test_production_pause_resume_and_rewind_do_not_duplicate_active_task() -> No
         project_id = project_response.json()["project"]["id"]
         missing_locks = client.post("/api/production-runs", headers={"x-csrf-token": csrf}, json={"project_id": project_id, "node_id": "storyboard-1", "automation_mode": "checkpoints"})
         assert missing_locks.status_code == 422
-        profiles = [{"name": "openai", "capabilities": ["chat"]}, {"name": "seedream", "capabilities": ["text_to_image"]}, {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"]}]
+        profiles = [{"name": "openai", "capabilities": ["chat"]}, {"name": "seedream", "capabilities": ["text_to_image"]}, {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"]}, {"name": "edge_tts", "capabilities": ["text_to_speech"]}]
+        production_payload = {"project_id": project_id, "node_id": "storyboard-1", "automation_mode": "checkpoints", "provider_locks": {"planning": "openai", "planning_model": "locked-planning-model", "image": "seedream", "image_model": "locked-image-model", "video": "seedance", "video_model": "locked-video-model"}}
+        text_only_profiles = [{**item, "capabilities": ["text_to_video"]} if item["name"] == "seedance" else item for item in profiles]
+        with patch("creative_server.main.available_providers", return_value=text_only_profiles):
+            incompatible = client.post("/api/production-runs/quote", json=production_payload)
+            assert incompatible.status_code == 409
+            assert "image_to_video" in incompatible.json()["detail"]
         with patch("creative_server.main.available_providers", return_value=profiles):
-            run_response = client.post("/api/production-runs", headers={"x-csrf-token": csrf}, json={"project_id": project_id, "node_id": "storyboard-1", "automation_mode": "checkpoints", "provider_locks": {"planning": "openai", "planning_model": "locked-planning-model", "image": "seedream", "image_model": "locked-image-model", "video": "seedance", "video_model": "locked-video-model"}})
+            quote = client.post("/api/production-runs/quote", json=production_payload)
+            assert quote.status_code == 200, quote.text
+            assert quote.json()["quote"]["tasks"] == 7
+            assert quote.json()["quote"]["credits"] == 86
+            run_response = client.post("/api/production-runs", headers={"x-csrf-token": csrf}, json=production_payload)
         assert run_response.status_code == 201
         run_id = run_response.json()["run"]["id"]
         with patch("creative_server.production.available_providers", return_value=[{"name": "openai", "capabilities": ["chat"]}]):

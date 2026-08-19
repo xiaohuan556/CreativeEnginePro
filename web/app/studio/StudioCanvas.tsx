@@ -560,6 +560,32 @@ function CanvasApp() {
       }
       updatePayload("saved_to_library", true); setNotice(`已将 ${ids.length} 个媒体副本保存到资产库，画布仍是流程权威`); return;
     }
+    if (selectedNode.data.specKey === "storyboard") {
+      const runId = String(payload.production_run_id || ""), productionStatus = String(payload.production_status || "ready");
+      if (action === "自动开始 / 继续") {
+        await productionCommand(productionStatus === "paused" ? "resume" : runId ? "continue" : "start"); return;
+      }
+      const targetStage = Number(action.match(/^(\d+)/)?.[1] || 0);
+      if (targetStage) {
+        if (!runId) {
+          if (targetStage === 1) await productionCommand("start");
+          else setNotice("新制片流程必须从第 1 阶段开始；完成前置阶段后系统会自动或经审片进入下一阶段");
+          return;
+        }
+        const currentStage = Number(payload.pipeline_stage || 1);
+        const completedStage = Number(payload.production_completed_stage ?? Math.max(0, currentStage - (productionStatus === "waiting_review" ? 0 : 1)));
+        if (targetStage <= completedStage) {
+          updatePayload("rewind_stage", targetStage); setNotice(`第 ${targetStage} 阶段已完成；如需重新付费生成，请点击“确认重做”`); return;
+        }
+        if (productionStatus === "waiting_review" && targetStage === completedStage + 1) {
+          await productionCommand("approve"); return;
+        }
+        if (targetStage === currentStage && ["ready", "failed", "paused"].includes(productionStatus)) {
+          await productionCommand(productionStatus === "paused" ? "resume" : "continue"); return;
+        }
+        setNotice(productionStatus === "running" ? `第 ${currentStage} 阶段正在执行，不能并行跳到其他阶段` : `当前只能执行第 ${currentStage} 阶段，不能跳过前置结果`); return;
+      }
+    }
     if (selectedNode.data.specKey === "script") {
       const versions = Array.isArray(payload.script_versions) ? [...payload.script_versions] : [];
       if (action === "采用AI候选稿") {
@@ -760,12 +786,12 @@ function CanvasApp() {
       const response = await apiFetch(`/api/production-runs/${runId}`, { cache: "no-store" });
       if (!response.ok) return;
       const data = await response.json() as { run: { status: string; stage: number; stage_name: string; completed_stage: number; active_task_id?: string; error_message?: string } };
-      setNodes((current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, status: data.run.status === "waiting_review" ? `等待确认 · ${data.run.stage_name}` : data.run.status === "complete" ? "全流程完成" : data.run.status === "paused" ? "流程已暂停" : data.run.status === "failed" ? "阶段失败" : `AI 制片中 · ${data.run.stage}/7`, progress: Math.round(data.run.completed_stage / 7 * 100), desktopPayload: { ...(node.data.desktopPayload || {}), production_run_id: runId, pipeline_stage: data.run.stage, production_status: data.run.status } } } : node));
+      setNodes((current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, status: data.run.status === "waiting_review" ? `等待确认 · ${data.run.stage_name}` : data.run.status === "complete" ? "全流程完成" : data.run.status === "paused" ? "流程已暂停" : data.run.status === "failed" ? "阶段失败" : `AI 制片中 · ${data.run.stage}/7`, progress: Math.round(data.run.completed_stage / 7 * 100), desktopPayload: { ...(node.data.desktopPayload || {}), production_run_id: runId, pipeline_stage: data.run.stage, production_completed_stage: data.run.completed_stage, production_status: data.run.status } } } : node));
       if (["waiting_review", "complete", "paused", "failed"].includes(data.run.status)) { await mergeServerResult(nodeId); setNotice(data.run.error_message || (data.run.status === "waiting_review" ? "到达确认节点：审片通过或接受风险后才会继续" : `制片流程：${data.run.status}`)); return; }
     }
   }
 
-  const productionCommand = async (command: string, targetStage?: number) => {
+  const productionCommand = async (command: string, targetStage?: number, confirmed = false) => {
     if (!selectedNode || !controlled || !projectId) return;
     if (["approve", "accept_risk"].includes(command) ? !canReview : !canWrite) { setNotice(["approve", "accept_risk"].includes(command) ? "当前账号没有该项目的审片权限" : "当前账号没有该项目的编辑权限"); return; }
     let runId = String(selectedNode.data.desktopPayload?.production_run_id || "");
@@ -776,7 +802,15 @@ function CanvasApp() {
       const imageModel = String(boardPayload.image_model || providers.find((item) => item.name === image)?.profile?.model || "");
       const videoModel = String(boardPayload.video_model || providers.find((item) => item.name === video)?.profile?.model || "");
       if (!planning || !image || !video || !planningModel || !imageModel || !videoModel) { setNotice("开始制片前请明确锁定拆镜、图片、视频的引擎和模型版本；系统不会静默切换"); return; }
-      const created = await apiFetch("/api/production-runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, automation_mode: boardPayload.automation_mode || "checkpoints", provider_locks: { planning, planning_model: planningModel, image, image_model: imageModel, video, video_model: videoModel } }) });
+      const createPayload = { project_id: projectId, node_id: selectedNode.id, automation_mode: boardPayload.automation_mode || "checkpoints", provider_locks: { planning, planning_model: planningModel, image, image_model: imageModel, video, video_model: videoModel } };
+      if (!confirmed) {
+        const quoteResponse = await apiFetch("/api/production-runs/quote", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(createPayload) });
+        const quoteData = await quoteResponse.json() as { quote?: { credits: number; tasks: number }; detail?: string };
+        if (!quoteResponse.ok || !quoteData.quote) { setNotice(quoteData.detail || "七阶段制片额度校验失败"); return; }
+        setPendingTask({ action: `启动七阶段 AI 制片（最多 ${quoteData.quote.tasks} 个任务）`, model: `拆镜 ${planning}:${planningModel} · 图片 ${image}:${imageModel} · 视频 ${video}:${videoModel}`, credits: quoteData.quote.credits, run: async () => { setPendingTask(null); await productionCommand(command, targetStage, true); } });
+        return;
+      }
+      const created = await apiFetch("/api/production-runs", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(createPayload) });
       const data = await created.json() as { run?: { id: string }; detail?: string };
       if (!created.ok || !data.run) { setNotice(data.detail || "制片流程创建失败"); return; }
       runId = data.run.id; updatePayload("production_run_id", runId);
