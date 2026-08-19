@@ -32,7 +32,7 @@ export const NODE_SPECS = [
   spec({ key: "storyboard", desktopType: "storyboard_node", title: "AI 故事板", description: "一句故事自动拆镜并完成制片", kind: "storyboard", group: "primary", accent: "#89b8ff", creatable: true, input: ["text"], output: ["shot", "image", "video", "audio"], actions: ["自动开始 / 继续", "1 · 拆解镜头（完成后停下确认）", "2 · 生成资产候选（逐项采用并锁定）", "3 · 生成调度与多帧运动分镜（完成后确认）", "4 · 确认调度并合成定稿提示词", "5 · 创建定稿图片生成器组", "6 · 确认定稿图片并生成视频", "7 · 创建对白音频组"], defaults: { style: "电影写实", shot_count: 0, automation_mode: "checkpoints", production_scope: "all", production_ratio: "16:9", pipeline_stage: 0 } }),
   spec({ key: "script", desktopType: "text_node", title: "剧本工作台", description: "写作、诊断、定稿和版本管理", kind: "script", group: "primary", accent: "#a7b0bd", creatable: true, input: ["text", "any"], output: ["text"], actions: ["生成完整脚本", "续写脚本", "改写优化", "剧本体检", "强化人物弧光", "对白润色", "制片可行性检查", "保存版本", "恢复上一版", "切换剧本定稿", "创建制片项目"], defaults: { editor_action: "生成完整脚本", script_versions: [], script_version: 1, script_locked: false } }),
   spec({ key: "copywriting", desktopType: "text_node", variant: "copywriting_workbench", title: "信息流口播文案", description: "口播生成、改写、压缩和翻译", kind: "copywriting", group: "primary", accent: "#f07daf", creatable: true, input: ["text", "image", "video"], output: ["text"], actions: ["生成口播文案", "改写优化", "压缩精简", "增强开场钩子", "翻译", "复制文案", "恢复原文"], defaults: { copywriting_workbench: true, product_name: "", product_description: "", copy_style: "激情抓眼球", copy_duration: "30", copy_language: "英语", editor_action: "生成口播文案" } }),
-  spec({ key: "multi_image", desktopType: "image_node", variant: "multi_image_composer", title: "多图生成图片", description: "为每张参考图指定主体、场景、构图、元素或风格用途", kind: "image", group: "primary", accent: "#50b9dd", creatable: true, input: ["image", "asset"], output: ["image"], actions: ["设置每张图片的用途", "AI 编辑", "保存到资产库"], defaults: { multi_image_composer: true, references: [], reference_assets: [], editor_action: "AI 编辑", ratio: "16:9", candidate_count: 1 } }),
+  spec({ key: "multi_image", desktopType: "image_node", variant: "multi_image_composer", title: "多图生成图片", description: "为每张参考图指定主体、场景、构图、元素或风格用途", kind: "image", group: "primary", accent: "#50b9dd", creatable: true, input: ["image", "asset"], output: ["image"], actions: ["设置每张图片的用途", "AI 编辑", "保存到资产库"], defaults: { multi_image_composer: true, references: [], reference_assets: [], reference_settings: [], editor_action: "AI 编辑", ratio: "16:9", candidate_count: 1 } }),
   spec({ key: "image_asset", desktopType: "image_node", variant: "imported", title: "图片节点", description: "画布中的上传或生成图片", kind: "image", group: "system", accent: "#86a9c2", creatable: false, input: ["image"], output: ["image", "asset"], actions: ["基于这张图继续编辑", "让这张图动起来（首帧）", "作为视频尾帧", "保存到资产库"], defaults: {} }),
   spec({ key: "multi_director", desktopType: "video_node", variant: "multi_image_director", title: "多图导演视频", description: "按时间段、动作、运镜和用途一次生成完整视频", kind: "director", group: "primary", accent: "#6f8cff", creatable: true, input: ["image", "asset"], output: ["video"], actions: ["编辑图片时间、动作、运镜与用途", "图生视频", "基于尾帧续拍", "提取首中尾帧"], defaults: { multi_image_director: true, timeline_images: [], references: [], reference_assets: [], provider_name: "seedance", duration: 10, ratio: "16:9", generator_kind: "video", editor_action: "图生视频" } }),
   spec({ key: "video", desktopType: "video_node", title: "视频节点", description: "文生视频、图生视频、抽帧和续拍", kind: "video", group: "basic", accent: "#8f87c9", creatable: true, input: ["text", "image", "asset"], output: ["video", "image"], actions: ["图生视频", "文生视频", "提取首中尾帧", "基于尾帧续拍", "保存到资产库"], defaults: { editor_action: "文生视频", ratio: "16:9", duration: 10, references: [], reference_assets: [] } }),
@@ -79,3 +79,22 @@ export const CREATION_GROUPS: Array<{ key: NodeGroup; label: string }> = [
   { key: "analysis", label: "分析与专业工具" },
   { key: "reference", label: "参考节点" },
 ];
+
+export function buildSkillPrompts(action: string, instruction: string) {
+  if (action === "多机位九宫格") {
+    return ["超远景建立空间", "全景人物与环境", "中全景调度", "中景表演", "近景情绪", "面部特写", "肩后反打", "低机位仰拍", "高机位俯拍"].map((shot, index) => `${instruction}。机位方案 ${index + 1}/9：${shot}。保持同一角色、服装、场景、时刻与轴线。`);
+  }
+  if (action === "25 宫格连贯分镜") {
+    return Array.from({ length: 25 }, (_, index) => `${instruction}。连贯分镜第 ${index + 1}/25 格，表现动作进度 ${Math.round(index / 24 * 100)}%，严格继承上一格人物位置、朝向、服装、光线和场景，只推进一个清晰动作节拍。`);
+  }
+  if (action === "角色设定") {
+    return ["正面全身", "左侧面全身", "背面全身", "四分之三正面", "四分之三背面", "面部近景", "喜悦表情", "悲伤表情", "愤怒表情"].map((view, index) => `${instruction}。角色设定第 ${index + 1}/9：${view}，中性背景，固定五官、发型、体型、服装、材质和配色。`);
+  }
+  if (action === "电影级光影调整") {
+    return ["柔和窗光", "伦勃朗侧光", "阴天漫射光", "黄金时刻逆光", "蓝调夜景", "霓虹双色光", "硬质顶光", "烛火暖光", "高反差黑色电影"].map((look, index) => `${instruction}。光影方案 ${index + 1}/9：${look}。保持人物身份、动作、构图和场景结构完全不变。`);
+  }
+  if (action === "情绪调整") {
+    return ["克制平静", "轻微喜悦", "明显喜悦", "隐忍悲伤", "崩溃悲伤", "警觉恐惧", "强烈恐惧", "压抑愤怒", "爆发愤怒"].map((emotion, index) => `${instruction}。情绪方案 ${index + 1}/9：${emotion}。保持人物身份、服装、镜头与背景不变，只调整眼神、眉眼、嘴角、肌肉紧张和身体姿态。`);
+  }
+  return [];
+}

@@ -14,7 +14,7 @@ import {
 } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 import { desktopProjectToWeb, toWebCanvas } from "../../lib/canvas-protocol";
-import { canConnect, CREATION_GROUPS, NODE_SPEC_BY_KEY, NODE_SPECS, StudioNodeKind } from "../../lib/node-registry";
+import { buildSkillPrompts, canConnect, CREATION_GROUPS, NODE_SPEC_BY_KEY, NODE_SPECS, StudioNodeKind } from "../../lib/node-registry";
 import { PulseEdge } from "./PulseEdge";
 import { useControlPlane } from "./ControlPlane";
 import { AdminPanel } from "./AdminPanel";
@@ -34,6 +34,9 @@ type StudioData = {
 
 type StudioNode = Node<StudioData, "studio">;
 type ProviderInfo = { name: string; capabilities: string[]; profile?: Record<string, unknown> };
+type LibraryAsset = { id: string; name: string; kind: string; size: number; content_type?: string; contentType?: string; in_library?: boolean };
+type QueueTask = { id: string; node_id: string; kind: string; provider: string; status: string; progress: number; error_message?: string };
+type PendingTask = { action: string; model: string; credits: number; run: () => Promise<void> };
 
 const kindIcons: Record<StudioNodeKind, typeof Sparkles> = {
   project: Clapperboard,
@@ -149,6 +152,10 @@ function CanvasApp() {
   const [notice, setNotice] = useState("所有更改已保存");
   const [adminOpen, setAdminOpen] = useState(false);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [sideView, setSideView] = useState<"canvas" | "assets" | "tasks">("canvas");
+  const [libraryAssets, setLibraryAssets] = useState<LibraryAsset[]>([]);
+  const [queueTasks, setQueueTasks] = useState<QueueTask[]>([]);
+  const [pendingTask, setPendingTask] = useState<PendingTask | null>(null);
   const [projectTitle, setProjectTitle] = useState("雨夜最后一封信");
   const [projectId, setProjectId] = useState("");
   const [hydrated, setHydrated] = useState(false);
@@ -160,6 +167,15 @@ function CanvasApp() {
 
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedId) ?? nodes[0], [nodes, selectedId]);
   const incomingNodes = useMemo(() => edges.filter((edge) => edge.target === selectedId).map((edge) => nodes.find((node) => node.id === edge.source)).filter((node): node is StudioNode => Boolean(node)), [edges, nodes, selectedId]);
+
+  useEffect(() => {
+    if (!selectedNode || selectedNode.data.specKey !== "multi_director" || !incomingNodes.length) return;
+    const existing = Array.isArray(selectedNode.data.desktopPayload?.timeline_images) ? selectedNode.data.desktopPayload.timeline_images as Array<Record<string, unknown>> : [];
+    const duration = Number(selectedNode.data.desktopPayload?.duration || 10), step = duration / incomingNodes.length;
+    const timeline = incomingNodes.map((node, index) => ({ source_node_id: node.id, start: Number((index * step).toFixed(2)), end: Number(((index + 1) * step).toFixed(2)), purpose: "continuity", action: "推进一个清晰动作", camera: "", ...(existing.find((item) => item.source_node_id === node.id) || {}) }));
+    if (JSON.stringify(timeline) === JSON.stringify(existing)) return;
+    setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, desktopPayload: { ...(node.data.desktopPayload || {}), timeline_images: timeline } } } : node));
+  }, [incomingNodes, selectedNode, setNodes]);
 
   useEffect(() => {
     if (bootingRef.current) return;
@@ -257,6 +273,123 @@ function CanvasApp() {
     setNodes((current) => current.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, desktopPayload: { ...(node.data.desktopPayload || {}), [key]: value } } } : node));
   };
 
+  const updateReferenceRow = (key: "reference_settings" | "timeline_images", sourceNodeId: string, patch: Record<string, unknown>) => {
+    if (!selectedNode) return;
+    const current = Array.isArray(selectedNode.data.desktopPayload?.[key]) ? [...selectedNode.data.desktopPayload[key] as Array<Record<string, unknown>>] : [];
+    const index = current.findIndex((item) => item.source_node_id === sourceNodeId);
+    const value = { ...(index >= 0 ? current[index] : {}), source_node_id: sourceNodeId, ...patch };
+    if (index >= 0) current[index] = value; else current.push(value);
+    updatePayload(key, current);
+  };
+
+  const createDerivedNode = (source: StudioNode, targetKey: string, relation: string, overrides: Record<string, unknown> = {}) => {
+    const target = NODE_SPEC_BY_KEY[targetKey], id = `${targetKey}-${crypto.randomUUID()}`;
+    setNodes((current) => [...current, { id, type: "studio", position: { x: source.position.x + 380, y: source.position.y + 30 }, data: { title: target.title, description: target.description, kind: target.kind, specKey: target.key, desktopType: target.desktopType, status: relation === "last_frame" ? "尾帧已设置 · 还需连接首帧" : "已继承上游参考", meta: "从图片节点创建", accent: target.accent, desktopPayload: { ...target.defaults, ...overrides } } }]);
+    setEdges((current) => addEdge({ id: `${relation}-${source.id}-${id}`, source: source.id, target: id, type: "pulse", data: { relation } }, current)); setSelectedId(id); setNotice(`${target.title}已创建并连接`);
+  };
+
+  const handleNodeAction = async (action: string) => {
+    if (!selectedNode) return;
+    const payload = selectedNode.data.desktopPayload || {};
+    if (action === "保存到资产库") {
+      const ids = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean).map(String);
+      if (!controlled || !ids.length) { setNotice(ids.length ? "公司服务器接入后才能同步资产库副本" : "该节点还没有可保存的媒体结果"); return; }
+      for (const id of ids) {
+        const response = await apiFetch(`/api/assets/${id}/save-to-library`, { method: "POST" });
+        if (!response.ok) { const data = await response.json() as { detail?: string }; setNotice(data.detail || "保存到资产库失败"); return; }
+      }
+      updatePayload("saved_to_library", true); setNotice(`已将 ${ids.length} 个媒体副本保存到资产库，画布仍是流程权威`); return;
+    }
+    if (selectedNode.data.specKey === "script") {
+      const versions = Array.isArray(payload.script_versions) ? [...payload.script_versions] : [];
+      if (action === "保存版本") { versions.push({ version: versions.length + 1, content: selectedNode.data.description, saved_at: new Date().toISOString() }); updatePayload("script_versions", versions); updatePayload("script_version", versions.length); setNotice(`剧本版本 ${versions.length} 已保存到画布节点`); return; }
+      if (action === "恢复上一版") { const previous = versions.at(-1) as { content?: string } | undefined; if (!previous?.content) { setNotice("还没有可恢复的剧本版本"); return; } updateSelected("description", previous.content); setNotice("已恢复上一版，保存后不会删除历史版本"); return; }
+      if (action === "切换剧本定稿") { updatePayload("script_locked", !payload.script_locked); setNotice(payload.script_locked ? "剧本已解除定稿" : "剧本已定稿锁定"); return; }
+      if (action === "创建制片项目") { createDerivedNode(selectedNode, "storyboard", "script_source", { source_script_node_id: selectedNode.id }); return; }
+    }
+    if (selectedNode.data.specKey === "copywriting") {
+      if (action === "复制文案") { try { await navigator.clipboard.writeText(selectedNode.data.description); setNotice("文案已复制"); } catch { setNotice("浏览器未授予剪贴板权限，请手动复制"); } return; }
+      if (action === "恢复原文") { const original = String(payload.original_text || ""); if (!original) { setNotice("当前节点没有保存原文"); return; } updateSelected("description", original); setNotice("已恢复原文"); return; }
+      if (!payload.original_text) updatePayload("original_text", selectedNode.data.description);
+    }
+    if (selectedNode.data.specKey === "analysis" && action === "导出拉片报告") {
+      const report = payload.analysis_result || payload.analysis;
+      if (!report || (typeof report === "object" && !Object.keys(report as object).length)) { setNotice("请先完成 AI 拉片"); return; }
+      const url = URL.createObjectURL(new Blob([JSON.stringify(report, null, 2)], { type: "application/json;charset=utf-8" }));
+      const link = document.createElement("a"); link.href = url; link.download = `${selectedNode.data.title || "拉片报告"}.json`; link.click(); URL.revokeObjectURL(url); setNotice("拉片报告已导出"); return;
+    }
+    if (["asset_view", "asset_take", "result"].includes(selectedNode.data.specKey) && ["采用", "驳回", "接受风险并继续"].includes(action)) {
+      const statusText = action === "采用" ? "已采用" : action === "驳回" ? "已驳回" : "风险已接受";
+      setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: statusText, desktopPayload: { ...(node.data.desktopPayload || {}), review_decision: action, review_at: new Date().toISOString() } } } : node));
+      setNotice(`${selectedNode.data.title} · ${statusText}`); return;
+    }
+    if (selectedNode.data.specKey === "task" && ["取消", "重试"].includes(action)) {
+      const taskId = String(payload.server_task_id || "");
+      if (!taskId || !controlled) { setNotice("该任务没有可操作的公司队列记录"); return; }
+      const response = await apiFetch(`/api/tasks/${taskId}/${action === "取消" ? "cancel" : "retry"}`, { method: "POST" });
+      const data = await response.json() as { task?: { id: string; status: string }; detail?: string };
+      if (!response.ok || !data.task) { setNotice(data.detail || `${action}失败`); return; }
+      setNotice(action === "重试" ? "重试任务已进入队列" : "任务已取消");
+      return;
+    }
+    if (selectedNode.data.specKey === "image_asset") {
+      const assetId = String(payload.asset_id || (Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids[0] : "") || "");
+      if (action === "基于这张图继续编辑") { createDerivedNode(selectedNode, "multi_image", "reference"); return; }
+      if (action === "让这张图动起来（首帧）") { createDerivedNode(selectedNode, "video", "first_frame"); return; }
+      if (action === "作为视频尾帧") { createDerivedNode(selectedNode, "video", "last_frame", { last_frame_asset_id: assetId }); return; }
+    }
+    updatePayload("editor_action", action); setNotice(`已选择“${action}”`);
+  };
+
+  const openSideView = async (view: "canvas" | "assets" | "tasks") => {
+    setSideView(view);
+    if (view === "canvas" || !projectId) return;
+    if (view === "assets") {
+      const response = await apiFetch(`/api/assets?project_id=${encodeURIComponent(projectId)}&projectId=${encodeURIComponent(projectId)}&library_only=${controlled ? "true" : "false"}`, { cache: "no-store" });
+      if (!response.ok) { setNotice("资产库读取失败"); return; }
+      const data = await response.json() as { assets?: LibraryAsset[] }; setLibraryAssets(data.assets || []);
+    } else if (controlled) {
+      const response = await apiFetch(`/api/tasks?project_id=${encodeURIComponent(projectId)}`, { cache: "no-store" });
+      if (!response.ok) { setNotice("任务列表读取失败"); return; }
+      const data = await response.json() as { tasks?: QueueTask[] }; setQueueTasks(data.tasks || []);
+    } else setNotice("公司任务队列会在接入自建服务器后显示");
+  };
+
+  const copyAssetToCanvas = (asset: LibraryAsset) => {
+    const spec = asset.kind === "video" ? NODE_SPEC_BY_KEY.video : asset.kind === "audio" ? NODE_SPEC_BY_KEY.audio : NODE_SPEC_BY_KEY.image_asset;
+    const id = `library-${asset.kind}-${crypto.randomUUID()}`;
+    setNodes((current) => [...current, { id, type: "studio", position: { x: 330, y: 240 }, data: { title: asset.name.replace(/\.[^.]+$/, ""), description: "从资产库复制到画布；后续修改不会反向改变资产库副本", kind: spec.kind, specKey: spec.key, desktopType: spec.desktopType, status: "资产副本", meta: asset.content_type || asset.contentType || asset.kind, accent: spec.accent, desktopPayload: { ...spec.defaults, asset_id: asset.id, size: asset.size } } }]);
+    setSelectedId(id); setSideView("canvas"); setNotice("资产副本已写入画布节点");
+  };
+
+  const mergeServerResult = useCallback(async (nodeId: string) => {
+    if (!projectId) return;
+    const response = await apiFetch(`/api/projects/${projectId}`, { cache: "no-store" });
+    if (!response.ok) return;
+    const detail = await response.json() as { project?: { version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
+    if (!detail.project) return;
+    versionRef.current = detail.project.version;
+    const serverNodes = detail.project.canvas.nodes.map(normalizeStudioNode);
+    const serverSource = serverNodes.find((node) => node.id === nodeId);
+    setNodes((current) => {
+      const existing = new Set(current.map((node) => node.id));
+      const merged = current.map((node) => node.id === nodeId && serverSource ? {
+        ...node,
+        data: {
+          ...node.data,
+          status: serverSource.data.status,
+          progress: serverSource.data.progress,
+          desktopPayload: { ...(node.data.desktopPayload || {}), ...(serverSource.data.desktopPayload || {}) },
+        },
+      } : node);
+      return [...merged, ...serverNodes.filter((node) => !existing.has(node.id))];
+    });
+    setEdges((current) => {
+      const existing = new Set(current.map((edge) => edge.id));
+      return [...current, ...detail.project!.canvas.edges.filter((edge) => !existing.has(edge.id)).map((edge) => ({ ...edge, type: "pulse" }))];
+    });
+  }, [apiFetch, projectId, setEdges, setNodes]);
+
   const pollTask = useCallback(async (taskId: string, nodeId: string) => {
     for (let attempt = 0; attempt < 1800; attempt += 1) {
       await new Promise((resolve) => window.setTimeout(resolve, 2000));
@@ -270,11 +403,11 @@ function CanvasApp() {
           const text = typeof output.data === "string" ? output.data : "";
           return { ...node, data: { ...node.data, description: data.task.status === "completed" && text ? text : node.data.description, status: data.task.status === "completed" ? "生成完成" : data.task.status === "failed" ? "生成失败" : `AI 制片中 · ${data.task.progress}%`, progress: data.task.progress, desktopPayload: { ...(node.data.desktopPayload || {}), ...(output.asset_ids ? { output_asset_ids: output.asset_ids } : {}), ...(output.analysis ? { analysis_result: output.analysis } : {}) } } };
         }));
-        if (data.task.status === "completed") { setNotice("生成完成，结果已写回画布节点"); return; }
-        if (["failed", "cancelled"].includes(data.task.status)) { setNotice(data.task.error_message || "任务已停止"); return; }
+        if (data.task.status === "completed") { await new Promise((resolve) => window.setTimeout(resolve, 200)); await mergeServerResult(nodeId); setNotice("生成完成，结果已写回画布节点"); return; }
+        if (["failed", "cancelled"].includes(data.task.status)) { await mergeServerResult(nodeId); setNotice(data.task.error_message || "任务已停止"); return; }
       } catch { return; }
     }
-  }, [apiFetch, setNodes]);
+  }, [apiFetch, mergeServerResult, setNodes]);
 
   const pollProduction = useCallback(async (runId: string, nodeId: string) => {
     for (let attempt = 0; attempt < 3600; attempt += 1) {
@@ -283,9 +416,9 @@ function CanvasApp() {
       if (!response.ok) return;
       const data = await response.json() as { run: { status: string; stage: number; stage_name: string; completed_stage: number; active_task_id?: string; error_message?: string } };
       setNodes((current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, status: data.run.status === "waiting_review" ? `等待确认 · ${data.run.stage_name}` : data.run.status === "complete" ? "全流程完成" : data.run.status === "paused" ? "流程已暂停" : data.run.status === "failed" ? "阶段失败" : `AI 制片中 · ${data.run.stage}/7`, progress: Math.round(data.run.completed_stage / 7 * 100), desktopPayload: { ...(node.data.desktopPayload || {}), production_run_id: runId, pipeline_stage: data.run.stage, production_status: data.run.status } } } : node));
-      if (["waiting_review", "complete", "paused", "failed"].includes(data.run.status)) { setNotice(data.run.error_message || (data.run.status === "waiting_review" ? "到达确认节点：审片通过或接受风险后才会继续" : `制片流程：${data.run.status}`)); return; }
+      if (["waiting_review", "complete", "paused", "failed"].includes(data.run.status)) { await mergeServerResult(nodeId); setNotice(data.run.error_message || (data.run.status === "waiting_review" ? "到达确认节点：审片通过或接受风险后才会继续" : `制片流程：${data.run.status}`)); return; }
     }
-  }, [apiFetch, setNodes]);
+  }, [apiFetch, mergeServerResult, setNodes]);
 
   const productionCommand = async (command: string, targetStage?: number) => {
     if (!selectedNode || !controlled || !projectId) return;
@@ -313,6 +446,27 @@ function CanvasApp() {
     }
     const payload = selectedNode.data.desktopPayload || {};
     const specKey = selectedNode.data.specKey;
+    const directorTimeline = Array.isArray(payload.timeline_images) ? payload.timeline_images as Array<Record<string, unknown>> : [];
+    const directorDuration = Number(payload.duration || 10), directorStep = incomingNodes.length ? directorDuration / incomingNodes.length : directorDuration;
+    const effectiveDirectorTimeline = incomingNodes.map((node, index) => ({ source_node_id: node.id, start: Number((index * directorStep).toFixed(2)), end: Number(((index + 1) * directorStep).toFixed(2)), purpose: "continuity", action: "推进一个清晰动作", camera: "", ...(directorTimeline.find((item) => item.source_node_id === node.id) || {}) }));
+    const hasDirectorFrame = effectiveDirectorTimeline.some((item) => ["first_frame", "last_frame"].includes(String(item.purpose || "")));
+    if (specKey === "skill") {
+      const action = String(payload.editor_action || "");
+      if (action === "故事板") {
+        const target = NODE_SPEC_BY_KEY.storyboard, id = `storyboard-${crypto.randomUUID()}`;
+        setNodes((current) => [...current, { id, type: "studio", position: { x: selectedNode.position.x + 380, y: selectedNode.position.y }, data: { title: "故事板生成器", description: selectedNode.data.description, kind: target.kind, specKey: target.key, desktopType: target.desktopType, status: "等待设置", meta: "专业 Skill 输出", accent: target.accent, desktopPayload: { ...target.defaults } } }]);
+        setEdges((current) => addEdge({ id: `skill-${selectedNode.id}-${id}`, source: selectedNode.id, target: id, type: "pulse" }, current)); setSelectedId(id); setNotice("已创建故事板节点，请锁定三个引擎后开始制片"); return;
+      }
+      const prompts = buildSkillPrompts(action, selectedNode.data.description);
+      if (prompts.length) {
+        const groupId = `workflow-${crypto.randomUUID()}`, imageSpec = NODE_SPEC_BY_KEY.multi_image;
+        const children = prompts.map((prompt, index) => ({ id: `skill-image-${crypto.randomUUID()}`, type: "studio" as const, position: { x: selectedNode.position.x + 420 + (index % 5) * 330, y: selectedNode.position.y + Math.floor(index / 5) * 225 }, data: { title: `${action} ${String(index + 1).padStart(2, "0")}`, description: prompt, kind: imageSpec.kind, specKey: imageSpec.key, desktopType: imageSpec.desktopType, status: "待检查并执行", meta: "专业 Skill 生成节点", accent: imageSpec.accent, desktopPayload: { ...imageSpec.defaults, provider_name: payload.provider_name, skill_source: selectedNode.id } } }));
+        const workflow = NODE_SPEC_BY_KEY.workflow;
+        setNodes((current) => [...current, { id: groupId, type: "studio", position: { x: selectedNode.position.x, y: selectedNode.position.y + 250 }, data: { title: action, description: `可复用专业 Skill · ${children.length} 个生成节点`, kind: workflow.kind, specKey: workflow.key, desktopType: workflow.desktopType, status: "已展开", meta: `${children.length} 个节点`, accent: workflow.accent, desktopPayload: { group_nodes: children.map((item) => item.id) } } }, ...children]);
+        setEdges((current) => [...current, ...children.flatMap((child) => [{ id: `skill-${selectedNode.id}-${child.id}`, source: selectedNode.id, target: child.id, type: "pulse" }, { id: `group-${groupId}-${child.id}`, source: groupId, target: child.id, type: "pulse" }])]);
+        setSelectedId(groupId); setNotice(`已展开 ${children.length} 个生成节点；先检查提示词，再逐项或批量执行，避免误扣费`); return;
+      }
+    }
     const mapping: Record<string, { provider: string; operation: string; model: string }> = {
       storyboard: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || payload.planning_model || "") },
       script: { provider: String(payload.provider_name || "openai"), operation: "chat", model: String(payload.model || "") },
@@ -321,7 +475,7 @@ function CanvasApp() {
       scene_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
       character_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
       element_reference: { provider: String(payload.provider_name || "seedream"), operation: incomingNodes.length ? "image_edit" : "text_to_image", model: String(payload.model || "") },
-      multi_director: { provider: String(payload.provider_name || "seedance"), operation: "text_to_video", model: String(payload.model || "") },
+      multi_director: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || "seedance"), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : hasDirectorFrame ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
       video: { provider: String(payload.editor_action || "") === "提取首中尾帧" ? "local" : String(payload.provider_name || "seedance"), operation: String(payload.editor_action || "") === "基于尾帧续拍" ? "continue_video" : String(payload.editor_action || "") === "提取首中尾帧" ? "extract_video_frames" : incomingNodes.length ? "image_to_video" : "text_to_video", model: String(payload.model || "") },
       audio: { provider: String(payload.provider_name || "edge_tts"), operation: "text_to_speech", model: String(payload.voice || "") },
       analysis: { provider: "local", operation: "video_breakdown", model: "local" },
@@ -331,18 +485,46 @@ function CanvasApp() {
     const task = mapping[specKey];
     if (!task) { setNotice("该运行节点由上游工作流自动驱动，不能单独提交"); return; }
     if (task.provider !== "local" && !payload.provider_name) { setNotice("请先在节点设置中明确选择生成引擎；系统不会替你静默切换模型"); return; }
+    if (specKey === "video" && payload.last_frame_asset_id) {
+      const firstAvailable = incomingNodes.some((node) => String(node.data.desktopPayload?.asset_id || "") !== String(payload.last_frame_asset_id));
+      if (!firstAvailable) { setNotice("尾帧不能单独生成视频，请再连接一张图片作为首帧"); return; }
+    }
+    if (specKey === "multi_director" && incomingNodes.length) {
+      const rows = effectiveDirectorTimeline.map((item) => ({ start: Number(item.start), end: Number(item.end) })).sort((left, right) => left.start - right.start);
+      if (rows.some((item) => !Number.isFinite(item.start) || !Number.isFinite(item.end) || item.start < 0 || item.end <= item.start)) { setNotice("导演时间轴存在无效时间段：结束秒必须大于开始秒"); return; }
+      if (rows.some((item, index) => index > 0 && item.start < rows[index - 1].end)) { setNotice("导演时间轴存在重叠，请调整每张图的开始与结束秒数"); return; }
+      if (rows.some((item) => item.end > Number(payload.duration || 10))) { setNotice("导演时间轴超出视频总时长，请先调整节点时长或时间段"); return; }
+      if (effectiveDirectorTimeline.filter((item) => item.purpose === "first_frame").length > 1 || effectiveDirectorTimeline.filter((item) => item.purpose === "last_frame").length > 1) { setNotice("首帧和尾帧各只能指定一张图片"); return; }
+    }
     const providerOperation = task.operation === "continue_video" ? "image_to_video" : task.operation === "extract_video_frames" ? "" : task.operation;
     if (providerOperation && task.provider !== "local" && providers.length && !providers.some((provider) => provider.name === task.provider && provider.capabilities.includes(providerOperation))) { setNotice(`“${task.provider}”当前不可用或不支持 ${providerOperation}，请在节点中明确选择可用模型`); return; }
+    const selectedProvider = providers.find((provider) => provider.name === task.provider);
+    const referenceLimit = Number(selectedProvider?.profile?.reference_assets || 0);
+    if (referenceLimit && incomingNodes.length > referenceLimit) { setNotice(`${task.provider} 单次最多支持 ${referenceLimit} 张参考图；当前连接 ${incomingNodes.length} 张。请减少输入或拆成连续段落，系统不会静默丢图`); return; }
     const action = String(payload.editor_action || NODE_SPEC_BY_KEY[specKey]?.actions[0] || "生成");
-    if (!window.confirm(`确认提交“${action}”？\n模型：${task.model || task.provider}\n预计费用：由管理员额度控制，服务端不会静默换模型。`)) return;
-    setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: "正在排队", progress: 0 } } : node));
-    const ownAssets = Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids.map((assetId) => ({ node_id: selectedNode.id, title: selectedNode.data.title, asset_id: assetId })) : [];
-    const references = incomingNodes.map((node) => ({ node_id: node.id, title: node.data.title, asset_id: node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : undefined) }));
-    if (["continue_video", "extract_video_frames"].includes(task.operation)) references.unshift(...ownAssets);
-    const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: 0, input: { inputs: { prompt: selectedNode.data.description, references }, params: payload, action, use_cache: false } }) });
-    const data = await response.json() as { task?: { id: string }; detail?: string };
-    if (!response.ok || !data.task) { setNotice(data.detail || "任务提交失败"); return; }
-    setNotice("任务已进入公司队列"); void pollTask(data.task.id, selectedNode.id);
+    const quoteResponse = await apiFetch(`/api/tasks/quote?kind=${encodeURIComponent(task.operation)}&provider=${encodeURIComponent(task.provider)}&model=${encodeURIComponent(task.model)}`, { cache: "no-store" });
+    const quoteData = await quoteResponse.json() as { quote?: { credits: number }; detail?: string };
+    if (!quoteResponse.ok || !quoteData.quote) { setNotice(quoteData.detail || "当前账号没有该任务的可用额度"); return; }
+    const run = async () => {
+      setPendingTask(null);
+      setNodes((current) => current.map((node) => node.id === selectedNode.id ? { ...node, data: { ...node.data, status: "正在排队", progress: 0 } } : node));
+      const ownAssetIds = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean);
+      const ownAssets = ownAssetIds.map((assetId) => ({ node_id: selectedNode.id, title: selectedNode.data.title, asset_id: assetId }));
+      const referenceSettings = Array.isArray(payload.reference_settings) ? payload.reference_settings as Array<Record<string, unknown>> : [];
+      const timelineSettings = effectiveDirectorTimeline;
+      let references = incomingNodes.map((node) => {
+        const settings = (specKey === "multi_director" ? timelineSettings : referenceSettings).find((item) => item.source_node_id === node.id) || {};
+        return { node_id: node.id, title: node.data.title, asset_id: node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) ? node.data.desktopPayload.output_asset_ids[0] : undefined), role: String(settings.purpose || "reference"), instruction: settings.instruction || settings.action, camera: settings.camera };
+      });
+      if (specKey === "video" && payload.last_frame_asset_id) references = [...references.filter((item) => String(item.asset_id || "") !== String(payload.last_frame_asset_id)), ...references.filter((item) => String(item.asset_id || "") === String(payload.last_frame_asset_id))];
+      if (["continue_video", "extract_video_frames"].includes(task.operation)) references.unshift(...ownAssets);
+      const taskParams = specKey === "multi_director" ? { ...payload, timeline_images: effectiveDirectorTimeline } : payload;
+      const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: quoteData.quote!.credits, input: { inputs: { prompt: selectedNode.data.description, references }, params: taskParams, action, use_cache: false } }) });
+      const data = await response.json() as { task?: { id: string }; detail?: string };
+      if (!response.ok || !data.task) { setNotice(data.detail || "任务提交失败"); return; }
+      setNotice("任务已进入公司队列"); void pollTask(data.task.id, selectedNode.id);
+    };
+    setPendingTask({ action, model: task.model || task.provider, credits: quoteData.quote.credits, run });
   };
 
   const importDesktopProject = async (file: File) => {
@@ -389,9 +571,9 @@ function CanvasApp() {
 
       <section className="workspace">
         <aside className="rail">
-          <button className="rail-button is-active"><Boxes size={18} /><span>画布</span></button>
-          <button className="rail-button"><FolderOpen size={18} /><span>资产</span></button>
-          <button className="rail-button"><Zap size={18} /><span>任务</span></button>
+          <button className={`rail-button ${sideView === "canvas" ? "is-active" : ""}`} onClick={() => void openSideView("canvas")}><Boxes size={18} /><span>画布</span></button>
+          <button className={`rail-button ${sideView === "assets" ? "is-active" : ""}`} onClick={() => void openSideView("assets")}><FolderOpen size={18} /><span>资产</span></button>
+          <button className={`rail-button ${sideView === "tasks" ? "is-active" : ""}`} onClick={() => void openSideView("tasks")}><Zap size={18} /><span>任务</span></button>
           <div className="rail-spacer" />
           <button className="rail-button"><Menu size={18} /><span>菜单</span></button>
         </aside>
@@ -408,6 +590,7 @@ function CanvasApp() {
             <Controls position="bottom-left" showInteractive={false} />
             <MiniMap position="bottom-right" nodeColor={(node) => (node.data as StudioData).accent} maskColor="rgba(8, 10, 14, .72)" pannable zoomable />
           </ReactFlow>
+          {sideView !== "canvas" && <aside className="canvas-side-panel"><header><div><strong>{sideView === "assets" ? "资产库副本" : "公司任务队列"}</strong><span>{sideView === "assets" ? "只有主动保存的媒体才进入这里" : "查看生成进度、失败原因并阻止重复提交"}</span></div><button onClick={() => setSideView("canvas")}><X size={16} /></button></header>{sideView === "assets" ? <div className="side-list">{libraryAssets.length ? libraryAssets.map((asset) => <article key={asset.id}><span className="side-kind">{asset.kind}</span><div><strong>{asset.name}</strong><small>{Math.max(1, Math.round(asset.size / 1024))} KB</small></div><button onClick={() => copyAssetToCanvas(asset)}>复制到画布</button></article>) : <p>还没有保存到资产库的媒体。</p>}</div> : <div className="side-list">{queueTasks.length ? queueTasks.map((task) => <article key={task.id}><span className={`task-state state-${task.status}`}>{task.progress}%</span><div><strong>{task.kind} · {task.provider || "local"}</strong><small>{task.status}{task.error_message ? ` · ${task.error_message}` : ""}</small></div>{["queued", "running", "paused"].includes(task.status) ? <button onClick={async () => { await apiFetch(`/api/tasks/${task.id}/cancel`, { method: "POST" }); void openSideView("tasks"); }}>取消</button> : ["failed", "cancelled"].includes(task.status) ? <button onClick={async () => { const response = await apiFetch(`/api/tasks/${task.id}/retry`, { method: "POST" }); const data = await response.json() as { task?: { id: string }; detail?: string }; if (!response.ok || !data.task) { setNotice(data.detail || "重试失败"); return; } setNotice("重试任务已进入队列"); void pollTask(data.task.id, task.node_id); void openSideView("tasks"); }}>重试</button> : null}</article>) : <p>当前项目还没有任务。</p>}</div>}</aside>}
 
           <div className="dock-wrap">
             <nav className="creation-dock" aria-label="画布程序坞">
@@ -438,15 +621,17 @@ function CanvasApp() {
             {selectedNode.data.specKey === "copywriting" && <><label><span>产品 / 品牌</span><input value={String(selectedNode.data.desktopPayload?.product_name || "")} onChange={(event) => updatePayload("product_name", event.target.value)} /></label><label><span>产品卖点与必须保留的信息</span><textarea rows={4} value={String(selectedNode.data.desktopPayload?.product_description || "")} onChange={(event) => updatePayload("product_description", event.target.value)} /></label><div className="field-row"><label><span>口播风格</span><select value={String(selectedNode.data.desktopPayload?.copy_style || "激情抓眼球")} onChange={(event) => updatePayload("copy_style", event.target.value)}><option>激情抓眼球</option><option>沉稳放松</option><option>幽默有趣</option><option>高端大气</option><option>情感共鸣</option><option>专业权威</option></select></label><label><span>目标秒数</span><input type="number" min="5" value={Number(selectedNode.data.desktopPayload?.copy_duration || 30)} onChange={(event) => updatePayload("copy_duration", event.target.value)} /></label></div></>}
             {controlled && selectedNode.data.specKey === "storyboard" && <div className="provider-locks"><label><span>拆镜 / 编剧引擎</span><select value={String(selectedNode.data.desktopPayload?.planning_provider || "")} onChange={(event) => updatePayload("planning_provider", event.target.value)}><option value="">明确选择</option>{providers.filter((item) => item.capabilities.includes("chat")).map((item) => <option key={item.name}>{item.name}</option>)}</select></label><label><span>图片引擎</span><select value={String(selectedNode.data.desktopPayload?.image_provider || "")} onChange={(event) => updatePayload("image_provider", event.target.value)}><option value="">明确选择</option>{providers.filter((item) => item.capabilities.includes("text_to_image")).map((item) => <option key={item.name}>{item.name}</option>)}</select></label><label><span>视频引擎</span><select value={String(selectedNode.data.desktopPayload?.video_provider || "")} onChange={(event) => updatePayload("video_provider", event.target.value)}><option value="">明确选择</option>{providers.filter((item) => item.capabilities.includes("text_to_video")).map((item) => <option key={item.name}>{item.name}</option>)}</select></label></div>}
             {controlled && !["storyboard", "analysis", "image_asset", "workflow", "task", "result", "project"].includes(selectedNode.data.specKey) && <label><span>生成引擎（明确锁定，不自动切换）</span><select value={String(selectedNode.data.desktopPayload?.provider_name || "")} onChange={(event) => updatePayload("provider_name", event.target.value)}><option value="">请选择可用引擎</option>{providers.map((provider) => <option key={provider.name} value={provider.name}>{provider.name} · {provider.capabilities.join(" / ")}</option>)}</select></label>}
-            {selectedNode.data.specKey === "multi_director" && <div className="timeline-editor"><div><strong>导演时间轴</strong><span>{incomingNodes.length}/50 张图片</span></div>{incomingNodes.map((node, index) => <div className="timeline-row" key={node.id}><span>{index + 1}</span><div><strong>{node.data.title}</strong><small>{index * 3}–{Math.min(Number(selectedNode.data.desktopPayload?.duration || 10), index * 3 + 3)} 秒</small></div><input aria-label={`${node.data.title}动作与运镜`} value={String(((selectedNode.data.desktopPayload?.timeline_images as Array<Record<string, unknown>> | undefined)?.[index]?.instruction) || "保持构图与主体，推进一个清晰动作")} onChange={(event) => { const timeline = [...((selectedNode.data.desktopPayload?.timeline_images as Array<Record<string, unknown>> | undefined) || [])]; timeline[index] = { ...(timeline[index] || {}), source_node_id: node.id, start: index * 3, end: Math.min(Number(selectedNode.data.desktopPayload?.duration || 10), index * 3 + 3), instruction: event.target.value }; updatePayload("timeline_images", timeline); }} /></div>)}</div>}
+            {selectedNode.data.specKey === "multi_image" && <div className="reference-purpose-editor"><div><strong>逐张定义参考用途</strong><span>{incomingNodes.length} 张输入</span></div>{incomingNodes.length ? incomingNodes.map((node) => { const settings = ((selectedNode.data.desktopPayload?.reference_settings as Array<Record<string, unknown>> | undefined) || []).find((item) => item.source_node_id === node.id) || {}; return <div className="purpose-row" key={node.id}><span>{node.data.title}</span><select aria-label={`${node.data.title}用途`} value={String(settings.purpose || "subject")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { purpose: event.target.value })}><option value="subject">主体身份</option><option value="scene">场景结构</option><option value="composition">构图机位</option><option value="element">道具元素</option><option value="style">视觉风格</option></select><input aria-label={`${node.data.title}补充要求`} placeholder="例如：只参考服装和五官" value={String(settings.instruction || "")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { instruction: event.target.value })} /></div>; }) : <p>把图片节点连入后，会在这里逐张设置用途。</p>}</div>}
+            {selectedNode.data.specKey === "multi_director" && <div className="timeline-editor"><div><strong>导演时间轴</strong><span>{incomingNodes.length}/50 张图片 · 当前引擎上限 {Number(providers.find((item) => item.name === selectedNode.data.desktopPayload?.provider_name)?.profile?.reference_assets || 0) || "待选择"}</span></div>{incomingNodes.map((node, index) => { const settings = ((selectedNode.data.desktopPayload?.timeline_images as Array<Record<string, unknown>> | undefined) || []).find((item) => item.source_node_id === node.id) || {}; const start = Number(settings.start ?? index * 3), end = Number(settings.end ?? Math.min(Number(selectedNode.data.desktopPayload?.duration || 10), index * 3 + 3)); return <div className="timeline-row" key={node.id}><span>{index + 1}</span><div className="timeline-source"><strong>{node.data.title}</strong><select aria-label={`${node.data.title}参考用途`} value={String(settings.purpose || "continuity")} onChange={(event) => updateReferenceRow("timeline_images", node.id, { purpose: event.target.value, start, end })}><option value="first_frame">首帧</option><option value="last_frame">尾帧</option><option value="continuity">连续性</option><option value="subject">主体身份</option><option value="scene">场景</option><option value="composition">构图</option></select></div><div className="timeline-time"><input type="number" min="0" step="0.1" aria-label={`${node.data.title}开始秒`} value={start} onChange={(event) => updateReferenceRow("timeline_images", node.id, { start: Number(event.target.value), end })} /><span>—</span><input type="number" min="0" step="0.1" aria-label={`${node.data.title}结束秒`} value={end} onChange={(event) => updateReferenceRow("timeline_images", node.id, { start, end: Number(event.target.value) })} /></div><input aria-label={`${node.data.title}动作`} placeholder="主体动作" value={String(settings.action || settings.instruction || "推进一个清晰动作")} onChange={(event) => updateReferenceRow("timeline_images", node.id, { action: event.target.value, start, end })} /><input aria-label={`${node.data.title}运镜`} placeholder="运镜，例如缓慢推近" value={String(settings.camera || "")} onChange={(event) => updateReferenceRow("timeline_images", node.id, { camera: event.target.value, start, end })} /></div>; })}</div>}
             {selectedNode.data.specKey === "storyboard" && <div className="production-controls"><label><span>制片方式</span><select value={String(selectedNode.data.desktopPayload?.automation_mode || "checkpoints")} onChange={(event) => updatePayload("automation_mode", event.target.value)}><option value="checkpoints">关键节点确认（推荐）</option><option value="auto">全自动</option><option value="manual">逐步控制</option></select></label><div><button onClick={() => void productionCommand("approve")}>审片通过并继续</button><button onClick={() => void productionCommand("accept_risk")}>接受风险并继续</button></div><div><button onClick={() => void productionCommand(selectedNode.data.desktopPayload?.production_status === "paused" ? "resume" : "pause")}>{selectedNode.data.desktopPayload?.production_status === "paused" ? "继续已暂停流程" : "暂停流程"}</button><select aria-label="重做阶段" value={Number(selectedNode.data.desktopPayload?.rewind_stage || 1)} onChange={(event) => updatePayload("rewind_stage", Number(event.target.value))}>{[1,2,3,4,5,6,7].map((stage) => <option key={stage} value={stage}>从第 {stage} 阶段重做</option>)}</select><button onClick={() => void productionCommand("rewind", Number(selectedNode.data.desktopPayload?.rewind_stage || 1))}>确认重做</button></div></div>}
             <div className="reference-box"><div><strong>参考输入 · {incomingNodes.length}</strong><span>{incomingNodes.length ? incomingNodes.map((node) => node.data.title).join("、") : "从其他节点连线后自动出现"}</span></div><button onClick={() => importInputRef.current?.click()}><Upload size={15} /> 导入</button></div>
-            <div className="node-actions"><span>桌面端一致操作</span>{(NODE_SPEC_BY_KEY[selectedNode.data.specKey]?.actions || []).map((action) => <button className={selectedNode.data.desktopPayload?.editor_action === action ? "is-active" : ""} key={action} onClick={() => { updatePayload("editor_action", action); setNotice(`已选择“${action}”`); }}>{action}</button>)}</div>
+            <div className="node-actions"><span>桌面端一致操作</span>{(NODE_SPEC_BY_KEY[selectedNode.data.specKey]?.actions || []).map((action) => <button className={selectedNode.data.desktopPayload?.editor_action === action ? "is-active" : ""} key={action} onClick={() => void handleNodeAction(action)}>{action}</button>)}</div>
             <button className="generate-button" onClick={() => void submitSelected()}><WandSparkles size={17} /> 生成当前节点</button>
             <p className="cost-note">提交前会显示模型、预计耗时和费用，不会静默切换模型。</p>
           </div>}
         </aside>
       </section>
+      {pendingTask && <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setPendingTask(null); }}><section className="task-confirm" role="dialog" aria-modal="true" aria-labelledby="task-confirm-title"><header><div><Zap size={18} /><span><strong id="task-confirm-title">确认提交生成任务</strong><small>由公司服务器校验账号、模型和额度</small></span></div><button onClick={() => setPendingTask(null)} aria-label="关闭"><X size={17} /></button></header><div className="task-confirm-body"><dl><div><dt>操作</dt><dd>{pendingTask.action}</dd></div><div><dt>锁定模型</dt><dd>{pendingTask.model}</dd></div><div><dt>额度预估</dt><dd>{pendingTask.credits} credits</dd></div></dl><p>提交后不会静默换模型；重复请求会通过幂等键拦截。生成结果先进入画布，只有手动点击才会复制到资产库。</p><div><button onClick={() => setPendingTask(null)}>取消</button><button className="confirm-primary" onClick={() => void pendingTask.run()}>确认并提交</button></div></div></section></div>}
       {adminOpen && <AdminPanel onClose={() => setAdminOpen(false)} />}
     </main>
   );

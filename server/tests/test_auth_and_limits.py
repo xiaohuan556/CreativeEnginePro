@@ -13,7 +13,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from creative_server.database import SessionLocal, create_schema  # noqa: E402
 from creative_server.main import app  # noqa: E402
-from creative_server.models import GenerationTask, Project, UsageLimit, User  # noqa: E402
+from creative_server.models import Asset, GenerationTask, Project, UsageLimit, User  # noqa: E402
 from creative_server.security import hash_password  # noqa: E402
 
 
@@ -51,22 +51,42 @@ def test_admin_controls_accounts_and_task_limits() -> None:
 
         with TestClient(app) as user_client:
             user_csrf = login(user_client, "artist.one", "Artist-Secure-42!")
-            forbidden = user_client.post("/api/tasks", headers={"x-csrf-token": user_csrf, "idempotency-key": "viewer-task-0001"}, json={"project_id": project_id, "node_id": "node-1", "kind": "image", "estimated_credits": 0})
+            forbidden = user_client.post("/api/tasks", headers={"x-csrf-token": user_csrf, "idempotency-key": "viewer-task-0001"}, json={"project_id": project_id, "node_id": "node-1", "kind": "text_to_image", "provider": "seedream", "estimated_credits": 0})
             assert forbidden.status_code == 403
 
-        changed = admin_client.patch(f"/api/admin/users/{user_id}", headers={"x-csrf-token": admin_csrf}, json={"role": "producer", "allowed_models": ["seedream-v4"]})
+        changed = admin_client.patch(f"/api/admin/users/{user_id}", headers={"x-csrf-token": admin_csrf}, json={"role": "producer", "allowed_models": ["seedream", "seedream-v4", "seedance"]})
         assert changed.status_code == 200
 
         with TestClient(app) as user_client:
             user_csrf = login(user_client, "artist.one", "Artist-Secure-42!")
+            denied = user_client.post("/api/tasks", headers={"x-csrf-token": user_csrf, "idempotency-key": "producer-task-denied"}, json={"project_id": project_id, "node_id": "node-1", "kind": "text_to_image", "provider": "seedream", "model": "seedream-v4", "estimated_credits": 0})
+            assert denied.status_code == 403
+
+        enabled = admin_client.patch(f"/api/admin/users/{user_id}", headers={"x-csrf-token": admin_csrf}, json={"allow_paid_models": True})
+        assert enabled.status_code == 200
+
+        with TestClient(app) as user_client:
+            user_csrf = login(user_client, "artist.one", "Artist-Secure-42!")
             headers = {"x-csrf-token": user_csrf, "idempotency-key": "producer-task-0001"}
-            task = user_client.post("/api/tasks", headers=headers, json={"project_id": project_id, "node_id": "node-1", "kind": "image", "model": "seedream-v4", "estimated_credits": 0})
+            task = user_client.post("/api/tasks", headers=headers, json={"project_id": project_id, "node_id": "node-1", "kind": "text_to_image", "provider": "seedream", "model": "seedream-v4", "estimated_credits": 0})
             assert task.status_code == 202, task.text
-            duplicate = user_client.post("/api/tasks", headers=headers, json={"project_id": project_id, "node_id": "node-1", "kind": "image", "model": "seedream-v4", "estimated_credits": 0})
+            assert task.json()["task"]["id"]
+            duplicate = user_client.post("/api/tasks", headers=headers, json={"project_id": project_id, "node_id": "node-1", "kind": "text_to_image", "provider": "seedream", "model": "seedream-v4", "estimated_credits": 0})
             assert duplicate.status_code == 202
             assert duplicate.json()["deduplicated"] is True
-            paid = user_client.post("/api/tasks", headers={"x-csrf-token": user_csrf, "idempotency-key": "producer-task-0002"}, json={"project_id": project_id, "node_id": "node-2", "kind": "video", "model": "seedream-v4", "estimated_credits": 1})
-            assert paid.status_code == 403
+            with SessionLocal() as db:
+                queued = db.get(GenerationTask, task.json()["task"]["id"])
+                assert queued.estimated_credits == 10
+                queued.status = "completed"
+                db.commit()
+            paid = user_client.post("/api/tasks", headers={"x-csrf-token": user_csrf, "idempotency-key": "producer-task-0002"}, json={"project_id": project_id, "node_id": "node-2", "kind": "text_to_video", "provider": "seedance", "estimated_credits": 1})
+            assert paid.status_code == 429
+        usage = admin_client.get("/api/admin/usage")
+        audit = admin_client.get("/api/admin/audit?limit=20")
+        assert usage.status_code == 200
+        assert usage.json()["statuses"]["completed"] >= 1
+        assert audit.status_code == 200
+        assert any(event["action"] == "task.queued" for event in audit.json()["events"])
 
 
 def test_login_is_rate_limited_without_revealing_account_state() -> None:
@@ -126,3 +146,52 @@ def test_worker_completes_a_persisted_task_and_writes_result() -> None:
         finished = db.get(GenerationTask, task_id)
         assert finished.status == "completed"
         assert "完成" in finished.output_json
+        project = db.get(Project, finished.project_id)
+        canvas = __import__("json").loads(project.canvas_json)
+        source = next(node for node in canvas["nodes"] if node["id"] == "script-1")
+        assert source["data"]["status"] == "生成完成"
+        assert source["data"]["desktopPayload"]["server_task_id"] == task_id
+        assert project.version == 2
+
+
+def test_asset_library_is_explicit_and_retry_is_a_new_queued_task() -> None:
+    seed_admin()
+    with SessionLocal() as db:
+        admin = db.query(User).filter(User.username == "admin").first()
+        project = Project(owner_id=admin.id, title="资产库测试", canvas_json='{"protocol":"creative-engine-canvas","version":1,"nodes":[],"edges":[]}')
+        db.add(project); db.flush()
+        asset = Asset(project_id=project.id, owner_id=admin.id, node_id="image-1", name="frame.png", kind="image", object_key="test/frame.png", content_type="image/png", size=128, sha256="a" * 64)
+        failed = GenerationTask(project_id=project.id, node_id="image-1", owner_id=admin.id, kind="text_to_image", provider="seedream", model="seedream-v4", estimated_credits=10, idempotency_key="failed-task-for-retry", input_json='{"inputs":{"prompt":"test"}}', status="failed")
+        db.add_all([asset, failed]); db.commit(); project_id, asset_id, failed_id = project.id, asset.id, failed.id
+    with TestClient(app) as client:
+        csrf = login(client, "admin", "Correct-Horse-42!")
+        before = client.get(f"/api/assets?project_id={project_id}&library_only=true")
+        assert before.json()["assets"] == []
+        saved = client.post(f"/api/assets/{asset_id}/save-to-library", headers={"x-csrf-token": csrf})
+        assert saved.status_code == 200
+        assert saved.json()["asset"]["in_library"] is True
+        after = client.get(f"/api/assets?project_id={project_id}&library_only=true")
+        assert [item["id"] for item in after.json()["assets"]] == [asset_id]
+        retried = client.post(f"/api/tasks/{failed_id}/retry", headers={"x-csrf-token": csrf})
+        assert retried.status_code == 202, retried.text
+        assert retried.json()["task"]["id"] != failed_id
+        with SessionLocal() as db:
+            queued = db.get(GenerationTask, retried.json()["task"]["id"])
+            assert queued.status == "queued"
+            assert queued.input_json == '{"inputs":{"prompt":"test"}}'
+
+
+def test_provider_reference_limit_is_enforced_without_silent_truncation() -> None:
+    seed_admin()
+    with SessionLocal() as db:
+        admin = db.query(User).filter(User.username == "admin").first()
+        project = Project(owner_id=admin.id, title="参考图限制", canvas_json='{"protocol":"creative-engine-canvas","version":1,"nodes":[],"edges":[]}')
+        db.add(project); db.commit(); project_id = project.id
+    references = [{"asset_id": str(index)} for index in range(10)]
+    profile = [{"name": "seedance", "capabilities": ["text_to_video", "image_to_video"], "profile": {"reference_assets": 9}}]
+    with patch("creative_server.main.available_providers", return_value=profile):
+        with TestClient(app) as client:
+            csrf = login(client, "admin", "Correct-Horse-42!")
+            response = client.post("/api/tasks", headers={"x-csrf-token": csrf, "idempotency-key": "too-many-references"}, json={"project_id": project_id, "node_id": "director-1", "kind": "text_to_video", "provider": "seedance", "input": {"inputs": {"prompt": "test", "references": references}}})
+            assert response.status_code == 422
+            assert "不会静默丢图" in response.json()["detail"]

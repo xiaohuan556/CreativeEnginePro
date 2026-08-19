@@ -15,12 +15,12 @@ def available_providers() -> list[dict]:
         result.append({"name": llm_name, "capabilities": ["chat", "json"], "profile": {"model": getattr(config, "LLM_MODEL_NAME", "")}})
     if getattr(config, "OPENAI_API_KEY", ""):
         result.extend([
-            {"name": "gptimage", "capabilities": ["text_to_image", "image_edit", "inpaint"], "profile": {}},
-            {"name": "veo", "capabilities": ["text_to_video", "image_to_video"], "profile": {}},
+            {"name": "gptimage", "capabilities": ["text_to_image", "image_edit", "inpaint"], "profile": {"reference_assets": 10}},
+            {"name": "veo", "capabilities": ["text_to_video", "image_to_video"], "profile": {"reference_assets": 3, "native_audio": True}},
         ])
     if getattr(config, "SEEDREAM_API_KEY", ""):
         result.extend([
-            {"name": "seedream", "capabilities": ["text_to_image", "image_edit"], "profile": {}},
-            {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"], "profile": {}},
+            {"name": "seedream", "capabilities": ["text_to_image", "image_edit"], "profile": {"reference_assets": 10}},
+            {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"], "profile": {"reference_assets": 9, "native_audio": True}},
         ])
     return result

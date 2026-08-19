@@ -14,8 +14,11 @@ IMAGE_ACTION_DEFAULTS = {
 
 def _director_prompt(prompt: str, timeline: list[dict]) -> str:
     lines = [prompt.strip(), "按以下导演时间轴一次生成完整连续视频；切镜点必须准确，主体身份、场景结构、道具和光线保持连续："]
-    for index, item in enumerate(timeline[:9]):
-        lines.append(f"{float(item.get('start', index * 3)):g}–{float(item.get('end', index * 3 + 3)):g}秒｜参考图{index + 1}｜{item.get('instruction') or '推进一个清晰动作并停在明确结束状态'}")
+    for index, item in enumerate(timeline[:50]):
+        purpose = item.get("purpose") or "连续性参考"
+        action = item.get("action") or item.get("instruction") or "推进一个清晰动作并停在明确结束状态"
+        camera = item.get("camera") or "保持镜头稳定并服从动作"
+        lines.append(f"{float(item.get('start', index * 3)):g}–{float(item.get('end', index * 3 + 3)):g}秒｜参考图{index + 1}（{purpose}）｜动作：{action}｜运镜：{camera}")
     return "\n".join(value for value in lines if value)
 
 

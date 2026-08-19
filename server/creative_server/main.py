@@ -8,7 +8,7 @@ from datetime import timedelta, timezone
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import delete, or_, select
+from sqlalchemy import delete, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,14 +16,14 @@ from .audit import client_ip, record_audit
 from .config import Settings, get_settings
 from .database import create_schema, get_db
 from .dependencies import current_user, require_admin, require_csrf
-from .models import Asset, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, UsageLimit, User
+from .models import Asset, AuditLog, GenerationTask, LoginSession, LoginThrottle, ProductionEvent, ProductionRun, Project, ProjectMember, ProjectRevision, UsageLimit, User
 from .production import handle_command
 from .production_state import STAGES
 from .provider_catalog import available_providers
 from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate
 from .security import DUMMY_PASSWORD_HASH, expiry, hash_password, opaque_token, token_hash, utcnow, validate_password, validate_username, verify_password
 from .storage import media_kind, resolve_object, save_upload
-from .task_policy import enforce_task_policy, require_project_read, require_project_write
+from .task_policy import enforce_task_policy, estimate_task_credits, require_project_read, require_project_write
 
 
 def _aware(value):
@@ -44,7 +44,7 @@ def public_project(project: Project) -> dict:
 
 
 def public_asset(asset: Asset) -> dict:
-    return {"id": asset.id, "project_id": asset.project_id, "node_id": asset.node_id, "name": asset.name, "kind": asset.kind, "content_type": asset.content_type, "size": asset.size, "sha256": asset.sha256, "status": asset.status, "metadata": json.loads(asset.metadata_json or "{}"), "url": f"/api/assets/{asset.id}", "created_at": asset.created_at.isoformat()}
+    return {"id": asset.id, "project_id": asset.project_id, "node_id": asset.node_id, "name": asset.name, "kind": asset.kind, "content_type": asset.content_type, "size": asset.size, "sha256": asset.sha256, "status": asset.status, "in_library": asset.in_library, "metadata": json.loads(asset.metadata_json or "{}"), "url": f"/api/assets/{asset.id}", "created_at": asset.created_at.isoformat()}
 
 
 def public_run(run: ProductionRun) -> dict:
@@ -186,9 +186,11 @@ def update_project(project_id: str, payload: ProjectUpdate, request: Request, us
 
 
 @app.get("/api/assets")
-def list_assets(project_id: str, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+def list_assets(project_id: str, library_only: bool = False, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     require_project_read(db, project_id, user)
-    items = db.scalars(select(Asset).where(Asset.project_id == project_id).order_by(Asset.created_at.desc())).all()
+    query = select(Asset).where(Asset.project_id == project_id)
+    if library_only: query = query.where(Asset.in_library.is_(True))
+    items = db.scalars(query.order_by(Asset.created_at.desc())).all()
     return {"assets": [public_asset(item) for item in items]}
 
 
@@ -213,6 +215,15 @@ def get_asset(asset_id: str, user: User = Depends(current_user), db: Session = D
     path = resolve_object(asset.object_key)
     if not path.is_file(): raise HTTPException(status.HTTP_404_NOT_FOUND, "资产文件已丢失")
     return FileResponse(path, media_type=asset.content_type, filename=asset.name)
+
+
+@app.post("/api/assets/{asset_id}/save-to-library")
+def save_asset_to_library(asset_id: str, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    asset = db.get(Asset, asset_id)
+    if not asset: raise HTTPException(status.HTTP_404_NOT_FOUND, "资产不存在")
+    require_project_write(db, asset.project_id, user)
+    asset.in_library = True; record_audit(db, request, "asset.saved_to_library", user, "asset", asset.id); db.commit()
+    return {"asset": public_asset(asset)}
 
 
 @app.post("/api/production-runs", status_code=201)
@@ -298,6 +309,22 @@ def update_user(user_id: str, payload: UserUpdate, request: Request, admin: User
     return {"user": public_user(user, limits)}
 
 
+@app.get("/api/admin/usage")
+def admin_usage(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    if user.role != "admin": raise HTTPException(status.HTTP_403_FORBIDDEN, "只有管理员可以查看使用统计")
+    day_start = utcnow() - timedelta(hours=24)
+    rows = db.execute(select(User.id, User.username, User.display_name, func.count(GenerationTask.id), func.coalesce(func.sum(GenerationTask.estimated_credits), 0)).join(GenerationTask, GenerationTask.owner_id == User.id).where(GenerationTask.created_at >= day_start).group_by(User.id, User.username, User.display_name).order_by(func.count(GenerationTask.id).desc())).all()
+    status_rows = db.execute(select(GenerationTask.status, func.count()).where(GenerationTask.created_at >= day_start).group_by(GenerationTask.status)).all()
+    return {"window_hours": 24, "users": [{"id": row[0], "username": row[1], "display_name": row[2], "tasks": row[3], "credits": row[4]} for row in rows], "statuses": {row[0]: row[1] for row in status_rows}}
+
+
+@app.get("/api/admin/audit")
+def admin_audit(limit: int = 100, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    if user.role != "admin": raise HTTPException(status.HTTP_403_FORBIDDEN, "只有管理员可以查看审计日志")
+    items = db.scalars(select(AuditLog).order_by(AuditLog.created_at.desc()).limit(max(1, min(limit, 500)))).all()
+    return {"events": [{"id": item.id, "actor_id": item.actor_id, "action": item.action, "target_type": item.target_type, "target_id": item.target_id, "ip_address": item.ip_address, "detail": json.loads(item.detail_json or "{}"), "created_at": item.created_at.isoformat()} for item in items]}
+
+
 @app.post("/api/tasks", status_code=202)
 def create_task(payload: TaskCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
     idem = (request.headers.get("idempotency-key") or "").strip()
@@ -307,10 +334,34 @@ def create_task(payload: TaskCreate, request: Request, user: User = Depends(requ
     if existing:
         return {"task": {"id": existing.id, "status": existing.status, "progress": existing.progress}, "deduplicated": True}
     require_project_write(db, payload.project_id, user)
-    enforce_task_policy(db, user, payload.provider, payload.model, payload.estimated_credits)
-    task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=payload.model, estimated_credits=payload.estimated_credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))
+    profile = next((item for item in available_providers() if item["name"] == payload.provider), None)
+    references = payload.input.get("inputs", {}).get("references", []) if isinstance(payload.input.get("inputs"), dict) else []
+    provider_operation = "image_to_video" if payload.kind == "continue_video" else payload.kind
+    if payload.provider != "local" and (not profile or provider_operation not in profile.get("capabilities", [])):
+        raise HTTPException(status.HTTP_409_CONFLICT, f"已选择引擎 {payload.provider or '空'} 当前不可用或不支持 {provider_operation}；任务未入队，系统不会静默切换")
+    reference_limit = int((profile or {}).get("profile", {}).get("reference_assets") or 0)
+    if reference_limit and isinstance(references, list) and len(references) > reference_limit:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, f"{payload.provider} 当前单次最多支持 {reference_limit} 张参考图；请减少输入或拆成连续段落，系统不会静默丢图")
+    if payload.kind in ("image_edit", "image_to_video", "continue_video", "extract_video_frames", "video_breakdown"):
+        if not isinstance(references, list) or not references:
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "该操作必须连接一个已生成或已上传的媒体节点")
+        for reference in references:
+            asset_id = str(reference.get("asset_id") or "") if isinstance(reference, dict) else ""
+            asset = db.get(Asset, asset_id) if asset_id else None
+            if not asset or asset.project_id != payload.project_id:
+                raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "参考节点尚无可用媒体，或媒体不属于当前项目；任务未入队")
+    credits = estimate_task_credits(payload.kind, payload.provider, payload.estimated_credits)
+    enforce_task_policy(db, user, payload.provider, payload.model, credits)
+    task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=payload.model, estimated_credits=credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))
     db.add(task); record_audit(db, request, "task.queued", user, "task", task.id, {"kind": task.kind, "provider": task.provider, "model": task.model, "credits": task.estimated_credits}); db.commit()
     return {"task": {"id": task.id, "status": task.status, "progress": task.progress}}
+
+
+@app.get("/api/tasks/quote")
+def quote_task(kind: str, provider: str = "", model: str = "", user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    credits = estimate_task_credits(kind, provider)
+    enforce_task_policy(db, user, provider, model, credits)
+    return {"quote": {"credits": credits, "kind": kind, "provider": provider, "model": model}}
 
 
 @app.get("/api/tasks")
@@ -335,4 +386,21 @@ def cancel_task(task_id: str, request: Request, user: User = Depends(require_csr
     require_project_write(db, item.project_id, user)
     if item.status in ("queued", "running", "paused"):
         item.status = "cancelled"; record_audit(db, request, "task.cancelled", user, "task", item.id); db.commit()
+        from .canvas_sync import sync_task_to_canvas
+        sync_task_to_canvas(item.id)
     return {"task": {"id": item.id, "status": item.status}}
+
+
+@app.post("/api/tasks/{task_id}/retry", status_code=202)
+def retry_task(task_id: str, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
+    item = db.get(GenerationTask, task_id)
+    if not item: raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
+    require_project_write(db, item.project_id, user)
+    if item.status not in ("failed", "cancelled"):
+        raise HTTPException(status.HTTP_409_CONFLICT, "只有失败或已取消的任务可以重试")
+    credits = estimate_task_credits(item.kind, item.provider, item.estimated_credits)
+    enforce_task_policy(db, user, item.provider, item.model, credits)
+    attempt = (db.scalar(select(func.count()).select_from(GenerationTask).where(GenerationTask.project_id == item.project_id, GenerationTask.node_id == item.node_id)) or 0) + 1
+    retry = GenerationTask(project_id=item.project_id, node_id=item.node_id, owner_id=user.id, kind=item.kind, provider=item.provider, model=item.model, estimated_credits=credits, idempotency_key=f"retry:{item.id}:{attempt}", input_json=item.input_json)
+    db.add(retry); record_audit(db, request, "task.retried", user, "task", retry.id, {"source_task_id": item.id}); db.commit()
+    return {"task": {"id": retry.id, "status": retry.status, "progress": retry.progress}}

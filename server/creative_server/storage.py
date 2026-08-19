@@ -38,6 +38,26 @@ def resolve_object(key: str) -> Path:
     return target
 
 
+def _valid_signature(path: Path, content_type: str) -> bool:
+    with path.open("rb") as source:
+        head = source.read(32)
+    checks = {
+        "image/png": head.startswith(b"\x89PNG\r\n\x1a\n"),
+        "image/jpeg": head.startswith(b"\xff\xd8\xff"),
+        "image/webp": head.startswith(b"RIFF") and head[8:12] == b"WEBP",
+        "video/mp4": head[4:8] == b"ftyp",
+        "video/quicktime": head[4:8] == b"ftyp",
+        "video/webm": head.startswith(b"\x1aE\xdf\xa3"),
+        "audio/mpeg": head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and head[1] & 0xE0 == 0xE0),
+        "audio/wav": head.startswith(b"RIFF") and head[8:12] == b"WAVE",
+        "audio/x-wav": head.startswith(b"RIFF") and head[8:12] == b"WAVE",
+        "audio/mp4": head[4:8] == b"ftyp",
+        "audio/flac": head.startswith(b"fLaC"),
+        "audio/ogg": head.startswith(b"OggS"),
+    }
+    return checks.get(content_type, False)
+
+
 async def save_upload(upload: UploadFile, project_id: str, asset_id: str) -> tuple[str, int, str, str]:
     content_type = (upload.content_type or mimetypes.guess_type(upload.filename or "")[0] or "application/octet-stream").lower()
     if not content_type.startswith(ALLOWED_PREFIXES):
@@ -55,6 +75,8 @@ async def save_upload(upload: UploadFile, project_id: str, asset_id: str) -> tup
                 if size > maximum:
                     raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "文件超过管理员设置的上传上限")
                 digest.update(chunk); output.write(chunk)
+        if not _valid_signature(path, content_type):
+            raise HTTPException(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, "文件内容与声明的图片、视频或音频格式不一致")
     except Exception:
         path.unlink(missing_ok=True)
         raise
@@ -70,5 +92,9 @@ def import_generated_file(source: str | Path, project_id: str, asset_id: str) ->
     object_key = f"{project_id[:12]}/{asset_id}{extension}"
     target = resolve_object(object_key); target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source_path, target)
-    digest = hashlib.sha256(target.read_bytes()).hexdigest()
+    digest_builder = hashlib.sha256()
+    with target.open("rb") as source:
+        while chunk := source.read(1024 * 1024):
+            digest_builder.update(chunk)
+    digest = digest_builder.hexdigest()
     return object_key, target.stat().st_size, digest, content_type

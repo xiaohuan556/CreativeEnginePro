@@ -14,6 +14,11 @@ from .storage import import_generated_file, media_kind, resolve_object
 from .request_compiler import compile_request
 
 
+def _sync_canvas(task_id: str) -> None:
+    from .canvas_sync import sync_task_to_canvas
+    sync_task_to_canvas(task_id)
+
+
 def _desktop_api():
     root = Path(__file__).resolve().parents[2]
     if str(root) not in sys.path:
@@ -61,16 +66,19 @@ def execute_task(task_id: str) -> None:
             if not isinstance(reference, dict) or not reference.get("asset_id"): continue
             asset = db.get(Asset, str(reference["asset_id"]))
             if asset and asset.project_id == task.project_id:
-                typed_references.append({"path": str(resolve_object(asset.object_key)), "role": str(reference.get("role") or "reference"), "label": str(reference.get("title") or asset.name)})
+                role = str(reference.get("role") or "reference")
+                typed_references.append({"path": str(resolve_object(asset.object_key)), "role": "character" if role == "subject" else role, "label": str(reference.get("title") or asset.name)})
         paths = [item["path"] for item in typed_references]
         if operation == "image_edit" and paths:
             hydrated_inputs.update({"image": paths[0], "images": paths, "reference_assets": typed_references})
         elif operation == "image_to_video" and paths:
-            hydrated_inputs["image"] = paths[0]
-            if len(paths) > 1: hydrated_inputs["last_frame"] = paths[1]
+            first = next((item for item in typed_references if item["role"] == "first_frame"), typed_references[0])
+            last = next((item for item in typed_references if item["role"] == "last_frame"), None)
+            hydrated_inputs["image"] = first["path"]
+            if last and last["path"] != first["path"]: hydrated_inputs["last_frame"] = last["path"]
             hydrated_inputs["reference_assets"] = typed_references
         elif operation == "text_to_video" and paths:
-            hydrated_inputs["reference_assets"] = typed_references[:9]
+            hydrated_inputs["reference_assets"] = typed_references[:50]
         elif operation == "text_to_speech":
             hydrated_inputs["text"] = hydrated_inputs.pop("prompt", "")
     if operation in {"extract_video_frames", "continue_video"}:
@@ -94,6 +102,7 @@ def execute_task(task_id: str) -> None:
                 with SessionLocal.begin() as db:
                     current = db.get(GenerationTask, task_id)
                     current.output_json = json.dumps(serialize_result(current, fake_result), ensure_ascii=False); current.status = "completed"; current.progress = 100
+                _sync_canvas(task_id)
                 from .production import on_task_finished
                 on_task_finished(task_id, True, ""); return
             operation = "image_to_video"
@@ -104,6 +113,7 @@ def execute_task(task_id: str) -> None:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
                 if current: current.status = "failed"; current.error_code = "video_frame_failed"; current.error_message = str(error)[:4000]
+            _sync_canvas(task_id)
             from .production import on_task_finished
             on_task_finished(task_id, False, str(error)); return
     if operation == "video_breakdown":
@@ -116,12 +126,14 @@ def execute_task(task_id: str) -> None:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
                 if current: current.output_json = json.dumps({"analysis": result}, ensure_ascii=False, default=str); current.status = "completed"; current.progress = 100
+            _sync_canvas(task_id)
             breakdown_success = True
         except Exception as error:
             breakdown_error = str(error)[:4000]
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
                 if current: current.status = "failed"; current.error_code = "breakdown_failed"; current.error_message = breakdown_error
+            _sync_canvas(task_id)
         from .production import on_task_finished
         on_task_finished(task_id, breakdown_success, breakdown_error)
         return
@@ -150,6 +162,7 @@ def execute_task(task_id: str) -> None:
         with SessionLocal.begin() as db:
             current = db.get(GenerationTask, task_id)
             if current: current.status = "failed"; current.error_code = "worker_error"; current.error_message = final_error
+    _sync_canvas(task_id)
     from .production import on_task_finished
     on_task_finished(task_id, succeeded, final_error)
 

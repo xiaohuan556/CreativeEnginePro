@@ -12,6 +12,27 @@ from .security import utcnow
 ACTIVE_TASKS = ("queued", "running", "paused")
 TASK_ROLES = ("admin", "producer", "director", "editor")
 
+MINIMUM_CREDITS = {
+    "chat": 2,
+    "json": 2,
+    "text_to_image": 10,
+    "image_edit": 10,
+    "inpaint": 10,
+    "text_to_video": 60,
+    "image_to_video": 60,
+    "continue_video": 60,
+    "text_to_speech": 1,
+    "image": 10,
+    "video": 60,
+}
+
+
+def estimate_task_credits(kind: str, provider: str, requested: int = 0) -> int:
+    """Return a server-owned quota estimate; clients cannot quote zero to bypass limits."""
+    if provider in ("local", "edge_tts") or kind in ("video_breakdown", "extract_video_frames"):
+        return 0
+    return max(int(requested or 0), MINIMUM_CREDITS.get(kind, 5))
+
 
 def require_project_write(db: Session, project_id: str, user: User) -> Project:
     project = db.get(Project, project_id)
