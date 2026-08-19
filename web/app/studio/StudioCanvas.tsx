@@ -39,6 +39,7 @@ type LibraryAsset = { id: string; name: string; kind: string; size: number; cont
 type QueueTask = { id: string; node_id: string; kind: string; provider: string; status: string; progress: number; managed_by?: "task" | "workflow" | "production"; error_message?: string };
 type PendingTask = { action: string; model: string; credits: number; run: () => Promise<void> };
 type WorkflowTemplate = { id: string; name: string; definition: { nodes?: StudioNode[]; edges?: Edge[] } };
+type ProjectSummary = { id: string; title: string; version: number; owner_id?: string; updated_at?: string; updatedAt?: string | number };
 
 const kindIcons: Record<StudioNodeKind, typeof Sparkles> = {
   project: Clapperboard,
@@ -147,10 +148,11 @@ function normalizeStudioNode(node: StudioNode): StudioNode {
 
 function CanvasApp() {
   const { apiFetch, controlled, signOut, user } = useControlPlane();
-  const [nodes, setNodes, onNodesChange] = useNodesState<StudioNode>(initialNodes);
-  const [edges, setEdges, onEdgesChange] = useEdgesState(initialEdges);
-  const [selectedId, setSelectedId] = useState("director");
+  const [nodes, setNodes, onNodesChange] = useNodesState<StudioNode>(controlled ? [] : initialNodes);
+  const [edges, setEdges, onEdgesChange] = useEdgesState(controlled ? [] : initialEdges);
+  const [selectedId, setSelectedId] = useState(controlled ? "" : "director");
   const [createOpen, setCreateOpen] = useState(false);
+  const [projectMenuOpen, setProjectMenuOpen] = useState(false);
   const [notice, setNotice] = useState("所有更改已保存");
   const [adminOpen, setAdminOpen] = useState(false);
   const [teamOpen, setTeamOpen] = useState(false);
@@ -162,7 +164,8 @@ function CanvasApp() {
   const [workflowTemplates, setWorkflowTemplates] = useState<WorkflowTemplate[]>([]);
   const [projectRole, setProjectRole] = useState("");
   const [projectConflict, setProjectConflict] = useState(false);
-  const [projectTitle, setProjectTitle] = useState("雨夜最后一封信");
+  const [projects, setProjects] = useState<ProjectSummary[]>([]);
+  const [projectTitle, setProjectTitle] = useState(controlled ? "未命名项目" : "雨夜最后一封信");
   const [projectId, setProjectId] = useState("");
   const [hydrated, setHydrated] = useState(false);
   const versionRef = useRef(1);
@@ -176,6 +179,7 @@ function CanvasApp() {
   const incomingNodes = useMemo(() => edges.filter((edge) => edge.target === selectedId).map((edge) => nodes.find((node) => node.id === edge.source)).filter((node): node is StudioNode => Boolean(node)), [edges, nodes, selectedId]);
   const canWrite = !controlled || (["admin", "producer", "director", "editor"].includes(user.role) && ["owner", "editor"].includes(projectRole));
   const canReview = canWrite || (user.role === "reviewer" && projectRole === "reviewer");
+  const canCreateProject = !controlled || ["admin", "producer", "director", "editor"].includes(user.role);
 
   useEffect(() => {
     if (!selectedNode || selectedNode.data.specKey !== "multi_director" || !incomingNodes.length) return;
@@ -193,25 +197,34 @@ function CanvasApp() {
       try {
         const listing = await apiFetch("/api/projects", { cache: "no-store" });
         if (!listing.ok) throw new Error("项目列表不可用");
-        const data = await listing.json() as { projects?: Array<{ id: string }> };
+        const data = await listing.json() as { projects?: ProjectSummary[] };
+        setProjects(data.projects || []);
         const first = data.projects?.[0];
         if (first) {
           const response = await apiFetch(`/api/projects/${first.id}`, { cache: "no-store" });
           const detail = await response.json() as { project?: { id: string; title: string; version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
-          if (detail.project) {
-            suppressNextSaveRef.current = true;
-            setProjectId(detail.project.id); setProjectTitle(detail.project.title);
-            versionRef.current = detail.project.version;
-            setNodes(detail.project.canvas.nodes.map(normalizeStudioNode));
-            setEdges(detail.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" })));
-          }
+          if (!response.ok || !detail.project) throw new Error("工程载入失败");
+          suppressNextSaveRef.current = true;
+          setProjectId(detail.project.id); setProjectTitle(detail.project.title);
+          versionRef.current = detail.project.version;
+          const nextNodes = detail.project.canvas.nodes.map(normalizeStudioNode);
+          setNodes(nextNodes); setSelectedId(nextNodes[0]?.id || "");
+          setEdges(detail.project.canvas.edges.map((edge) => ({ ...edge, type: "pulse" })));
         } else {
+          if (!canCreateProject) {
+            setNodes([]); setEdges([]); setSelectedId("");
+            setNotice("还没有分配给你的工程，请联系制片人或管理员");
+            return;
+          }
           const response = await apiFetch("/api/projects", {
             method: "POST", headers: { "content-type": "application/json" },
-            body: JSON.stringify({ title: projectTitle, canvas: toWebCanvas(initialNodes, initialEdges) }),
+            body: JSON.stringify({ title: "未命名项目", canvas: toWebCanvas([], []) }),
           });
-          const created = await response.json() as { project?: { id: string; version: number } };
-          if (created.project) { setProjectId(created.project.id); versionRef.current = created.project.version; }
+          const created = await response.json() as { project?: ProjectSummary };
+          if (!response.ok || !created.project) throw new Error("创建工程失败");
+          suppressNextSaveRef.current = true;
+          setProjects([created.project]); setProjectId(created.project.id); setProjectTitle(created.project.title);
+          setNodes([]); setEdges([]); setSelectedId(""); versionRef.current = created.project.version;
         }
         setNotice("服务器项目已同步");
       } catch {
@@ -220,7 +233,7 @@ function CanvasApp() {
         setHydrated(true);
       }
     })();
-  }, [apiFetch, projectTitle, setEdges, setNodes]);
+  }, [apiFetch, canCreateProject, setEdges, setNodes]);
 
   useEffect(() => {
     if (!controlled) return;
@@ -253,21 +266,97 @@ function CanvasApp() {
     if (!hydrated || !projectId) return;
     if (suppressNextSaveRef.current) { suppressNextSaveRef.current = false; return; }
     if (!canWrite) return;
+    if (!projectTitle.trim()) return;
     if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
+    let cancelled = false;
+    const save = async () => {
+      if (cancelled) return;
       setNotice("正在保存…");
-      void apiFetch(`/api/projects/${projectId}`, {
-        method: "PATCH", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ title: projectTitle, canvas: toWebCanvas(nodes, edges), expectedVersion: versionRef.current }),
-      }).then(async (response) => {
+      try {
+        const response = await apiFetch(`/api/projects/${projectId}`, {
+          method: "PATCH", headers: { "content-type": "application/json" },
+          body: JSON.stringify({ title: projectTitle, canvas: toWebCanvas(nodes, edges), expectedVersion: versionRef.current }),
+        });
         const data = await response.json() as { project?: { version: number }; currentVersion?: number };
         if (response.status === 409) { versionRef.current = data.currentVersion || versionRef.current; setProjectConflict(true); setNotice("检测到其他成员更新 · 当前自动保存已暂停"); return; }
         if (!response.ok || !data.project) throw new Error("save failed");
-        versionRef.current = data.project.version; setProjectConflict(false); setNotice("所有更改已保存");
-      }).catch(() => setNotice("保存失败 · 将自动重试"));
-    }, 700);
-    return () => { if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
+        versionRef.current = data.project.version;
+        setProjects((current) => current.map((item) => item.id === projectId ? { ...item, title: projectTitle, version: data.project!.version } : item));
+        setProjectConflict(false); setNotice("所有更改已保存");
+      } catch {
+        if (cancelled) return;
+        setNotice("保存失败 · 3 秒后自动重试");
+        saveTimerRef.current = setTimeout(() => void save(), 3000);
+      }
+    };
+    saveTimerRef.current = setTimeout(() => void save(), 700);
+    return () => { cancelled = true; if (saveTimerRef.current) clearTimeout(saveTimerRef.current); };
   }, [apiFetch, canWrite, edges, hydrated, nodes, projectId, projectTitle]);
+
+  const saveCurrentProjectNow = async () => {
+    if (!controlled || !projectId || !canWrite) return true;
+    if (!projectTitle.trim()) { setNotice("请先填写工程名称"); return false; }
+    if (projectConflict) { setNotice("当前工程存在版本冲突，请先重新载入再切换"); return false; }
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    setNotice("正在保存当前工程…");
+    try {
+      const response = await apiFetch(`/api/projects/${projectId}`, {
+        method: "PATCH", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: projectTitle, canvas: toWebCanvas(nodes, edges), expectedVersion: versionRef.current }),
+      });
+      const data = await response.json() as { project?: ProjectSummary; currentVersion?: number; detail?: string };
+      if (response.status === 409) {
+        versionRef.current = data.currentVersion || versionRef.current; setProjectConflict(true);
+        setNotice("检测到其他成员更新，请先重新载入再切换"); return false;
+      }
+      if (!response.ok || !data.project) { setNotice(data.detail || "当前工程保存失败，已取消切换"); return false; }
+      versionRef.current = data.project.version;
+      setProjects((current) => current.map((item) => item.id === projectId ? { ...item, ...data.project } : item));
+      setNotice("当前工程已保存");
+      return true;
+    } catch {
+      setNotice("当前工程保存失败，已取消切换"); return false;
+    }
+  };
+
+  const loadProject = async (targetId: string) => {
+    const response = await apiFetch(`/api/projects/${targetId}`, { cache: "no-store" });
+    const data = await response.json() as { project?: ProjectSummary & { canvas: { nodes: StudioNode[]; edges: Edge[] } }; detail?: string };
+    if (!response.ok || !data.project) { setNotice(data.detail || "工程载入失败"); return false; }
+    suppressNextSaveRef.current = true;
+    setProjectRole(""); setProjectId(data.project.id); setProjectTitle(data.project.title);
+    versionRef.current = data.project.version;
+    const nextNodes = (data.project.canvas.nodes || []).map(normalizeStudioNode);
+    setNodes(nextNodes); setEdges((data.project.canvas.edges || []).map((edge) => ({ ...edge, type: "pulse" })));
+    setSelectedId(nextNodes[0]?.id || ""); setProjectConflict(false);
+    setProjects((current) => current.map((item) => item.id === data.project!.id ? { ...item, ...data.project } : item));
+    setNotice(`已打开工程：${data.project.title}`);
+    return true;
+  };
+
+  const switchProject = async (targetId: string) => {
+    setProjectMenuOpen(false);
+    if (!targetId || targetId === projectId) return;
+    if (!await saveCurrentProjectNow()) return;
+    await loadProject(targetId);
+  };
+
+  const createBlankProject = async () => {
+    setProjectMenuOpen(false);
+    if (!canCreateProject) { setNotice("当前账号没有创建工程的权限"); return; }
+    if (!await saveCurrentProjectNow()) return;
+    const sequence = projects.length + 1;
+    const response = await apiFetch("/api/projects", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ title: `未命名项目 ${sequence}`, canvas: toWebCanvas([], []) }),
+    });
+    const data = await response.json() as { project?: ProjectSummary & { canvas?: { nodes: StudioNode[]; edges: Edge[] } }; detail?: string };
+    if (!response.ok || !data.project) { setNotice(data.detail || "新建工程失败"); return; }
+    setProjects((current) => [data.project!, ...current]);
+    suppressNextSaveRef.current = true; setProjectRole(""); setProjectId(data.project.id); setProjectTitle(data.project.title);
+    versionRef.current = data.project.version; setNodes([]); setEdges([]); setSelectedId(""); setProjectConflict(false);
+    setNotice("空白工程已创建，请从“新建”添加第一个节点");
+  };
 
   const reloadProject = async () => {
     if (!projectId) return;
@@ -307,13 +396,13 @@ function CanvasApp() {
   const updateSelected = (key: "title" | "description", value: string) => {
     if (!canWrite) { setNotice("当前项目是只读状态"); return; }
     setNodes((current) => current.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, [key]: value } } : node));
-    setNotice("正在保存…");
-    window.setTimeout(() => setNotice("所有更改已保存"), 450);
+    setNotice("有未保存更改");
   };
 
   const updatePayload = (key: string, value: unknown) => {
     if (!canWrite) { setNotice("当前项目是只读状态"); return; }
     setNodes((current) => current.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, desktopPayload: { ...(node.data.desktopPayload || {}), [key]: value } } } : node));
+    setNotice("有未保存更改");
   };
 
   const updateReferenceRow = (key: "reference_settings" | "timeline_images", sourceNodeId: string, patch: Record<string, unknown>) => {
@@ -517,7 +606,6 @@ function CanvasApp() {
     if (!response.ok) return;
     const detail = await response.json() as { project?: { version: number; canvas: { nodes: StudioNode[]; edges: Edge[] } } };
     if (!detail.project) return;
-    suppressNextSaveRef.current = true;
     versionRef.current = detail.project.version;
     const serverNodes = detail.project.canvas.nodes.map(normalizeStudioNode);
     const serverSource = serverNodes.find((node) => node.id === nodeId);
@@ -735,7 +823,17 @@ function CanvasApp() {
     <main className="studio-shell">
       <header className="topbar">
         <div className="brand-mark"><Clapperboard size={18} /></div>
-        <div className="project-heading"><strong>Creative Engine</strong><span className="project-separator">/</span><button className="project-name">{projectTitle} <ChevronDown size={14} /></button></div>
+        <div className="project-heading">
+          <strong>Creative Engine</strong><span className="project-separator">/</span>
+          <button className="project-name" aria-expanded={projectMenuOpen} onClick={() => setProjectMenuOpen((value) => !value)}>{projectTitle} <ChevronDown size={14} /></button>
+          {projectMenuOpen && <div className="project-menu">
+            <div className="project-menu-heading"><span>公司工程</span>{canCreateProject && <button onClick={() => void createBlankProject()}><Plus size={13} /> 新建空白工程</button>}</div>
+            {projectId && <label className="project-menu-rename"><span>当前工程名称</span><input value={projectTitle} disabled={!canWrite} maxLength={200} onChange={(event) => setProjectTitle(event.target.value)} onBlur={() => { if (!projectTitle.trim()) setProjectTitle("未命名项目"); }} /></label>}
+            <div className="project-menu-list">
+              {projects.length ? projects.map((project) => <button key={project.id} className={project.id === projectId ? "is-active" : ""} onClick={() => void switchProject(project.id)}><span><strong>{project.title}</strong><small>{project.id === projectId ? "当前工程" : project.updated_at || project.updatedAt ? new Date(project.updated_at || project.updatedAt!).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" }) : "可打开"}</small></span>{project.id === projectId && <span className="project-current-dot" />}</button>) : <p>当前账号还没有可访问的工程。</p>}
+            </div>
+          </div>}
+        </div>
         <div className="topbar-center"><span className="live-dot" /><span>{notice}</span>{projectConflict && <button onClick={() => void reloadProject()}>重新载入</button>}</div>
         <div className="topbar-actions"><button className="team-button" onClick={() => { if (controlled && projectId) setTeamOpen(true); else setNotice("连接公司服务器后可管理项目成员"); }}><Users size={15} /> {user.role === "admin" ? "管理员" : "制片组"}</button><button className="icon-button" aria-label={user.role === "admin" ? "账号与权限" : "设置"} onClick={() => { if (user.role === "admin" && controlled) setAdminOpen(true); }}><Settings2 size={17} /></button><button className="avatar" title={controlled ? `${user.display_name} · 点击退出` : user.display_name} onClick={() => { if (controlled) void signOut(); }}>{(user.display_name || user.username || "制").slice(0, 1)}</button></div>
       </header>
@@ -754,7 +852,7 @@ function CanvasApp() {
           <ReactFlow<StudioNode, Edge>
             nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes}
             onNodesChange={canWrite ? onNodesChange : undefined} onEdgesChange={canWrite ? onEdgesChange : undefined} onConnect={onConnect}
-            onNodeClick={(_, node) => setSelectedId(node.id)} onPaneClick={() => setCreateOpen(false)}
+            onNodeClick={(_, node) => setSelectedId(node.id)} onPaneClick={() => { setCreateOpen(false); setProjectMenuOpen(false); }}
             fitView fitViewOptions={{ padding: 0.18 }} minZoom={0.18} maxZoom={1.8}
             nodesDraggable={canWrite} nodesConnectable={canWrite} edgesReconnectable={canWrite}
             proOptions={{ hideAttribution: true }} deleteKeyCode={canWrite ? ["Backspace", "Delete"] : null}>
