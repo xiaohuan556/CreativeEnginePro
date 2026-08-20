@@ -21,7 +21,7 @@ const statements = [
 export function ensureSchema() {
   if (!ready) {
     ready = (async () => {
-      const db = getRawDb();
+      const db = await getRawDb();
       await db.batch(statements.map((statement) => db.prepare(statement)));
       await db.prepare("PRAGMA optimize").run();
     })();

@@ -6,7 +6,7 @@ export async function GET(request: Request) {
   const identity = getRequestIdentity(request);
   if (!identity) return unauthorized();
   await ensureSchema();
-  const result = await getRawDb().prepare(
+  const result = await (await getRawDb()).prepare(
     "SELECT id, title, source_format AS sourceFormat, version, created_at AS createdAt, updated_at AS updatedAt FROM projects WHERE owner_id = ? OR id IN (SELECT project_id FROM project_members WHERE user_id = ?) ORDER BY updated_at DESC LIMIT 100"
   ).bind(identity.userId, identity.userId).all();
   return Response.json({ projects: result.results ?? [], user: identity });
@@ -24,7 +24,7 @@ export async function POST(request: Request) {
   const title = payload.title?.trim() || "未命名制片工程";
   const now = Date.now();
   const canvasJson = JSON.stringify(payload.canvas);
-  const db = getRawDb();
+  const db = await getRawDb();
   await db.batch([
     db.prepare("INSERT INTO projects (id, owner_id, title, canvas_json, source_format, version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?)")
       .bind(id, identity.userId, title, canvasJson, payload.sourceFormat || "creative-engine-web", now, now),

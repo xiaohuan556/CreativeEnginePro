@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
+import { access, readFile } from "node:fs/promises";
 import test from "node:test";
 
 const registryPath = new URL("../lib/node-registry.ts", import.meta.url);
@@ -24,4 +24,20 @@ test("web canvas exposes explicit media roles, safe result adoption, native audi
   }
   assert.match(canvas, /selectedAction === "图生视频" \? "image_to_video" : "text_to_video"/);
   assert.match(canvas, /任务未提交，避免错误扣费/);
+});
+
+test("company deployment uses its own password control plane and keeps preview storage lazy", async () => {
+  const [control, database, assetRoute] = await Promise.all([
+    readFile(new URL("../app/studio/ControlPlane.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../db/index.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/assets/route.ts", import.meta.url), "utf8"),
+  ]);
+  assert.match(control, /NEXT_PUBLIC_CONTROL_PLANE_URL/);
+  assert.match(control, /\/api\/auth\/login/);
+  assert.match(control, /name="username"/);
+  assert.match(control, /name="password" type="password"/);
+  assert.doesNotMatch(database, /^import \{ env \} from "cloudflare:workers"/m);
+  assert.match(database, /await import\("cloudflare:workers"\)/);
+  assert.match(assetRoute, /if \(!identity\) return unauthorized\(\)/);
+  await assert.rejects(access(new URL("../app/chatgpt-auth.ts", import.meta.url)));
 });
