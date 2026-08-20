@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import sys
 import time
@@ -17,6 +18,35 @@ from .models import Asset, GenerationTask, ProductionRun, ServiceHeartbeat, User
 from .storage import import_generated_file, media_kind, resolve_object
 from .request_compiler import compile_request
 from .task_policy import enforce_asset_policy, enforce_existing_task_policy
+
+
+def _task_scratch(task_id: str, category: str = "") -> Path:
+    from config import WORK_DIR
+    root = (Path(WORK_DIR) / "server_tasks" / task_id).resolve()
+    target = root / category if category else root
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def _cleanup_task_scratch(task_id: str) -> None:
+    from config import WORK_DIR
+    root = (Path(WORK_DIR) / "server_tasks" / task_id).resolve()
+    work_root = Path(WORK_DIR).resolve()
+    if work_root in root.parents:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+def _cleanup_provider_outputs(paths: list[Path]) -> None:
+    """Remove copied provider outputs only from server-owned scratch roots."""
+    from config import OUTPUT_DIR, WORK_DIR
+    storage = Path(get_settings().storage_dir).resolve()
+    roots = (Path(OUTPUT_DIR).resolve(), Path(WORK_DIR).resolve())
+    for path in paths:
+        candidate = path.resolve()
+        if storage == candidate or storage in candidate.parents:
+            continue
+        if any(root == candidate or root in candidate.parents for root in roots):
+            candidate.unlink(missing_ok=True)
 
 
 def _sync_canvas(task_id: str) -> None:
@@ -77,16 +107,19 @@ def serialize_result(task: GenerationTask, result) -> dict:
     candidates = data if isinstance(data, list) else [data]
     files = [Path(value) for value in candidates if isinstance(value, (str, Path)) and Path(value).is_file()]
     asset_ids: list[str] = []
-    with SessionLocal.begin() as db:
-        if files:
-            user = db.get(User, task.owner_id)
-            if not user: raise HTTPException(404, "素材所属账号不存在")
-            enforce_asset_policy(db, user, sum(path.stat().st_size for path in files))
-        for index, value in enumerate(files):
-            asset = Asset(project_id=task.project_id, owner_id=task.owner_id, node_id=task.node_id, name=value.name, kind="file", object_key="pending", content_type="application/octet-stream", size=0, sha256="", status="processing", metadata_json=json.dumps({"task_id": task.id, "candidate": index}, ensure_ascii=False))
-            db.add(asset); db.flush()
-            key, size, digest, content_type = import_generated_file(value, task.project_id, asset.id)
-            asset.object_key = key; asset.size = size; asset.sha256 = digest; asset.content_type = content_type; asset.kind = media_kind(content_type); asset.status = "ready"; asset_ids.append(asset.id)
+    try:
+        with SessionLocal.begin() as db:
+            if files:
+                user = db.get(User, task.owner_id)
+                if not user: raise HTTPException(404, "素材所属账号不存在")
+                enforce_asset_policy(db, user, sum(path.stat().st_size for path in files))
+            for index, value in enumerate(files):
+                asset = Asset(project_id=task.project_id, owner_id=task.owner_id, node_id=task.node_id, name=value.name, kind="file", object_key="pending", content_type="application/octet-stream", size=0, sha256="", status="processing", metadata_json=json.dumps({"task_id": task.id, "candidate": index}, ensure_ascii=False))
+                db.add(asset); db.flush()
+                key, size, digest, content_type = import_generated_file(value, task.project_id, asset.id)
+                asset.object_key = key; asset.size = size; asset.sha256 = digest; asset.content_type = content_type; asset.kind = media_kind(content_type); asset.status = "ready"; asset_ids.append(asset.id)
+    finally:
+        _cleanup_provider_outputs(files)
     if asset_ids: return {"asset_ids": asset_ids}
     try: json.dumps(data, ensure_ascii=False); return {"data": data}
     except TypeError: return {"data": str(data)}
@@ -127,7 +160,7 @@ def execute_task(task_id: str) -> None:
             frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             if frame_count <= 0: raise RuntimeError("无法读取视频帧")
             indices = [0, max(0, frame_count // 2), max(0, frame_count - 1)] if operation == "extract_video_frames" else [max(0, frame_count - 1)]
-            output_dir = Path(get_settings().storage_dir) / task.project_id[:12] / f"frames-{task.id}"; output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = _task_scratch(task.id, "frames")
             frame_paths = []
             for index, frame_index in enumerate(indices):
                 cap.set(cv2.CAP_PROP_POS_FRAMES, frame_index); ok, frame = cap.read()
@@ -137,9 +170,11 @@ def execute_task(task_id: str) -> None:
             if not frame_paths: raise RuntimeError("视频抽帧失败")
             if operation == "extract_video_frames":
                 fake_result = type("FrameResult", (), {"data": frame_paths, "cost_credits": 0})()
+                serialized = serialize_result(task, fake_result)
                 with SessionLocal.begin() as db:
                     current = db.get(GenerationTask, task_id)
-                    current.output_json = json.dumps(serialize_result(current, fake_result), ensure_ascii=False); current.status = "completed"; current.progress = 100
+                    current.output_json = json.dumps(serialized, ensure_ascii=False); current.status = "completed"; current.progress = 100
+                _cleanup_task_scratch(task_id)
                 _sync_canvas(task_id)
                 _finish_orchestrators(task_id, True, ""); return
             operation = "image_to_video"
@@ -152,6 +187,7 @@ def execute_task(task_id: str) -> None:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
                 if current: current.status = "failed"; current.error_code = "video_frame_failed"; current.error_message = str(error)[:4000]
+            _cleanup_task_scratch(task_id)
             _sync_canvas(task_id)
             _finish_orchestrators(task_id, False, str(error)); return
     if operation == "video_breakdown":
@@ -159,11 +195,19 @@ def execute_task(task_id: str) -> None:
         try:
             if not paths: raise ValueError("AI 拉片节点必须连接一个视频资产节点")
             from ai.video_breakdown import analyze_video
-            output_dir = Path(get_settings().storage_dir) / task.project_id[:12] / f"breakdown-{task.id}"
+            output_dir = _task_scratch(task.id, "breakdown")
             result = analyze_video(paths[0], output_dir)
+            keyframe_shots = [shot for shot in result.get("shots", []) if shot.get("keyframe")]
+            keyframe_paths = [shot["keyframe"] for shot in keyframe_shots]
+            serialized = serialize_result(task, type("BreakdownFrames", (), {"data": keyframe_paths})()) if keyframe_paths else {}
+            for shot, asset_id in zip(keyframe_shots, serialized.get("asset_ids", [])):
+                shot["keyframe_asset_id"] = asset_id; shot["keyframe_url"] = f"/api/assets/{asset_id}"; shot.pop("keyframe", None)
+            result["source_asset_id"] = str(references[0].get("asset_id") or "") if references and isinstance(references[0], dict) else ""
+            result.pop("source", None)
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
-                if current: current.output_json = json.dumps({"analysis": result}, ensure_ascii=False, default=str); current.status = "completed"; current.progress = 100
+                if current:
+                    current.output_json = json.dumps({"analysis": result, "asset_ids": serialized.get("asset_ids", [])}, ensure_ascii=False, default=str); current.status = "completed"; current.progress = 100
             _sync_canvas(task_id)
             breakdown_success = True
         except Exception as error:
@@ -172,6 +216,7 @@ def execute_task(task_id: str) -> None:
                 current = db.get(GenerationTask, task_id)
                 if current: current.status = "failed"; current.error_code = "breakdown_failed"; current.error_message = breakdown_error
             _sync_canvas(task_id)
+        _cleanup_task_scratch(task_id)
         _finish_orchestrators(task_id, breakdown_success, breakdown_error)
         return
     manager, request_type = _desktop_api()
@@ -183,13 +228,14 @@ def execute_task(task_id: str) -> None:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
                 if not current or current.status == "cancelled":
-                    handle.cancel(); return
+                    handle.cancel(); _cleanup_task_scratch(task_id); return
                 current.progress = max(1, min(99, int(handle.progress * 100)))
             time.sleep(0.5)
+        serialized = serialize_result(task, handle.result) if handle.is_success and handle.result else None
         with SessionLocal.begin() as db:
             current = db.get(GenerationTask, task_id)
             if handle.is_success and handle.result:
-                current.output_json = json.dumps(serialize_result(current, handle.result), ensure_ascii=False); current.status = "completed"; current.progress = 100; current.charged_credits = int(round(handle.result.cost_credits or 0))
+                current.output_json = json.dumps(serialized, ensure_ascii=False); current.status = "completed"; current.progress = 100; current.charged_credits = int(round(handle.result.cost_credits or 0))
                 succeeded = True
             else:
                 current.status = "failed"; current.error_code = "provider_failed"; current.error_message = (handle.result.error if handle.result else "任务未返回结果")[:4000]
@@ -200,6 +246,7 @@ def execute_task(task_id: str) -> None:
             current = db.get(GenerationTask, task_id)
             if current: current.status = "failed"; current.error_code = "worker_error"; current.error_message = final_error
     _sync_canvas(task_id)
+    _cleanup_task_scratch(task_id)
     _finish_orchestrators(task_id, succeeded, final_error)
 
 

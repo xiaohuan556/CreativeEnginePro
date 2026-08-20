@@ -153,6 +153,38 @@ def test_generated_media_cannot_bypass_storage_limits() -> None:
         assert db.query(Asset).filter(Asset.owner_id == user_id).count() == 0
 
 
+def test_video_breakdown_keyframes_become_assets_and_scratch_is_removed() -> None:
+    seed_admin()
+    from creative_server.storage import resolve_object
+    from creative_server.worker import execute_task
+    with SessionLocal() as db:
+        admin = db.query(User).filter(User.username == "admin").first()
+        project = Project(owner_id=admin.id, title="拉片关键帧资产化", canvas_json='{"protocol":"creative-engine-canvas","version":1,"nodes":[],"edges":[]}')
+        db.add(project); db.flush()
+        source = Asset(project_id=project.id, owner_id=admin.id, node_id="video-1", name="source.mp4", kind="video", object_key=f"{project.id[:12]}/source.mp4", content_type="video/mp4", size=16, sha256="f" * 64)
+        db.add(source); db.flush()
+        source_path = resolve_object(source.object_key); source_path.parent.mkdir(parents=True, exist_ok=True); source_path.write_bytes(b"\0\0\0\x18ftypisomtest")
+        task = GenerationTask(project_id=project.id, node_id="analysis-1", owner_id=admin.id, kind="video_breakdown", provider="local", model="local", idempotency_key="breakdown-keyframe-assets", status="running", input_json=__import__("json").dumps({"inputs": {"references": [{"asset_id": source.id, "role": "reference"}]}}))
+        db.add(task); db.commit(); task_id, source_id = task.id, source.id
+
+    def fake_breakdown(path, output_dir):
+        keyframe = Path(output_dir) / "shot_001.jpg"; keyframe.parent.mkdir(parents=True, exist_ok=True); keyframe.write_bytes(b"\xff\xd8\xfftest")
+        return {"source": path, "duration": 2.0, "shot_count": 1, "shots": [{"number": 1, "keyframe": str(keyframe), "start": 0.0, "end": 2.0}]}
+
+    with patch("ai.video_breakdown.analyze_video", side_effect=fake_breakdown):
+        execute_task(task_id)
+    with SessionLocal() as db:
+        task = db.get(GenerationTask, task_id); output = __import__("json").loads(task.output_json)
+        shot = output["analysis"]["shots"][0]; keyframe_id = shot["keyframe_asset_id"]
+        assert task.status == "completed"
+        assert shot["keyframe_url"] == f"/api/assets/{keyframe_id}"
+        assert "keyframe" not in shot and "source" not in output["analysis"]
+        assert output["analysis"]["source_asset_id"] == source_id
+        assert db.get(Asset, keyframe_id).kind == "image"
+    from config import WORK_DIR
+    assert not (Path(WORK_DIR) / "server_tasks" / task_id).exists()
+
+
 def test_production_pause_resume_and_rewind_do_not_duplicate_active_task() -> None:
     seed_admin()
     with TestClient(app) as client:
