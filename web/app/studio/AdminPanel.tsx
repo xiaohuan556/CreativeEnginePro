@@ -106,17 +106,21 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
 
   return <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="公司账号管理">
     <section className="admin-panel">
-      <header><div><ShieldCheck size={19} /><span><strong>公司账号与使用权限</strong><small>只有管理员可以创建、批准、停用或重置账号</small></span></div><button onClick={onClose} aria-label="关闭"><X size={18} /></button></header>
+      <header><div><ShieldCheck size={19} /><span><strong>团队与权限</strong><small>管理成员登录、额度和可用模型</small></span></div><button onClick={onClose} aria-label="关闭"><X size={18} /></button></header>
       <div className="admin-body">
-        <section className="admin-observability">
-          <div className="admin-section-title"><Activity size={15} /><span>最近 24 小时使用与安全记录</span></div>
+        <details className="admin-observability admin-fold">
+          <summary><span><Activity size={16} /><span><strong>系统状态与使用记录</strong><small>任务、额度、服务状态和审计记录</small></span></span><em>{readiness?.ready ? "运行正常" : "需要检查"}</em></summary>
+          <div className="admin-fold-body">
           <div className="usage-cards"><article><strong>{totalTasks}</strong><span>任务总数</span></article><article><strong>{totalCredits}</strong><span>预估额度</span></article><article><strong>{statuses.failed || 0}</strong><span>失败任务</span></article><article><strong>{loginFailures}</strong><span>近期登录失败</span></article></div>
           <div className={`system-readiness ${readiness?.ready ? "is-ready" : "is-warning"}`}><strong>{readiness?.ready ? "完整制片能力已就绪" : readiness?.control_ready ? "控制层正常，生成能力未配齐" : "生产服务待检查"}</strong><span>数据库 {readiness?.database ? "正常" : "异常"} · 媒体存储 {readiness?.storage ? "正常" : "异常"} · Worker {readiness?.active_workers ?? 0} 个在线 · 已配置引擎 {readiness?.providers?.join("、") || "无外部引擎"}</span>{Boolean(readiness?.missing_capabilities?.length) && <small>尚缺：{readiness!.missing_capabilities!.map((item) => capabilityNames[item] || item).join("、")}</small>}{readiness?.storage_error && <small>{readiness.storage_error}</small>}</div>
           <div className="usage-detail"><div>{usage.length ? usage.slice(0, 8).map((item) => <span key={item.id}><strong>{item.display_name || item.username}</strong>{item.tasks} 次 · {item.credits} credits</span>) : <span>最近 24 小时暂无模型任务</span>}</div><div>{events.length ? events.slice(0, 8).map((item) => <span key={item.id}><strong>{item.action}</strong>{new Date(item.created_at).toLocaleString("zh-CN")} · {item.ip_address || "内部"}</span>) : <span>暂无审计记录</span>}</div></div>
-        </section>
+          </div>
+        </details>
 
         <form className="admin-create" onSubmit={create}>
-          <div className="admin-section-title"><UserPlus size={15} /><span>创建或预批准账号</span></div>
+          <details className="admin-fold">
+          <summary><span><UserPlus size={16} /><span><strong>添加成员账号</strong><small>设置初始密码、角色、额度和模型权限</small></span></span><em>展开填写</em></summary>
+          <div className="admin-fold-body">
           <div className="admin-grid">
             <label><span>登录账号</span><input name="username" required placeholder="例如 editor.01" /></label><label><span>显示名称</span><input name="display_name" required /></label>
             <label className="wide"><span>初始密码</span><input name="password" type="password" minLength={12} required autoComplete="new-password" placeholder="12 位以上，至少三类字符" /></label>
@@ -126,16 +130,18 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
             <label className="wide"><span>允许引擎或 provider:model（逗号分隔；留空则禁止外部模型）</span><input name="allowed_models" placeholder="seedream, seedance, deepseek" /></label>
           </div>
           <div className="admin-checks"><label><input name="approved" type="checkbox" /> 我已确认账号和密码，创建后允许登录</label><label><input name="allow_paid_models" type="checkbox" /> 允许付费模型</label><button disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}确认创建</button></div>
+          </div>
+          </details>
         </form>
 
-        <div className="admin-section-title"><Users size={15} /><span>已有账号 · {users.length}</span></div>
+        <div className="admin-section-title admin-accounts-title"><Users size={16} /><span><strong>成员账号</strong><small>{users.length} 人 · 修改后点击各行“保存”</small></span></div>
         {message && <p className="admin-message">{message}</p>}
         {busy && users.length === 0 ? <div className="admin-loading"><LoaderCircle className="spin" size={20} />读取账号…</div> : <div className="user-list">{users.map((user) =>
           <form key={user.id} className="user-row" onSubmit={(event) => { event.preventDefault(); void save(user, event.currentTarget); }}>
             <div className="user-identity"><span>{(user.display_name || user.username).slice(0, 1)}</span><div><strong>{user.username}</strong><small>{user.active_sessions || 0} 个在线会话{user.last_login_at ? ` · ${new Date(user.last_login_at).toLocaleDateString("zh-CN")}` : " · 尚未登录"} · 素材 {Math.round(Number(user.asset_usage?.total_bytes || 0) / 1024 / 1024)} MB</small><input name="display_name" defaultValue={user.display_name} aria-label="显示名称" /></div></div>
             <select name="role" defaultValue={user.role} aria-label="角色">{roles.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
             <select name="status" defaultValue={user.status} aria-label="状态"><option value="active">允许登录</option><option value="pending">等待批准</option><option value="suspended">已停用</option></select>
-            <div className="quota-fields"><input name="daily_tasks" type="number" min="0" defaultValue={user.limits?.daily_tasks ?? 0} title="每日任务" /><input name="daily_credits" type="number" min="0" defaultValue={user.limits?.daily_credits ?? 0} title="每日费用额度" /><input name="concurrent_tasks" type="number" min="0" defaultValue={user.limits?.concurrent_tasks ?? 0} title="并发任务" /><input name="daily_asset_mb" type="number" min="0" defaultValue={user.limits?.daily_asset_mb ?? 0} title="每日新增素材 MB" /><input name="storage_mb" type="number" min="0" defaultValue={user.limits?.storage_mb ?? 0} title="个人素材总容量 MB" /></div>
+            <div className="quota-fields"><label><span>日任务</span><input name="daily_tasks" type="number" min="0" defaultValue={user.limits?.daily_tasks ?? 0} /></label><label><span>日额度</span><input name="daily_credits" type="number" min="0" defaultValue={user.limits?.daily_credits ?? 0} /></label><label><span>并发</span><input name="concurrent_tasks" type="number" min="0" defaultValue={user.limits?.concurrent_tasks ?? 0} /></label><label><span>日素材 MB</span><input name="daily_asset_mb" type="number" min="0" defaultValue={user.limits?.daily_asset_mb ?? 0} /></label><label><span>总容量 MB</span><input name="storage_mb" type="number" min="0" defaultValue={user.limits?.storage_mb ?? 0} /></label></div>
             <input className="models-field" name="allowed_models" defaultValue={(user.limits?.allowed_models || []).join(", ")} placeholder="允许引擎；留空禁用" />
             <label className="paid-check"><input name="allow_paid_models" type="checkbox" defaultChecked={user.limits?.allow_paid_models} />付费</label>
             <div className="password-reset"><KeyRound size={13} /><input name="password" type="password" minLength={12} placeholder="新密码（可空）" autoComplete="new-password" /></div><div className="user-row-actions"><button type="button" disabled={busy || !user.active_sessions} onClick={() => void forceLogout(user)}>下线</button><button className="user-save" disabled={busy}>保存</button></div>

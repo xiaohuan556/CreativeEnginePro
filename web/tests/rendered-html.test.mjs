@@ -12,12 +12,12 @@ async function render() {
   );
 }
 
-test("server renders the Creative Engine production canvas shell", async () => {
+test("server renders the AI 无限画布 production canvas shell", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
   const html = await response.text();
-  assert.match(html, /Creative Engine/);
+  assert.match(html, /AI 无限画布/);
   assert.match(html, /AI 制片画布/);
   assert.match(html, /雨夜最后一封信/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|SkeletonPreview/);
