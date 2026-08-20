@@ -24,6 +24,12 @@ docker compose --env-file deploy/.env.production -f deploy/compose.yml exec api 
 
 DNS 的 A/AAAA 记录必须先指向服务器，80/443 端口放行后 Caddy 会自动申请和续期证书。PostgreSQL 和媒体卷不会暴露到公网；浏览器只通过同域 `/control` 访问 API。
 
+正式启动前先运行部署预检；它会拒绝示例域名、短数据库密码、无效 Compose 配置或缺失的 Docker：
+
+```bash
+python3 deploy/manage.py --env-file deploy/.env.production preflight
+```
+
 更新版本时先备份，再拉取代码并重复 `up -d --build`。API 与 Worker 同时启动时会使用 PostgreSQL 事务锁串行执行兼容迁移，避免重复 DDL。
 
 ## 生产进程
@@ -86,3 +92,20 @@ python server/scripts/full_model_pipeline_smoke.py
 - 媒体目录每日增量备份；数据库和媒体必须使用同一时间点恢复策略。
 - 告警至少覆盖：登录爆破、连续生成失败、队列积压、磁盘 80%、日费用异常和供应商 429/5xx。
 - 管理员页面“生产服务状态”应持续显示数据库、媒体存储正常且至少一个 Worker 在线；45 秒内没有心跳即视为异常。
+
+仓库自带的一致性备份会短暂停止 API 和 Worker 写入，同时导出 PostgreSQL 与媒体卷，生成带 SHA-256 清单的备份目录：
+
+```bash
+python3 deploy/manage.py --env-file deploy/.env.production backup
+python3 deploy/manage.py verify deploy/backups/creative-engine-20260820T000000Z
+```
+
+恢复会先校验清单和媒体归档、防止路径越界，再自动备份当前线上状态。它属于覆盖性操作，必须精确填写目标备份目录名才能执行：
+
+```bash
+python3 deploy/manage.py --env-file deploy/.env.production restore \
+  deploy/backups/creative-engine-20260820T000000Z \
+  --confirm creative-engine-20260820T000000Z
+```
+
+脚本恢复后会重新启动 API/Worker 并等待 `/ready` 通过。备份目录应再同步到独立存储，不要只留在同一块服务器磁盘上。
