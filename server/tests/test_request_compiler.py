@@ -17,6 +17,24 @@ def test_image_and_director_video_params_match_desktop_contract() -> None:
     assert video_params["duration"] == 9
 
 
+def test_image_style_prompt_is_appended_once() -> None:
+    style_prompt = "以输入图片为唯一结构基准。\n只改变：整张画面的材质。"
+    inputs, _ = compile_request(
+        "image_edit",
+        {"prompt": "把画面变成玻璃雕塑"},
+        {"ratio": "1:1", "style_prompt": style_prompt},
+    )
+    assert inputs["prompt"].endswith(style_prompt)
+    assert inputs["prompt"].count("以输入图片为唯一结构基准") == 1
+
+    repeated, _ = compile_request(
+        "image_edit",
+        {"prompt": inputs["prompt"]},
+        {"style_prompt": style_prompt},
+    )
+    assert repeated["prompt"].count("以输入图片为唯一结构基准") == 1
+
+
 def test_video_request_carries_native_audio_contract() -> None:
     inputs, params = compile_request(
         "text_to_video",

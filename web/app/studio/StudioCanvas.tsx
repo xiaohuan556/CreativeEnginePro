@@ -14,10 +14,12 @@ import {
   MoreHorizontal, Plus, Redo2, ScanSearch, Settings2, Sparkles, Upload, Users,
   WandSparkles, X, Zap, Camera, Shapes, Workflow, ListTodo, PackageCheck, Trash2,
   Download, Maximize2, Link2, Link2Off, Map as MapIcon, Copy, ClipboardCopy, PackagePlus,
+  Palette, Search, Shuffle, RotateCcw,
 } from "lucide-react";
 import "@xyflow/react/dist/style.css";
 import { desktopProjectToWeb, toWebCanvas } from "../../lib/canvas-protocol";
 import { buildSkillPrompts, canConnect, CREATION_GROUPS, NODE_SPEC_BY_KEY, StudioNodeKind } from "../../lib/node-registry";
+import { compileStylePrompt, createStyleRecipe, STYLE_CATEGORIES, STYLE_PRESETS, styleSummary } from "../../lib/style-presets";
 import { PulseEdge } from "./PulseEdge";
 import { useControlPlane } from "./ControlPlane";
 import { AdminPanel } from "./AdminPanel";
@@ -310,6 +312,8 @@ function CanvasApp() {
   const [projectRole, setProjectRole] = useState("");
   const [projectConflict, setProjectConflict] = useState(false);
   const [fileDragActive, setFileDragActive] = useState(false);
+  const [styleSearch, setStyleSearch] = useState("");
+  const [styleCategory, setStyleCategory] = useState<(typeof STYLE_CATEGORIES)[number]>("全部");
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
   const [projectTitle, setProjectTitle] = useState(controlled ? "未命名项目" : "雨夜最后一封信");
   const [projectId, setProjectId] = useState("");
@@ -329,6 +333,7 @@ function CanvasApp() {
   const selectedNode = useMemo(() => nodes.find((node) => node.id === selectedId), [nodes, selectedId]);
   const selectedNodeIds = useMemo(() => nodes.filter((node) => node.selected).map((node) => node.id), [nodes]);
   const incomingNodes = useMemo(() => edges.filter((edge) => edge.target === selectedId).map((edge) => nodes.find((node) => node.id === edge.source)).filter((node): node is StudioNode => Boolean(node)), [edges, nodes, selectedId]);
+  const visibleStylePresets = useMemo(() => STYLE_PRESETS.filter((item) => (styleCategory === "全部" || item.category === styleCategory) && (!styleSearch.trim() || `${item.label}${item.summary}${item.category}`.toLowerCase().includes(styleSearch.trim().toLowerCase()))), [styleCategory, styleSearch]);
   const beginnerMode = String(selectedNode?.data.desktopPayload?.beginner_mode || "");
   const currentBeginnerSteps = beginnerMode ? beginnerSteps(beginnerMode, incomingNodes.length) : [];
   const hasScriptResult = Boolean(selectedNode?.data.desktopPayload?.script_candidate || selectedNode?.data.desktopPayload?.script_review);
@@ -620,6 +625,12 @@ function CanvasApp() {
     setNotice("有未保存更改");
   };
 
+  const updatePayloadFields = (patch: Record<string, unknown>) => {
+    if (!canWrite) { setNotice("当前项目是只读状态"); return; }
+    setNodes((current) => current.map((node) => node.id === selectedId ? { ...node, data: { ...node.data, desktopPayload: { ...(node.data.desktopPayload || {}), ...patch } } } : node));
+    setNotice("有未保存更改");
+  };
+
   const updateReferenceRow = (key: "reference_settings" | "timeline_images", sourceNodeId: string, patch: Record<string, unknown>) => {
     if (!selectedNode) return;
     const current = Array.isArray(selectedNode.data.desktopPayload?.[key]) ? [...selectedNode.data.desktopPayload[key] as Array<Record<string, unknown>>] : [];
@@ -666,7 +677,8 @@ function CanvasApp() {
         const ownIds = [payload.asset_id, ...(Array.isArray(payload.output_asset_ids) ? payload.output_asset_ids : [])].filter(Boolean);
         taskReferences.unshift(...ownIds.map((assetId) => ({ node_id: node.id, title: node.data.title, asset_id: assetId, role: "video_source" })));
       }
-      return { node_id: node.id, kind: mapping.kind, provider: mapping.provider, model: mapping.model, input: { inputs: { prompt: node.data.specKey === "shot" ? compileShotPrompt(node) : node.data.description, references: taskReferences }, params: payload, action: selectedAction || "生成", use_cache: false } };
+      const stylePrompt = node.data.specKey === "multi_image" ? compileStylePrompt(payload, Boolean(references.length)) : "";
+      return { node_id: node.id, kind: mapping.kind, provider: mapping.provider, model: mapping.model, input: { inputs: { prompt: node.data.specKey === "shot" ? compileShotPrompt(node) : node.data.description, references: taskReferences }, params: stylePrompt ? { ...payload, style_prompt: stylePrompt } : payload, action: selectedAction || "生成", use_cache: false } };
     }).filter((item): item is NonNullable<typeof item> => Boolean(item));
   };
 
@@ -1059,7 +1071,8 @@ function CanvasApp() {
       });
       if (specKey === "video" && payload.last_frame_asset_id) references = [...references.filter((item) => String(item.asset_id || "") !== String(payload.last_frame_asset_id)), ...references.filter((item) => String(item.asset_id || "") === String(payload.last_frame_asset_id))];
       if (["continue_video", "extract_video_frames"].includes(task.operation)) references.unshift(...ownAssets);
-      const taskParams = specKey === "multi_director" ? { ...payload, timeline_images: effectiveDirectorTimeline } : payload;
+      const stylePrompt = specKey === "multi_image" ? compileStylePrompt(payload, Boolean(usableIncoming.length)) : "";
+      const taskParams = specKey === "multi_director" ? { ...payload, timeline_images: effectiveDirectorTimeline } : stylePrompt ? { ...payload, style_prompt: stylePrompt } : payload;
       const prompt = specKey === "shot" ? compileShotPrompt(selectedNode) : selectedNode.data.description;
       const response = await apiFetch("/api/tasks", { method: "POST", headers: { "content-type": "application/json", "idempotency-key": crypto.randomUUID() }, body: JSON.stringify({ project_id: projectId, node_id: selectedNode.id, kind: task.operation, provider: task.provider, model: task.model, estimated_credits: quoteData.quote!.credits, input: { inputs: { prompt, references }, params: taskParams, action, use_cache: false } }) });
       const data = await response.json() as { task?: { id: string }; detail?: string };
@@ -1235,6 +1248,18 @@ function CanvasApp() {
               <details className="quick-reference-menu"><summary><Plus size={14} />参考{incomingNodes.length ? ` · ${incomingNodes.length}` : ""}</summary><div className="quick-popover reference-popover">{incomingNodes.length ? <div className="reference-purpose-editor"><div><strong>参考图用途</strong><span>{incomingNodes.length} 张</span></div>{incomingNodes.map((node) => { const settings = ((selectedNode.data.desktopPayload?.reference_settings as Array<Record<string, unknown>> | undefined) || []).find((item) => item.source_node_id === node.id) || {}; return <div className="purpose-row" key={node.id}><span>{node.data.title}</span><select aria-label={`${node.data.title}用途`} value={String(settings.purpose || "subject")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { purpose: event.target.value })}><option value="subject">主体</option><option value="scene">场景</option><option value="composition">构图</option><option value="element">元素</option><option value="style">风格</option></select><input aria-label={`${node.data.title}补充要求`} placeholder="补充要求（可选）" value={String(settings.instruction || "")} onChange={(event) => updateReferenceRow("reference_settings", node.id, { instruction: event.target.value })} /></div>; })}</div> : <button className="quick-import" onClick={() => importInputRef.current?.click()}><Upload size={15} />导入图片或把图片节点连进来</button>}</div></details>
               <div className="multi-image-command-bar">
                 <select aria-label="生成引擎" value={String(selectedNode.data.desktopPayload?.provider_name || "")} onChange={(event) => { const name = event.target.value; updatePayload("provider_name", name); updatePayload("model", String(providers.find((item) => item.name === name)?.profile?.model || "")); }}><option value="">选择图片模型</option>{providers.filter((provider) => provider.capabilities.includes(incomingNodes.length ? "image_edit" : "text_to_image")).map((provider) => <option key={provider.name} value={provider.name}>{provider.name}</option>)}</select>
+                <details className="quick-style-menu"><summary title="打开风格探索器"><Palette size={14} /><span>{styleSummary(selectedNode.data.desktopPayload || {})}</span></summary><div className="quick-popover style-explorer-popover">
+                  <header className="style-explorer-header"><div><strong>风格探索器</strong><small>{incomingNodes.length ? "只换风格，锁住原图结构" : "给新画面注入材质与工艺"}</small></div><button className="style-reset" onClick={() => updatePayloadFields({ style_preset: "", style_recipe: null, style_custom: "" })}><RotateCcw size={13} />清空</button></header>
+                  <div className="style-search"><Search size={14} /><input aria-label="搜索风格" placeholder="搜索玻璃、毛线、版画……" value={styleSearch} onChange={(event) => setStyleSearch(event.target.value)} /></div>
+                  <div className="style-category-row">{STYLE_CATEGORIES.map((category) => <button key={category} className={styleCategory === category ? "is-selected" : ""} onClick={() => setStyleCategory(category)}>{category}</button>)}</div>
+                  <div className="style-preset-grid">{visibleStylePresets.map((item) => <button key={item.id} className={selectedNode.data.desktopPayload?.style_preset === item.id ? "is-selected" : ""} onClick={() => updatePayloadFields({ style_preset: item.id, style_recipe: null, style_strength: item.strength })}><i style={{ background: item.swatch }} /><span><strong>{item.label}</strong><small>{item.summary}</small></span></button>)}</div>
+                  {!visibleStylePresets.length && <div className="style-empty">没有匹配项，可以在下方直接描述你脑洞里的风格。</div>}
+                  <section className="style-lab"><div className="style-lab-heading"><div><strong>脑洞漫游</strong><small>跨材质、工艺、色彩与光线随机组合，不受固定预设限制</small></div><button onClick={() => updatePayloadFields({ style_preset: "", style_recipe: createStyleRecipe() })}><Shuffle size={14} />换个脑洞</button></div>{(() => { const recipe = selectedNode.data.desktopPayload?.style_recipe as Record<string, { label?: string }> | undefined; return recipe && <div className="style-recipe-chips">{Object.entries(recipe).map(([key, value]) => <span key={key}>{value.label}</span>)}</div>; })()}</section>
+                  <label className="style-custom"><span>自定义补充</span><input placeholder="例如：像雨水凝成的透明刺绣，边缘有蓝色生物荧光" value={String(selectedNode.data.desktopPayload?.style_custom || "")} onChange={(event) => updatePayload("style_custom", event.target.value)} /></label>
+                  <div className="style-control-grid"><div><span>改哪里</span><div className="style-segmented">{[["subject","只改主体"],["whole","整张画面"],["background","只改背景"]].map(([value,label]) => <button key={value} className={String(selectedNode.data.desktopPayload?.style_scope || "whole") === value ? "is-selected" : ""} onClick={() => updatePayload("style_scope", value)}>{label}</button>)}</div></div><label className="style-strength"><span>风格强度 <b>{Number(selectedNode.data.desktopPayload?.style_strength || 70)}%</b></span><input type="range" min="20" max="100" step="5" value={Number(selectedNode.data.desktopPayload?.style_strength || 70)} onChange={(event) => updatePayload("style_strength", Number(event.target.value))} /><small>只控制风格表达，不会静默改模型参数</small></label></div>
+                  <div className="style-preserve"><span>锁住原图</span>{[["identity","主体身份"],["pose","动作姿势"],["composition","构图机位"],["background","背景结构"],["lighting","光线方向"]].map(([value,label]) => { const values = Array.isArray(selectedNode.data.desktopPayload?.style_preserve) ? selectedNode.data.desktopPayload.style_preserve.map(String) : ["identity","pose","composition","background","lighting"]; const active = values.includes(value); return <button key={value} className={active ? "is-selected" : ""} onClick={() => updatePayload("style_preserve", active ? values.filter((item) => item !== value) : [...values, value])}>{label}</button>; })}</div>
+                  {(selectedNode.data.desktopPayload?.style_preset || selectedNode.data.desktopPayload?.style_recipe || selectedNode.data.desktopPayload?.style_custom) && <details className="style-prompt-preview"><summary>查看将发送的专业风格提示词</summary><pre>{compileStylePrompt(selectedNode.data.desktopPayload || {}, Boolean(incomingNodes.length))}</pre></details>}
+                </div></details>
                 <details className="quick-settings-menu"><summary><Settings2 size={14} />{String(selectedNode.data.desktopPayload?.ratio || "16:9")} · {Number(selectedNode.data.desktopPayload?.candidate_count || 1)}张</summary><div className="quick-popover image-settings-popover"><strong>画面比例</strong><div className="ratio-grid">{["1:1","4:3","3:2","16:9","9:16"].map((ratio) => <button key={ratio} className={selectedNode.data.desktopPayload?.ratio === ratio ? "is-selected" : ""} onClick={() => updatePayload("ratio", ratio)}>{ratio}</button>)}</div><strong>生成数量</strong><div className="count-grid">{[1,2,4].map((count) => <button key={count} className={Number(selectedNode.data.desktopPayload?.candidate_count || 1) === count ? "is-selected" : ""} onClick={() => updatePayload("candidate_count", count)}>{count}张</button>)}</div></div></details>
                 {Boolean(selectedNode.data.desktopPayload?.asset_id || (Array.isArray(selectedNode.data.desktopPayload?.output_asset_ids) && selectedNode.data.desktopPayload.output_asset_ids.length)) && <button className="quick-save" onClick={() => void handleNodeAction("保存到资产库")} aria-label="保存到资产库" title="保存副本到资产库"><PackagePlus size={16} /></button>}
                 <button className="quick-generate" onClick={() => void submitSelected()} aria-label="生成图片"><WandSparkles size={16} /><span>生成图片</span></button>

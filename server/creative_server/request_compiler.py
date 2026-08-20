@@ -57,7 +57,11 @@ def compile_request(operation: str, hydrated_inputs: dict[str, Any], raw_params:
         params = {"model": model or str(source.get("model") or ""), "temperature": float(source.get("planning_temperature") or 0.5), "timeout_seconds": 300}
         return inputs, {key: value for key, value in params.items() if value not in (None, "")}
     if operation in {"text_to_image", "image_edit"}:
-        inputs["prompt"] = prompt or IMAGE_ACTION_DEFAULTS.get(action, "")
+        prompt = prompt or IMAGE_ACTION_DEFAULTS.get(action, "")
+        style_prompt = str(source.get("style_prompt") or "").strip()
+        if style_prompt and style_prompt not in prompt:
+            prompt = f"{prompt}\n\n{style_prompt}".strip()
+        inputs["prompt"] = prompt
         ratio = str(source.get("ratio") or source.get("production_ratio") or "1:1")
         return inputs, {"size": IMAGE_SIZES.get(ratio, "2048x2048"), "n": max(1, min(4, int(source.get("candidate_count") or 1))), "quality": "high", "watermark": False, **({"model": model} if model else {})}
     if operation in {"text_to_video", "image_to_video"}:
