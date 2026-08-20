@@ -86,6 +86,27 @@ def main() -> int:
         project = expect(admin.post(f"{api}/api/projects", headers=admin_headers(), json={"title": f"生产验收 {stamp}", "canvas": canvas}, timeout=20), 201, "create smoke project")["project"]
         project_id = str(project["id"]); checks.append("project_persistence")
 
+        # Persist a representative desktop-compatible graph, not merely an
+        # empty project shell.  The edge relation and director timeline are
+        # contracts consumed by both desktop and web request compilation.
+        roundtrip_canvas = {
+            "protocol": "creative-engine-canvas", "version": 1,
+            "nodes": [*canvas["nodes"],
+                {"id": "smoke-image-1", "type": "studio", "position": {"x": 80, "y": 80}, "data": {"title": "首帧", "description": "一致性首帧", "kind": "image", "specKey": "image_asset", "desktopType": "image_node", "status": "待上传", "meta": "smoke", "accent": "#50b9dd", "desktopPayload": {}}},
+                {"id": "smoke-director-1", "type": "studio", "position": {"x": 420, "y": 80}, "data": {"title": "多图导演", "description": "0-3 秒缓慢推近", "kind": "director", "specKey": "multi_director", "desktopType": "video_node", "status": "待生成", "meta": "smoke", "accent": "#6f8cff", "desktopPayload": {"multi_image_director": True, "duration": 6, "timeline_images": [{"source_node_id": "smoke-image-1", "purpose": "first_frame", "start": 0, "end": 3, "action": "抬头", "camera": "缓慢推近"}]}}},
+            ],
+            "edges": [{"id": "smoke-edge-1", "source": "smoke-image-1", "target": "smoke-director-1", "type": "pulse", "data": {"relation": "first_frame"}}],
+        }
+        synced = expect(admin.patch(f"{api}/api/projects/{project_id}", headers=admin_headers(), json={"title": project["title"], "canvas": roundtrip_canvas, "expectedVersion": int(project["version"])}, timeout=20), 200, "persist graph roundtrip")["project"]
+        reloaded = expect(admin.get(f"{api}/api/projects/{project_id}", timeout=20), 200, "reload graph roundtrip")["project"]
+        if reloaded.get("canvas") != roundtrip_canvas:
+            fail("nodes, edges, relation or director timeline changed after persistence")
+        stale = admin.patch(f"{api}/api/projects/{project_id}", headers=admin_headers(), json={"title": "stale-write-must-fail", "canvas": roundtrip_canvas, "expectedVersion": int(project["version"])}, timeout=20)
+        if stale.status_code != 409:
+            fail("stale canvas write was not rejected with a version conflict")
+        project = synced
+        checks.extend(["node_edge_roundtrip", "optimistic_write_conflict"])
+
         account = expect(admin.post(f"{api}/api/admin/users", headers=admin_headers(), json={
             "username": reviewer_username, "display_name": "冒烟审片账号", "password": reviewer_password,
             "role": "reviewer", "approved": False, "daily_tasks": 0, "daily_credits": 0,

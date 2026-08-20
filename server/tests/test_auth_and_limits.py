@@ -231,6 +231,31 @@ def test_production_pause_resume_and_rewind_do_not_duplicate_active_task() -> No
         assert rewound.json()["run"]["status"] == "ready"
 
 
+def test_canvas_roundtrip_preserves_nodes_edges_and_absent_optional_fields() -> None:
+    seed_admin()
+    with TestClient(app) as client:
+        csrf = login(client, "admin", "Correct-Horse-42!")
+        canvas = {
+            "protocol": "creative-engine-canvas", "version": 1,
+            "nodes": [{"id": "image-1", "type": "studio", "position": {"x": 1, "y": 2}, "data": {"specKey": "image_asset", "desktopPayload": {}}}],
+            "edges": [{"id": "edge-1", "source": "image-1", "target": "director-1", "type": "pulse", "data": {"relation": "first_frame"}}],
+        }
+        created = client.post("/api/projects", headers={"x-csrf-token": csrf}, json={"title": "严格往返", "canvas": canvas})
+        assert created.status_code == 201, created.text
+        project = created.json()["project"]
+        assert project["canvas"] == canvas
+        assert "storyboard" not in project["canvas"] and "desktopSource" not in project["canvas"]
+
+        updated_canvas = {
+            **canvas,
+            "nodes": [*canvas["nodes"], {"id": "director-1", "type": "studio", "position": {"x": 3, "y": 4}, "data": {"specKey": "multi_director", "desktopPayload": {"duration": 6, "timeline_images": [{"source_node_id": "image-1", "start": 0, "end": 3, "purpose": "first_frame"}]}}}],
+        }
+        updated = client.patch(f"/api/projects/{project['id']}", headers={"x-csrf-token": csrf}, json={"title": project["title"], "canvas": updated_canvas, "expectedVersion": project["version"]})
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["project"]["canvas"] == updated_canvas
+        assert client.get(f"/api/projects/{project['id']}").json()["project"]["canvas"] == updated_canvas
+
+
 def test_worker_completes_a_persisted_task_and_writes_result() -> None:
     seed_admin()
     with SessionLocal() as db:

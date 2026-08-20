@@ -220,7 +220,7 @@ def list_projects(user: User = Depends(current_user), db: Session = Depends(get_
 def create_project(payload: ProjectCreate, request: Request, user: User = Depends(require_csrf), db: Session = Depends(get_db)) -> dict:
     if user.role not in ("admin", "producer", "director", "editor"):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "当前角色不能创建项目，请由制片人创建后再加入成员")
-    project = Project(owner_id=user.id, title=payload.title.strip(), canvas_json=payload.canvas.model_dump_json(by_alias=True))
+    project = Project(owner_id=user.id, title=payload.title.strip(), canvas_json=payload.canvas.model_dump_json(by_alias=True, exclude_none=True))
     db.add(project); db.flush(); db.add(ProjectMember(project_id=project.id, user_id=user.id, role="owner"))
     record_audit(db, request, "project.created", user, "project", project.id); db.commit()
     return {"project": public_project(project)}
@@ -237,7 +237,7 @@ def update_project(project_id: str, payload: ProjectUpdate, request: Request, us
     if project.version != payload.expected_version:
         return Response(content=json.dumps({"error": "version_conflict", "currentVersion": project.version}), media_type="application/json", status_code=409)
     db.add(ProjectRevision(project_id=project.id, actor_id=user.id, version=project.version, canvas_json=project.canvas_json))
-    project.canvas_json = payload.canvas.model_dump_json(by_alias=True)
+    project.canvas_json = payload.canvas.model_dump_json(by_alias=True, exclude_none=True)
     if payload.title is not None: project.title = payload.title.strip()
     project.version += 1; project.updated_at = utcnow()
     record_audit(db, request, "project.updated", user, "project", project.id, {"version": project.version}); db.commit()
