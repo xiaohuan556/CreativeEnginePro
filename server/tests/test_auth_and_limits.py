@@ -1,5 +1,6 @@
 import os
 import tempfile
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -177,6 +178,8 @@ def test_video_breakdown_keyframes_become_assets_and_scratch_is_removed() -> Non
         task = db.get(GenerationTask, task_id); output = __import__("json").loads(task.output_json)
         shot = output["analysis"]["shots"][0]; keyframe_id = shot["keyframe_asset_id"]
         assert task.status == "completed"
+        assert task.worker_id is None
+        assert task.lease_expires_at is None
         assert shot["keyframe_url"] == f"/api/assets/{keyframe_id}"
         assert "keyframe" not in shot and "source" not in output["analysis"]
         assert output["analysis"]["source_asset_id"] == source_id
@@ -246,6 +249,8 @@ def test_worker_completes_a_persisted_task_and_writes_result() -> None:
     with SessionLocal() as db:
         finished = db.get(GenerationTask, task_id)
         assert finished.status == "completed"
+        assert finished.worker_id is None
+        assert finished.lease_expires_at is None
         assert "完成" in finished.output_json
         project = db.get(Project, finished.project_id)
         canvas = __import__("json").loads(project.canvas_json)
@@ -253,6 +258,29 @@ def test_worker_completes_a_persisted_task_and_writes_result() -> None:
         assert source["data"]["status"] == "生成完成"
         assert source["data"]["desktopPayload"]["server_task_id"] == task_id
         assert project.version == 2
+
+
+def test_expired_worker_lease_is_recovered_without_dual_ownership() -> None:
+    seed_admin()
+    from creative_server.worker import claim_task, execute_task, renew_task_lease
+    with SessionLocal() as db:
+        db.query(GenerationTask).filter(GenerationTask.status.in_(("queued", "running"))).update({"status": "completed", "worker_id": None, "lease_expires_at": None}, synchronize_session=False)
+        admin = db.query(User).filter(User.username == "admin").first()
+        project = Project(owner_id=admin.id, title="租约恢复", canvas_json="{}")
+        db.add(project); db.flush()
+        task = GenerationTask(project_id=project.id, node_id="lease-1", owner_id=admin.id, kind="chat", provider="openai", model="locked", idempotency_key="expired-worker-lease", status="running", progress=37, worker_id="dead-worker", lease_expires_at=datetime.now(timezone.utc) - timedelta(minutes=5))
+        db.add(task); db.commit(); task_id = task.id
+    assert claim_task("replacement-worker") == task_id
+    with SessionLocal() as db:
+        recovered = db.get(GenerationTask, task_id)
+        assert recovered.status == "running" and recovered.worker_id == "replacement-worker"
+        assert recovered.progress == 37 and recovered.error_code == "worker_recovered"
+    assert renew_task_lease(task_id, "dead-worker") is False
+    assert renew_task_lease(task_id, "replacement-worker") is True
+    with patch("creative_server.worker._desktop_api") as desktop_api:
+        execute_task(task_id, "dead-worker")
+        desktop_api.assert_not_called()
+    assert claim_task("third-worker") is None
 
 
 def test_text_results_preserve_script_original_and_update_copywriting() -> None:

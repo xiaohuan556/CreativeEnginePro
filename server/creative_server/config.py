@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     storage_dir: str = "./creative_engine_media"
     max_upload_mb: int = 500
     worker_poll_seconds: float = 1.0
+    task_lease_seconds: int = 120
 
 
 @lru_cache

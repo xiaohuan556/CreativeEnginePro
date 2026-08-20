@@ -123,7 +123,7 @@ def handle_command(db: Session, run: ProductionRun, command: str, actor_id: str,
         if run.status == "ready" and not run.active_task_id: enqueue_current_stage(db, run)
     elif command == "rewind":
         if target_stage is None: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "请选择重做阶段")
-        db.execute(update(GenerationTask).where(GenerationTask.production_run_id == run.id, GenerationTask.production_stage >= target_stage, GenerationTask.status.in_(("queued", "running", "paused"))).values(status="cancelled"))
+        db.execute(update(GenerationTask).where(GenerationTask.production_run_id == run.id, GenerationTask.production_stage >= target_stage, GenerationTask.status.in_(("queued", "running", "paused"))).values(status="cancelled", worker_id=None, lease_expires_at=None))
         apply_state(run, rewind(state_of(run), target_stage)); event(db, run, "run.rewound", actor_id, {"target_stage": target_stage})
         run.resume_status = "ready"
     else: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "不支持的流程操作")

@@ -43,3 +43,10 @@ def create_schema() -> None:
             connection.execute(text("ALTER TABLE usage_limits ADD COLUMN daily_asset_mb INTEGER NOT NULL DEFAULT 2048"))
         if "storage_mb" not in usage_columns:
             connection.execute(text("ALTER TABLE usage_limits ADD COLUMN storage_mb INTEGER NOT NULL DEFAULT 20480"))
+        task_columns = {column["name"] for column in inspect(connection).get_columns("generation_tasks")}
+        if "worker_id" not in task_columns:
+            connection.execute(text("ALTER TABLE generation_tasks ADD COLUMN worker_id VARCHAR(160)"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_generation_tasks_worker_id ON generation_tasks (worker_id)"))
+        if "lease_expires_at" not in task_columns:
+            connection.execute(text("ALTER TABLE generation_tasks ADD COLUMN lease_expires_at TIMESTAMP"))
+            connection.execute(text("CREATE INDEX IF NOT EXISTS ix_generation_tasks_lease_expires_at ON generation_tasks (lease_expires_at)"))

@@ -5,12 +5,13 @@ import os
 import shutil
 import socket
 import sys
+import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import HTTPException
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 
 from .config import get_settings
 from .database import SessionLocal, create_schema
@@ -18,6 +19,34 @@ from .models import Asset, GenerationTask, ProductionRun, ServiceHeartbeat, User
 from .storage import import_generated_file, media_kind, resolve_object
 from .request_compiler import compile_request
 from .task_policy import enforce_asset_policy, enforce_existing_task_policy
+
+
+class TaskLeaseLost(RuntimeError):
+    pass
+
+
+def worker_instance() -> str:
+    return f"{socket.gethostname()}:{os.getpid()}"
+
+
+def _lease_deadline() -> datetime:
+    return datetime.now(timezone.utc) + timedelta(seconds=max(30, get_settings().task_lease_seconds))
+
+
+def renew_task_lease(task_id: str, worker_id: str) -> bool:
+    with SessionLocal.begin() as db:
+        task = db.get(GenerationTask, task_id)
+        if not task or task.status != "running" or task.worker_id != worker_id:
+            return False
+        task.lease_expires_at = _lease_deadline()
+        return True
+
+
+def _lease_heartbeat(task_id: str, worker_id: str, stop: threading.Event) -> None:
+    interval = max(10, min(30, get_settings().task_lease_seconds // 3))
+    while not stop.wait(interval):
+        if not renew_task_lease(task_id, worker_id):
+            return
 
 
 def _task_scratch(task_id: str, category: str = "") -> Path:
@@ -62,7 +91,7 @@ def _finish_orchestrators(task_id: str, success: bool, error: str = "") -> None:
 
 
 def record_heartbeat() -> None:
-    instance = f"{socket.gethostname()}:{os.getpid()}"
+    instance = worker_instance()
     with SessionLocal.begin() as db:
         item = db.get(ServiceHeartbeat, f"worker:{instance}")
         if item:
@@ -81,34 +110,46 @@ def _desktop_api():
     return get_ai_manager(), TaskRequest
 
 
-def claim_task() -> str | None:
+def claim_task(worker_id: str | None = None) -> str | None:
+    worker_id = worker_id or worker_instance()
+    now = datetime.now(timezone.utc)
     with SessionLocal.begin() as db:
-        query = select(GenerationTask).where(GenerationTask.status == "queued").order_by(GenerationTask.created_at).with_for_update(skip_locked=True).limit(1)
+        query = select(GenerationTask).where(or_(
+            GenerationTask.status == "queued",
+            and_(GenerationTask.status == "running", or_(GenerationTask.lease_expires_at.is_(None), GenerationTask.lease_expires_at < now)),
+        )).order_by(GenerationTask.created_at).with_for_update(skip_locked=True).limit(1)
         task = db.scalar(query)
         if not task: return None
+        recovered = task.status == "running"
         user = db.get(User, task.owner_id)
         try:
             if not user or user.status != "active":
                 raise HTTPException(403, "账号已被管理员暂停")
             enforce_existing_task_policy(db, user, task.provider, task.model, task.estimated_credits)
         except HTTPException as policy_error:
-            task.status = "paused"; task.error_code = "policy_revoked"; task.error_message = str(policy_error.detail)
+            task.status = "paused"; task.worker_id = None; task.lease_expires_at = None; task.error_code = "policy_revoked"; task.error_message = str(policy_error.detail)
             workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.active_task_id == task.id))
             if workflow: workflow.status = "paused"; workflow.error_message = task.error_message
             production = db.get(ProductionRun, task.production_run_id) if task.production_run_id else None
             if production: production.status = "paused"; production.error_message = task.error_message
             return None
-        task.status = "running"; task.progress = 1
+        task.status = "running"; task.progress = max(1, task.progress); task.worker_id = worker_id; task.lease_expires_at = _lease_deadline()
+        if recovered:
+            task.error_code = "worker_recovered"; task.error_message = "上一个 Worker 租约已过期，任务已安全接管"
         return task.id
 
 
-def serialize_result(task: GenerationTask, result) -> dict:
+def serialize_result(task: GenerationTask, result, worker_id: str = "") -> dict:
     data = result.data
     candidates = data if isinstance(data, list) else [data]
     files = [Path(value) for value in candidates if isinstance(value, (str, Path)) and Path(value).is_file()]
     asset_ids: list[str] = []
     try:
         with SessionLocal.begin() as db:
+            if worker_id:
+                owned = db.scalar(select(GenerationTask).where(GenerationTask.id == task.id).with_for_update())
+                if not owned or owned.status != "running" or owned.worker_id != worker_id:
+                    raise TaskLeaseLost("任务租约已被其他 Worker 接管")
             if files:
                 user = db.get(User, task.owner_id)
                 if not user: raise HTTPException(404, "素材所属账号不存在")
@@ -125,10 +166,10 @@ def serialize_result(task: GenerationTask, result) -> dict:
     except TypeError: return {"data": str(data)}
 
 
-def execute_task(task_id: str) -> None:
+def _execute_task(task_id: str, worker_id: str) -> None:
     with SessionLocal() as db:
         task = db.get(GenerationTask, task_id)
-        if not task: return
+        if not task or task.status != "running" or task.worker_id != worker_id: return
         provider, operation, raw = task.provider, task.kind, json.loads(task.input_json or "{}")
         hydrated_inputs = dict(raw.get("inputs", raw))
         references = hydrated_inputs.pop("references", [])
@@ -170,10 +211,11 @@ def execute_task(task_id: str) -> None:
             if not frame_paths: raise RuntimeError("视频抽帧失败")
             if operation == "extract_video_frames":
                 fake_result = type("FrameResult", (), {"data": frame_paths, "cost_credits": 0})()
-                serialized = serialize_result(task, fake_result)
+                serialized = serialize_result(task, fake_result, worker_id)
                 with SessionLocal.begin() as db:
                     current = db.get(GenerationTask, task_id)
-                    current.output_json = json.dumps(serialized, ensure_ascii=False); current.status = "completed"; current.progress = 100
+                    if not current or current.status != "running" or current.worker_id != worker_id: raise TaskLeaseLost("任务租约已被其他 Worker 接管")
+                    current.output_json = json.dumps(serialized, ensure_ascii=False); current.status = "completed"; current.progress = 100; current.error_code = None; current.error_message = None
                 _cleanup_task_scratch(task_id)
                 _sync_canvas(task_id)
                 _finish_orchestrators(task_id, True, ""); return
@@ -183,10 +225,12 @@ def execute_task(task_id: str) -> None:
             continuation_contract = "从上一段视频的最后状态自然继续；第一帧必须匹配尾帧，保持角色身份、空间位置、动作方向与速度、道具、场景结构、光线和镜头轴线连续，不得重新开场或重复上一段动作。"
             user_direction = str(hydrated_inputs.get("prompt") or "").strip()
             hydrated_inputs["prompt"] = continuation_contract + (f"\n续写要求：{user_direction}" if user_direction else "")
+        except TaskLeaseLost:
+            _cleanup_task_scratch(task_id); return
         except Exception as error:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
-                if current: current.status = "failed"; current.error_code = "video_frame_failed"; current.error_message = str(error)[:4000]
+                if current and current.status == "running" and current.worker_id == worker_id: current.status = "failed"; current.error_code = "video_frame_failed"; current.error_message = str(error)[:4000]
             _cleanup_task_scratch(task_id)
             _sync_canvas(task_id)
             _finish_orchestrators(task_id, False, str(error)); return
@@ -199,22 +243,25 @@ def execute_task(task_id: str) -> None:
             result = analyze_video(paths[0], output_dir)
             keyframe_shots = [shot for shot in result.get("shots", []) if shot.get("keyframe")]
             keyframe_paths = [shot["keyframe"] for shot in keyframe_shots]
-            serialized = serialize_result(task, type("BreakdownFrames", (), {"data": keyframe_paths})()) if keyframe_paths else {}
+            serialized = serialize_result(task, type("BreakdownFrames", (), {"data": keyframe_paths})(), worker_id) if keyframe_paths else {}
             for shot, asset_id in zip(keyframe_shots, serialized.get("asset_ids", [])):
                 shot["keyframe_asset_id"] = asset_id; shot["keyframe_url"] = f"/api/assets/{asset_id}"; shot.pop("keyframe", None)
             result["source_asset_id"] = str(references[0].get("asset_id") or "") if references and isinstance(references[0], dict) else ""
             result.pop("source", None)
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
-                if current:
-                    current.output_json = json.dumps({"analysis": result, "asset_ids": serialized.get("asset_ids", [])}, ensure_ascii=False, default=str); current.status = "completed"; current.progress = 100
+                if current and current.status == "running" and current.worker_id == worker_id:
+                    current.output_json = json.dumps({"analysis": result, "asset_ids": serialized.get("asset_ids", [])}, ensure_ascii=False, default=str); current.status = "completed"; current.progress = 100; current.error_code = None; current.error_message = None
+                else: raise TaskLeaseLost("任务租约已被其他 Worker 接管")
             _sync_canvas(task_id)
             breakdown_success = True
+        except TaskLeaseLost:
+            _cleanup_task_scratch(task_id); return
         except Exception as error:
             breakdown_error = str(error)[:4000]
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
-                if current: current.status = "failed"; current.error_code = "breakdown_failed"; current.error_message = breakdown_error
+                if current and current.status == "running" and current.worker_id == worker_id: current.status = "failed"; current.error_code = "breakdown_failed"; current.error_message = breakdown_error
             _sync_canvas(task_id)
         _cleanup_task_scratch(task_id)
         _finish_orchestrators(task_id, breakdown_success, breakdown_error)
@@ -227,39 +274,63 @@ def execute_task(task_id: str) -> None:
         while not handle.is_finished:
             with SessionLocal.begin() as db:
                 current = db.get(GenerationTask, task_id)
-                if not current or current.status == "cancelled":
+                if not current or current.status == "cancelled" or current.worker_id != worker_id:
                     handle.cancel(); _cleanup_task_scratch(task_id); return
                 current.progress = max(1, min(99, int(handle.progress * 100)))
             time.sleep(0.5)
-        serialized = serialize_result(task, handle.result) if handle.is_success and handle.result else None
+        serialized = serialize_result(task, handle.result, worker_id) if handle.is_success and handle.result else None
         with SessionLocal.begin() as db:
             current = db.get(GenerationTask, task_id)
+            if not current or current.status != "running" or current.worker_id != worker_id: raise TaskLeaseLost("任务租约已被其他 Worker 接管")
             if handle.is_success and handle.result:
-                current.output_json = json.dumps(serialized, ensure_ascii=False); current.status = "completed"; current.progress = 100; current.charged_credits = int(round(handle.result.cost_credits or 0))
+                current.output_json = json.dumps(serialized, ensure_ascii=False); current.status = "completed"; current.progress = 100; current.charged_credits = int(round(handle.result.cost_credits or 0)); current.error_code = None; current.error_message = None
                 succeeded = True
             else:
                 current.status = "failed"; current.error_code = "provider_failed"; current.error_message = (handle.result.error if handle.result else "任务未返回结果")[:4000]
                 final_error = current.error_message
+    except TaskLeaseLost:
+        _cleanup_task_scratch(task_id); return
     except Exception as error:
         final_error = str(error)[:4000]
         with SessionLocal.begin() as db:
             current = db.get(GenerationTask, task_id)
-            if current: current.status = "failed"; current.error_code = "worker_error"; current.error_message = final_error
+            if current and current.status == "running" and current.worker_id == worker_id: current.status = "failed"; current.error_code = "worker_error"; current.error_message = final_error
     _sync_canvas(task_id)
     _cleanup_task_scratch(task_id)
     _finish_orchestrators(task_id, succeeded, final_error)
 
 
+def execute_task(task_id: str, worker_id: str | None = None) -> None:
+    worker_id = worker_id or worker_instance()
+    with SessionLocal.begin() as db:
+        task = db.get(GenerationTask, task_id)
+        if not task or task.status != "running": return
+        if task.worker_id and task.worker_id != worker_id: return
+        task.worker_id = worker_id; task.lease_expires_at = _lease_deadline()
+    stop = threading.Event()
+    heartbeat = threading.Thread(target=_lease_heartbeat, args=(task_id, worker_id, stop), daemon=True)
+    heartbeat.start()
+    try:
+        _execute_task(task_id, worker_id)
+    finally:
+        stop.set(); heartbeat.join(timeout=2)
+        with SessionLocal.begin() as db:
+            task = db.get(GenerationTask, task_id)
+            if task and task.worker_id == worker_id and task.status != "running":
+                task.worker_id = None; task.lease_expires_at = None
+
+
 def main() -> None:
     create_schema(); settings = get_settings()
-    print("Creative Engine worker started")
+    instance = worker_instance()
+    print(f"Creative Engine worker started: {instance}")
     last_heartbeat = 0.0
     while True:
         try:
             if time.monotonic() - last_heartbeat >= 10:
                 record_heartbeat(); last_heartbeat = time.monotonic()
-            task_id = claim_task()
-            if task_id: execute_task(task_id)
+            task_id = claim_task(instance)
+            if task_id: execute_task(task_id, instance)
             else: time.sleep(settings.worker_poll_seconds)
         except KeyboardInterrupt:
             raise

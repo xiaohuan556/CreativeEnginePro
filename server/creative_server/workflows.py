@@ -106,7 +106,7 @@ def enqueue_next_workflow_item(db: Session, run: WorkflowRun, retry: bool = Fals
         if not user:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "工作流账号不存在")
         enforce_existing_task_policy(db, user, task.provider, task.model, task.estimated_credits)
-        task.status = "queued"
+        task.status = "queued"; task.worker_id = None; task.lease_expires_at = None
     elif task.status not in ("queued", "running", "paused"):
         return None
     run.active_task_id = task.id; run.status = "running"; run.error_message = ""
@@ -120,7 +120,7 @@ def command_workflow(db: Session, run: WorkflowRun, command: str, user: User) ->
         if run.active_task_id:
             task = db.get(GenerationTask, run.active_task_id)
             if task and task.status == "queued":
-                task.status = "paused"
+                task.status = "paused"; task.worker_id = None; task.lease_expires_at = None
         run.status = "paused"
     elif command == "resume":
         if run.status != "paused":
@@ -130,7 +130,7 @@ def command_workflow(db: Session, run: WorkflowRun, command: str, user: User) ->
             if task and task.status in ("queued", "running", "paused"):
                 enforce_existing_task_policy(db, user, task.provider, task.model, task.estimated_credits)
                 if task.status == "paused":
-                    task.status = "queued"
+                    task.status = "queued"; task.worker_id = None; task.lease_expires_at = None
                 run.status = "running"
             else:
                 run.active_task_id = None; enqueue_next_workflow_item(db, run)
@@ -147,12 +147,12 @@ def command_workflow(db: Session, run: WorkflowRun, command: str, user: User) ->
         if run.active_task_id:
             task = db.get(GenerationTask, run.active_task_id)
             if task and task.status in ("queued", "running", "paused"):
-                task.status = "cancelled"
+                task.status = "cancelled"; task.worker_id = None; task.lease_expires_at = None
         items = json.loads(run.items_json or "[]")
         waiting_ids = [str(item.get("task_id")) for item in items[run.current_index:] if item.get("task_id")]
         for task in db.scalars(select(GenerationTask).where(GenerationTask.id.in_(waiting_ids))).all() if waiting_ids else []:
             if task.status in ("queued", "workflow_waiting", "paused"):
-                task.status = "cancelled"
+                task.status = "cancelled"; task.worker_id = None; task.lease_expires_at = None
         run.status = "cancelled"; run.active_task_id = None
     elif command == "retry":
         if run.status != "failed":

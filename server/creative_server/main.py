@@ -654,7 +654,7 @@ def cancel_task(task_id: str, request: Request, user: User = Depends(require_csr
     if not item: raise HTTPException(status.HTTP_404_NOT_FOUND, "任务不存在")
     require_project_write(db, item.project_id, user)
     if item.status in ("queued", "running", "paused"):
-        item.status = "cancelled"
+        item.status = "cancelled"; item.worker_id = None; item.lease_expires_at = None
         workflow = db.scalar(select(WorkflowRun).where(WorkflowRun.active_task_id == item.id))
         if workflow: workflow.status = "cancelled"; workflow.active_task_id = None; workflow.error_message = "子任务已取消"
         production = db.scalar(select(ProductionRun).where(ProductionRun.active_task_id == item.id))
@@ -672,7 +672,7 @@ def pause_task(task_id: str, request: Request, user: User = Depends(require_csrf
     require_project_write(db, item.project_id, user)
     if item.status == "running": raise HTTPException(status.HTTP_409_CONFLICT, "供应商已开始执行，单任务不能安全暂停；请暂停所属工作流，或取消任务")
     if item.status != "queued": raise HTTPException(status.HTTP_409_CONFLICT, "只有排队中的任务可以暂停")
-    item.status = "paused"; record_audit(db, request, "task.paused", user, "task", item.id); db.commit()
+    item.status = "paused"; item.worker_id = None; item.lease_expires_at = None; record_audit(db, request, "task.paused", user, "task", item.id); db.commit()
     from .canvas_sync import sync_task_to_canvas
     sync_task_to_canvas(item.id)
     return {"task": {"id": item.id, "status": item.status}}
@@ -685,7 +685,7 @@ def resume_task(task_id: str, request: Request, user: User = Depends(require_csr
     require_project_write(db, item.project_id, user)
     if item.status != "paused": raise HTTPException(status.HTTP_409_CONFLICT, "当前任务没有暂停")
     enforce_existing_task_policy(db, user, item.provider, item.model, item.estimated_credits)
-    item.status = "queued"; record_audit(db, request, "task.resumed", user, "task", item.id); db.commit()
+    item.status = "queued"; item.worker_id = None; item.lease_expires_at = None; record_audit(db, request, "task.resumed", user, "task", item.id); db.commit()
     from .canvas_sync import sync_task_to_canvas
     sync_task_to_canvas(item.id)
     return {"task": {"id": item.id, "status": item.status}}

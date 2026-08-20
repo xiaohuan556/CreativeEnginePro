@@ -135,6 +135,8 @@ class GenerationTask(Base):
     model: Mapped[str] = mapped_column(String(160), default="")
     status: Mapped[str] = mapped_column(String(24), default="queued", index=True)
     progress: Mapped[int] = mapped_column(Integer, default=0)
+    worker_id: Mapped[str | None] = mapped_column(String(160), nullable=True, index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
     estimated_credits: Mapped[int] = mapped_column(Integer, default=0)
     charged_credits: Mapped[int] = mapped_column(Integer, default=0)
     idempotency_key: Mapped[str] = mapped_column(String(100))
