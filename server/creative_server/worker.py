@@ -16,7 +16,7 @@ from .database import SessionLocal, create_schema
 from .models import Asset, GenerationTask, ProductionRun, ServiceHeartbeat, User, WorkflowRun
 from .storage import import_generated_file, media_kind, resolve_object
 from .request_compiler import compile_request
-from .task_policy import enforce_existing_task_policy
+from .task_policy import enforce_asset_policy, enforce_existing_task_policy
 
 
 def _sync_canvas(task_id: str) -> None:
@@ -75,12 +75,15 @@ def claim_task() -> str | None:
 def serialize_result(task: GenerationTask, result) -> dict:
     data = result.data
     candidates = data if isinstance(data, list) else [data]
+    files = [Path(value) for value in candidates if isinstance(value, (str, Path)) and Path(value).is_file()]
     asset_ids: list[str] = []
     with SessionLocal.begin() as db:
-        for index, value in enumerate(candidates):
-            if not isinstance(value, (str, Path)) or not Path(value).is_file():
-                continue
-            asset = Asset(project_id=task.project_id, owner_id=task.owner_id, node_id=task.node_id, name=Path(value).name, kind="file", object_key="pending", content_type="application/octet-stream", size=0, sha256="", status="processing", metadata_json=json.dumps({"task_id": task.id, "candidate": index}, ensure_ascii=False))
+        if files:
+            user = db.get(User, task.owner_id)
+            if not user: raise HTTPException(404, "素材所属账号不存在")
+            enforce_asset_policy(db, user, sum(path.stat().st_size for path in files))
+        for index, value in enumerate(files):
+            asset = Asset(project_id=task.project_id, owner_id=task.owner_id, node_id=task.node_id, name=value.name, kind="file", object_key="pending", content_type="application/octet-stream", size=0, sha256="", status="processing", metadata_json=json.dumps({"task_id": task.id, "candidate": index}, ensure_ascii=False))
             db.add(asset); db.flush()
             key, size, digest, content_type = import_generated_file(value, task.project_id, asset.id)
             asset.object_key = key; asset.size = size; asset.sha256 = digest; asset.content_type = content_type; asset.kind = media_kind(content_type); asset.status = "ready"; asset_ids.append(asset.id)

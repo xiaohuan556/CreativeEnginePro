@@ -60,6 +60,8 @@ class UsageLimit(Base):
     daily_tasks: Mapped[int] = mapped_column(Integer, default=50)
     daily_credits: Mapped[int] = mapped_column(Integer, default=5000)
     concurrent_tasks: Mapped[int] = mapped_column(Integer, default=2)
+    daily_asset_mb: Mapped[int] = mapped_column(Integer, default=2048)
+    storage_mb: Mapped[int] = mapped_column(Integer, default=20480)
     allow_paid_models: Mapped[bool] = mapped_column(Boolean, default=False)
     allowed_models_json: Mapped[str] = mapped_column(Text, default="[]")
 

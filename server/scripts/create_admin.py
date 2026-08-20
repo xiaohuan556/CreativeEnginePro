@@ -19,7 +19,7 @@ def main() -> None:
             raise SystemExit("账号已经存在，未做任何修改。")
         user = User(username=username, display_name=display_name, password_hash=hash_password(password), role="admin", status="active")
         db.add(user); db.flush()
-        db.add(UsageLimit(user_id=user.id, daily_tasks=1000, daily_credits=10_000_000, concurrent_tasks=10, allow_paid_models=True, allowed_models_json="[]"))
+        db.add(UsageLimit(user_id=user.id, daily_tasks=1000, daily_credits=10_000_000, concurrent_tasks=10, daily_asset_mb=10240, storage_mb=102400, allow_paid_models=True, allowed_models_json="[]"))
         db.commit()
     print("管理员已创建。现在只能由该管理员创建或批准其他账号。")
 

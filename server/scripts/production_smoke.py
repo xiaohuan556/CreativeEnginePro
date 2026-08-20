@@ -89,14 +89,14 @@ def main() -> int:
         account = expect(admin.post(f"{api}/api/admin/users", headers=admin_headers(), json={
             "username": reviewer_username, "display_name": "冒烟审片账号", "password": reviewer_password,
             "role": "reviewer", "approved": False, "daily_tasks": 0, "daily_credits": 0,
-            "concurrent_tasks": 0, "allow_paid_models": False, "allowed_models": [],
+            "concurrent_tasks": 0, "daily_asset_mb": 0, "storage_mb": 0, "allow_paid_models": False, "allowed_models": [],
         }, timeout=30), 201, "create pending reviewer")["user"]
         created_user_id = str(account["id"])
         denied = reviewer.post(f"{api}/api/auth/login", json={"username": reviewer_username, "password": reviewer_password}, timeout=20)
         if denied.status_code != 401: fail("pending account was able to log in")
         checks.append("pending_login_denied")
 
-        expect(admin.patch(f"{api}/api/admin/users/{created_user_id}", headers=admin_headers(), json={"status": "active", "role": "reviewer", "daily_tasks": 0, "daily_credits": 0, "concurrent_tasks": 0, "allow_paid_models": False, "allowed_models": []}, timeout=20), 200, "approve reviewer")
+        expect(admin.patch(f"{api}/api/admin/users/{created_user_id}", headers=admin_headers(), json={"status": "active", "role": "reviewer", "daily_tasks": 0, "daily_credits": 0, "concurrent_tasks": 0, "daily_asset_mb": 0, "storage_mb": 0, "allow_paid_models": False, "allowed_models": []}, timeout=20), 200, "approve reviewer")
         expect(admin.post(f"{api}/api/projects/{project_id}/members", headers=admin_headers(), json={"username": reviewer_username, "role": "reviewer"}, timeout=20), 201, "add reviewer to project")
         reviewer_login = expect(reviewer.post(f"{api}/api/auth/login", json={"username": reviewer_username, "password": reviewer_password}, timeout=20), 200, "reviewer login")
         reviewer_csrf = str(reviewer_login["csrf_token"])

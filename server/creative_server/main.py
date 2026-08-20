@@ -25,7 +25,7 @@ from .provider_catalog import available_providers, resolve_provider_model
 from .schemas import LoginRequest, ProductionCommand, ProductionRunCreate, ProjectCreate, ProjectMemberCreate, ProjectMemberUpdate, ProjectReviewCreate, ProjectUpdate, TaskCreate, UserCreate, UserUpdate, WorkflowCommand, WorkflowRunCreate, WorkflowTemplateCreate
 from .security import DUMMY_PASSWORD_HASH, expiry, hash_password, opaque_token, token_hash, utcnow, validate_password, validate_username, verify_password
 from .storage import media_kind, resolve_object, save_upload
-from .task_policy import enforce_existing_task_policy, enforce_task_policy, enforce_workflow_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
+from .task_policy import enforce_asset_policy, enforce_existing_task_policy, enforce_task_policy, enforce_workflow_policy, estimate_task_credits, require_project_read, require_project_review, require_project_write
 from .task_validation import validate_task_request
 from .workflows import command_workflow, initialize_workflow_tasks, prepare_workflow_items, public_workflow_run
 
@@ -42,7 +42,7 @@ def _aware(value):
 def public_user(user: User, limits: UsageLimit | None = None) -> dict:
     payload = {"id": user.id, "username": user.username, "display_name": user.display_name, "role": user.role, "status": user.status, "created_at": user.created_at.isoformat()}
     if limits:
-        payload["limits"] = {"daily_tasks": limits.daily_tasks, "daily_credits": limits.daily_credits, "concurrent_tasks": limits.concurrent_tasks, "allow_paid_models": limits.allow_paid_models, "allowed_models": json.loads(limits.allowed_models_json or "[]")}
+        payload["limits"] = {"daily_tasks": limits.daily_tasks, "daily_credits": limits.daily_credits, "concurrent_tasks": limits.concurrent_tasks, "daily_asset_mb": limits.daily_asset_mb, "storage_mb": limits.storage_mb, "allow_paid_models": limits.allow_paid_models, "allowed_models": json.loads(limits.allowed_models_json or "[]")}
     return payload
 
 
@@ -324,9 +324,22 @@ async def upload_asset(request: Request, project_id: str = Form(...), node_id: s
     require_project_write(db, project_id, user)
     try: metadata = json.loads(metadata_json or "{}")
     except json.JSONDecodeError as error: raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "资产元数据不是有效 JSON") from error
+    incoming_size = int(file.size or 0)
+    try:
+        enforce_asset_policy(db, user, incoming_size)
+    except HTTPException as policy_error:
+        record_audit(db, request, "asset.upload_blocked", user, "project", project_id, {"size": incoming_size, "reason": str(policy_error.detail)}); db.commit()
+        raise
     asset = Asset(project_id=project_id, owner_id=user.id, node_id=node_id, name=(file.filename or "未命名资源")[:260], kind="file", object_key="pending", content_type=file.content_type or "application/octet-stream", size=0, sha256="", status="uploading", metadata_json=json.dumps(metadata, ensure_ascii=False))
     db.add(asset); db.flush()
     object_key, size, digest, content_type = await save_upload(file, project_id, asset.id)
+    if size != incoming_size:
+        try:
+            enforce_asset_policy(db, user, size)
+        except HTTPException as policy_error:
+            resolve_object(object_key).unlink(missing_ok=True); db.rollback()
+            record_audit(db, request, "asset.upload_blocked", user, "project", project_id, {"size": size, "reason": str(policy_error.detail)}); db.commit()
+            raise
     asset.object_key = object_key; asset.size = size; asset.sha256 = digest; asset.content_type = content_type; asset.kind = media_kind(content_type); asset.status = "ready"
     record_audit(db, request, "asset.uploaded", user, "asset", asset.id, {"kind": asset.kind, "size": size}); db.commit()
     return {"asset": public_asset(asset)}
@@ -406,6 +419,11 @@ def list_users(_: User = Depends(current_user), db: Session = Depends(get_db)) -
     result = []
     for user in users:
         payload = public_user(user, db.get(UsageLimit, user.id))
+        day_start = utcnow() - timedelta(hours=24)
+        payload["asset_usage"] = {
+            "daily_bytes": db.scalar(select(func.coalesce(func.sum(Asset.size), 0)).where(Asset.owner_id == user.id, Asset.created_at >= day_start, Asset.status == "ready")) or 0,
+            "total_bytes": db.scalar(select(func.coalesce(func.sum(Asset.size), 0)).where(Asset.owner_id == user.id, Asset.status == "ready")) or 0,
+        }
         payload["active_sessions"] = db.scalar(select(func.count()).select_from(LoginSession).where(LoginSession.user_id == user.id, LoginSession.revoked_at.is_(None), LoginSession.expires_at > now)) or 0
         last_login = db.scalar(select(func.max(LoginSession.created_at)).where(LoginSession.user_id == user.id))
         payload["last_login_at"] = last_login.isoformat() if last_login else None
@@ -426,7 +444,7 @@ def create_user(payload: UserCreate, request: Request, admin: User = Depends(req
         db.flush()
     except IntegrityError as error:
         db.rollback(); raise HTTPException(status.HTTP_409_CONFLICT, "该账号已存在") from error
-    limits = UsageLimit(user_id=user.id, daily_tasks=payload.daily_tasks, daily_credits=payload.daily_credits, concurrent_tasks=payload.concurrent_tasks, allow_paid_models=payload.allow_paid_models, allowed_models_json=json.dumps(payload.allowed_models, ensure_ascii=False))
+    limits = UsageLimit(user_id=user.id, daily_tasks=payload.daily_tasks, daily_credits=payload.daily_credits, concurrent_tasks=payload.concurrent_tasks, daily_asset_mb=payload.daily_asset_mb, storage_mb=payload.storage_mb, allow_paid_models=payload.allow_paid_models, allowed_models_json=json.dumps(payload.allowed_models, ensure_ascii=False))
     db.add(limits); record_audit(db, request, "admin.user_created", admin, "user", user.id, {"role": user.role, "status": user.status}); db.commit()
     return {"user": public_user(user, limits)}
 
@@ -455,7 +473,7 @@ def update_user(user_id: str, payload: UserUpdate, request: Request, admin: User
     if revoke_sessions:
         db.execute(delete(LoginSession).where(LoginSession.user_id == user.id))
     limits = db.get(UsageLimit, user.id) or UsageLimit(user_id=user.id)
-    for key in ("daily_tasks", "daily_credits", "concurrent_tasks", "allow_paid_models"):
+    for key in ("daily_tasks", "daily_credits", "concurrent_tasks", "daily_asset_mb", "storage_mb", "allow_paid_models"):
         if values.get(key) is not None: setattr(limits, key, values[key])
     if payload.allowed_models is not None: limits.allowed_models_json = json.dumps(payload.allowed_models, ensure_ascii=False)
     db.add(limits); record_audit(db, request, "admin.user_updated", admin, "user", user.id, {"fields": sorted(values)}); db.commit()

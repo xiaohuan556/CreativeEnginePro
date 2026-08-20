@@ -20,6 +20,8 @@ class UserCreate(BaseModel):
     daily_tasks: int = Field(0, ge=0, le=10000)
     daily_credits: int = Field(0, ge=0, le=10_000_000)
     concurrent_tasks: int = Field(0, ge=0, le=50)
+    daily_asset_mb: int = Field(0, ge=0, le=10_000_000)
+    storage_mb: int = Field(0, ge=0, le=10_000_000)
     allow_paid_models: bool = False
     allowed_models: list[str] = []
 
@@ -32,6 +34,8 @@ class UserUpdate(BaseModel):
     daily_tasks: int | None = Field(None, ge=0, le=10000)
     daily_credits: int | None = Field(None, ge=0, le=10_000_000)
     concurrent_tasks: int | None = Field(None, ge=0, le=50)
+    daily_asset_mb: int | None = Field(None, ge=0, le=10_000_000)
+    storage_mb: int | None = Field(None, ge=0, le=10_000_000)
     allow_paid_models: bool | None = None
     allowed_models: list[str] | None = None
 

@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from creative_server.database import SessionLocal, create_schema  # noqa: E402
 from creative_server.main import app  # noqa: E402
-from creative_server.models import Asset, GenerationTask, ProductionRun, Project, ServiceHeartbeat, WorkflowRun, UsageLimit, User  # noqa: E402
+from creative_server.models import Asset, AuditLog, GenerationTask, ProductionRun, Project, ServiceHeartbeat, WorkflowRun, UsageLimit, User  # noqa: E402
 from creative_server.security import hash_password  # noqa: E402
 
 
@@ -99,6 +99,58 @@ def test_login_is_rate_limited_without_revealing_account_state() -> None:
             assert "账号或密码错误" in response.json()["detail"]
         blocked = client.post("/api/auth/login", json={"username": "nobody", "password": "wrong"})
         assert blocked.status_code == 429
+
+
+def test_asset_uploads_obey_daily_and_total_storage_limits() -> None:
+    seed_admin()
+    with SessionLocal() as db:
+        user = User(username="storage.user", display_name="素材用户", password_hash=hash_password("Storage-Secure-42!"), role="producer", status="active")
+        db.add(user); db.flush()
+        db.add(UsageLimit(user_id=user.id, daily_tasks=5, daily_credits=100, concurrent_tasks=1, daily_asset_mb=1, storage_mb=1, allowed_models_json="[]"))
+        project = Project(owner_id=user.id, title="素材容量测试", canvas_json='{"protocol":"creative-engine-canvas","version":1,"nodes":[],"edges":[]}')
+        db.add(project); db.commit(); user_id, project_id = user.id, project.id
+    image = b"\x89PNG\r\n\x1a\n" + b"\0" * (600 * 1024)
+    with TestClient(app) as client:
+        csrf = login(client, "storage.user", "Storage-Secure-42!")
+        first = client.post("/api/assets", headers={"x-csrf-token": csrf}, data={"project_id": project_id, "node_id": "upload-1"}, files={"file": ("one.png", image, "image/png")})
+        assert first.status_code == 201, first.text
+        with SessionLocal() as db:
+            limits = db.get(UsageLimit, user_id); limits.daily_asset_mb = 10; db.commit()
+        total_blocked = client.post("/api/assets", headers={"x-csrf-token": csrf}, data={"project_id": project_id, "node_id": "upload-2"}, files={"file": ("two.png", image, "image/png")})
+        assert total_blocked.status_code == 413
+        assert "总容量" in total_blocked.json()["detail"]
+        with SessionLocal() as db:
+            limits = db.get(UsageLimit, user_id); limits.daily_asset_mb = 1; limits.storage_mb = 10; db.commit()
+        daily_blocked = client.post("/api/assets", headers={"x-csrf-token": csrf}, data={"project_id": project_id, "node_id": "upload-3"}, files={"file": ("three.png", image, "image/png")})
+        assert daily_blocked.status_code == 413
+        assert "今日新增素材" in daily_blocked.json()["detail"]
+    with SessionLocal() as db:
+        assert db.query(Asset).filter(Asset.owner_id == user_id).count() == 1
+        assert db.query(AuditLog).filter(AuditLog.actor_id == user_id, AuditLog.action == "asset.upload_blocked").count() == 2
+
+
+def test_generated_media_cannot_bypass_storage_limits() -> None:
+    seed_admin()
+    generated = data_dir / "generated-over-quota.png"
+    generated.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\0" * 128)
+    with SessionLocal() as db:
+        user = User(username="generated.storage", display_name="生成容量", password_hash=hash_password("Generated-Secure-42!"), role="producer", status="active")
+        db.add(user); db.flush()
+        db.add(UsageLimit(user_id=user.id, daily_tasks=5, daily_credits=100, concurrent_tasks=1, daily_asset_mb=0, storage_mb=0, allowed_models_json="[]"))
+        project = Project(owner_id=user.id, title="生成容量测试", canvas_json="{}")
+        db.add(project); db.flush()
+        task = GenerationTask(project_id=project.id, node_id="image-1", owner_id=user.id, kind="text_to_image", provider="test", model="test", idempotency_key="generated-storage-limit", status="running")
+        db.add(task); db.commit(); task_id, user_id = task.id, user.id
+    from creative_server.worker import serialize_result
+    with SessionLocal() as db:
+        task = db.get(GenerationTask, task_id)
+    try:
+        serialize_result(task, SimpleNamespace(data=str(generated)))
+        assert False, "generated media should have been blocked"
+    except Exception as error:
+        assert "素材容量" in str(error) or "新增素材" in str(error)
+    with SessionLocal() as db:
+        assert db.query(Asset).filter(Asset.owner_id == user_id).count() == 0
 
 
 def test_production_pause_resume_and_rewind_do_not_duplicate_active_task() -> None:

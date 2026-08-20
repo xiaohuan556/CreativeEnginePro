@@ -5,13 +5,14 @@ from fastapi import HTTPException, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from .models import GenerationTask, Project, ProjectMember, UsageLimit, User
+from .models import Asset, GenerationTask, Project, ProjectMember, UsageLimit, User
 from .security import utcnow
 
 
 ACTIVE_TASKS = ("queued", "running", "paused")
 TASK_ROLES = ("admin", "producer", "director", "editor")
 FREE_PROVIDERS = ("local", "edge_tts")
+BYTES_PER_MB = 1024 * 1024
 
 MINIMUM_CREDITS = {
     "chat": 2,
@@ -33,6 +34,22 @@ def estimate_task_credits(kind: str, provider: str, requested: int = 0) -> int:
     if provider in ("local", "edge_tts") or kind in ("video_breakdown", "extract_video_frames"):
         return 0
     return max(int(requested or 0), MINIMUM_CREDITS.get(kind, 5))
+
+
+def enforce_asset_policy(db: Session, user: User, incoming_bytes: int) -> UsageLimit:
+    """Serialize per-user asset reservations and enforce daily/total storage caps."""
+    limits = db.scalar(select(UsageLimit).where(UsageLimit.user_id == user.id).with_for_update())
+    if not limits:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "账号尚未配置素材容量")
+    incoming = max(0, int(incoming_bytes or 0))
+    day_start = utcnow() - timedelta(hours=24)
+    daily_bytes = db.scalar(select(func.coalesce(func.sum(Asset.size), 0)).where(Asset.owner_id == user.id, Asset.created_at >= day_start, Asset.status.in_(("ready", "processing", "uploading")))) or 0
+    total_bytes = db.scalar(select(func.coalesce(func.sum(Asset.size), 0)).where(Asset.owner_id == user.id, Asset.status.in_(("ready", "processing", "uploading")))) or 0
+    if int(limits.daily_asset_mb or 0) <= 0 or daily_bytes + incoming > int(limits.daily_asset_mb) * BYTES_PER_MB:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "今日新增素材容量已达到管理员设置的上限")
+    if int(limits.storage_mb or 0) <= 0 or total_bytes + incoming > int(limits.storage_mb) * BYTES_PER_MB:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "个人素材总容量不足，请清理素材或联系管理员扩容")
+    return limits
 
 
 def _model_allowed(allowed: list[str], provider: str, model: str) -> bool:

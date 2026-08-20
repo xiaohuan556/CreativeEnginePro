@@ -7,7 +7,8 @@ import { useControlPlane } from "./ControlPlane";
 type ManagedUser = {
   id: string; username: string; display_name: string; role: string; status: string;
   active_sessions?: number; last_login_at?: string | null;
-  limits?: { daily_tasks: number; daily_credits: number; concurrent_tasks: number; allow_paid_models: boolean; allowed_models: string[] };
+  limits?: { daily_tasks: number; daily_credits: number; concurrent_tasks: number; daily_asset_mb: number; storage_mb: number; allow_paid_models: boolean; allowed_models: string[] };
+  asset_usage?: { daily_bytes: number; total_bytes: number };
 };
 type UsageRow = { id: string; username: string; display_name: string; tasks: number; credits: number };
 type AuditEvent = { id: string; action: string; target_type: string; target_id: string; ip_address: string; created_at: string };
@@ -69,6 +70,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
     const response = await apiFetch("/api/admin/users", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({
       username: form.get("username"), display_name: form.get("display_name"), password: form.get("password"), role: form.get("role"), approved: form.get("approved") === "on",
       daily_tasks: Number(form.get("daily_tasks")), daily_credits: Number(form.get("daily_credits")), concurrent_tasks: Number(form.get("concurrent_tasks")), allow_paid_models: form.get("allow_paid_models") === "on",
+      daily_asset_mb: Number(form.get("daily_asset_mb")), storage_mb: Number(form.get("storage_mb")),
       allowed_models: String(form.get("allowed_models") || "").split(",").map((item) => item.trim()).filter(Boolean),
     }) });
     const data = await response.json() as { detail?: string };
@@ -82,6 +84,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
     const response = await apiFetch(`/api/admin/users/${user.id}`, { method: "PATCH", headers: { "content-type": "application/json" }, body: JSON.stringify({
       display_name: data.get("display_name"), role: data.get("role"), status: data.get("status"), ...(password ? { password } : {}),
       daily_tasks: Number(data.get("daily_tasks")), daily_credits: Number(data.get("daily_credits")), concurrent_tasks: Number(data.get("concurrent_tasks")), allow_paid_models: data.get("allow_paid_models") === "on",
+      daily_asset_mb: Number(data.get("daily_asset_mb")), storage_mb: Number(data.get("storage_mb")),
       allowed_models: String(data.get("allowed_models") || "").split(",").map((item) => item.trim()).filter(Boolean),
     }) });
     const payload = await response.json() as { detail?: string };
@@ -119,6 +122,7 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
             <label className="wide"><span>初始密码</span><input name="password" type="password" minLength={12} required autoComplete="new-password" placeholder="12 位以上，至少三类字符" /></label>
             <label><span>角色</span><select name="role" defaultValue="producer">{roles.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
             <label><span>每日任务</span><input name="daily_tasks" type="number" min="0" defaultValue="0" /></label><label><span>每日费用额度</span><input name="daily_credits" type="number" min="0" defaultValue="0" /></label><label><span>最大并发</span><input name="concurrent_tasks" type="number" min="0" max="50" defaultValue="0" /></label>
+            <label><span>每日新增素材 MB</span><input name="daily_asset_mb" type="number" min="0" defaultValue="0" /></label><label><span>个人素材总容量 MB</span><input name="storage_mb" type="number" min="0" defaultValue="0" /></label>
             <label className="wide"><span>允许引擎或 provider:model（逗号分隔；留空则禁止外部模型）</span><input name="allowed_models" placeholder="seedream, seedance, deepseek" /></label>
           </div>
           <div className="admin-checks"><label><input name="approved" type="checkbox" /> 我已确认账号和密码，创建后允许登录</label><label><input name="allow_paid_models" type="checkbox" /> 允许付费模型</label><button disabled={busy}>{busy ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}确认创建</button></div>
@@ -128,10 +132,10 @@ export function AdminPanel({ onClose }: { onClose: () => void }) {
         {message && <p className="admin-message">{message}</p>}
         {busy && users.length === 0 ? <div className="admin-loading"><LoaderCircle className="spin" size={20} />读取账号…</div> : <div className="user-list">{users.map((user) =>
           <form key={user.id} className="user-row" onSubmit={(event) => { event.preventDefault(); void save(user, event.currentTarget); }}>
-            <div className="user-identity"><span>{(user.display_name || user.username).slice(0, 1)}</span><div><strong>{user.username}</strong><small>{user.active_sessions || 0} 个在线会话{user.last_login_at ? ` · ${new Date(user.last_login_at).toLocaleDateString("zh-CN")}` : " · 尚未登录"}</small><input name="display_name" defaultValue={user.display_name} aria-label="显示名称" /></div></div>
+            <div className="user-identity"><span>{(user.display_name || user.username).slice(0, 1)}</span><div><strong>{user.username}</strong><small>{user.active_sessions || 0} 个在线会话{user.last_login_at ? ` · ${new Date(user.last_login_at).toLocaleDateString("zh-CN")}` : " · 尚未登录"} · 素材 {Math.round(Number(user.asset_usage?.total_bytes || 0) / 1024 / 1024)} MB</small><input name="display_name" defaultValue={user.display_name} aria-label="显示名称" /></div></div>
             <select name="role" defaultValue={user.role} aria-label="角色">{roles.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
             <select name="status" defaultValue={user.status} aria-label="状态"><option value="active">允许登录</option><option value="pending">等待批准</option><option value="suspended">已停用</option></select>
-            <div className="quota-fields"><input name="daily_tasks" type="number" min="0" defaultValue={user.limits?.daily_tasks ?? 0} title="每日任务" /><input name="daily_credits" type="number" min="0" defaultValue={user.limits?.daily_credits ?? 0} title="每日费用额度" /><input name="concurrent_tasks" type="number" min="0" defaultValue={user.limits?.concurrent_tasks ?? 0} title="并发任务" /></div>
+            <div className="quota-fields"><input name="daily_tasks" type="number" min="0" defaultValue={user.limits?.daily_tasks ?? 0} title="每日任务" /><input name="daily_credits" type="number" min="0" defaultValue={user.limits?.daily_credits ?? 0} title="每日费用额度" /><input name="concurrent_tasks" type="number" min="0" defaultValue={user.limits?.concurrent_tasks ?? 0} title="并发任务" /><input name="daily_asset_mb" type="number" min="0" defaultValue={user.limits?.daily_asset_mb ?? 0} title="每日新增素材 MB" /><input name="storage_mb" type="number" min="0" defaultValue={user.limits?.storage_mb ?? 0} title="个人素材总容量 MB" /></div>
             <input className="models-field" name="allowed_models" defaultValue={(user.limits?.allowed_models || []).join(", ")} placeholder="允许引擎；留空禁用" />
             <label className="paid-check"><input name="allow_paid_models" type="checkbox" defaultChecked={user.limits?.allow_paid_models} />付费</label>
             <div className="password-reset"><KeyRound size={13} /><input name="password" type="password" minLength={12} placeholder="新密码（可空）" autoComplete="new-password" /></div><div className="user-row-actions"><button type="button" disabled={busy || !user.active_sessions} onClick={() => void forceLogout(user)}>下线</button><button className="user-save" disabled={busy}>保存</button></div>

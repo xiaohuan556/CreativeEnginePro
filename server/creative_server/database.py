@@ -38,3 +38,8 @@ def create_schema() -> None:
         if "in_library" not in columns:
             connection.execute(text("ALTER TABLE assets ADD COLUMN in_library BOOLEAN NOT NULL DEFAULT FALSE"))
             connection.execute(text("CREATE INDEX IF NOT EXISTS ix_assets_in_library ON assets (in_library)"))
+        usage_columns = {column["name"] for column in inspect(connection).get_columns("usage_limits")}
+        if "daily_asset_mb" not in usage_columns:
+            connection.execute(text("ALTER TABLE usage_limits ADD COLUMN daily_asset_mb INTEGER NOT NULL DEFAULT 2048"))
+        if "storage_mb" not in usage_columns:
+            connection.execute(text("ALTER TABLE usage_limits ADD COLUMN storage_mb INTEGER NOT NULL DEFAULT 20480"))
