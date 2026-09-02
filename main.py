@@ -1,6 +1,7 @@
 import os
 import sys
 import traceback
+import json
 from datetime import datetime
 
 # 强制 ffmpeg 单线程解码（OpenCV 后端）：
@@ -155,22 +156,39 @@ sys.path.insert(0, os.path.join(base_path, "core"))
 sys.path.insert(0, os.path.join(base_path, "ui"))
 
 # --- 3. 先创建 QApplication（必须在任何 Qt 对象创建之前）---
-from PyQt6.QtWidgets import QApplication, QMessageBox
-from PyQt6.QtGui import QFont
-
-def check_expiry():
-    expire_date = datetime(2026, 10, 1)
-    if datetime.now() > expire_date:
-        return True
-    return False
+from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
+from PyQt6.QtGui import QFont, QIcon
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)
+    # 应用级图标会自动传递给主窗口、弹窗和 Windows 任务栏。
+    app.setWindowIcon(QIcon(os.path.join(base_path, "assets", "icon.ico")))
 
-    # 授权检查逻辑
-    if check_expiry():
-        QMessageBox.critical(None, "授权过期", "软件授权已到期，请联系管理员续期。")
+    # 正式版日期锁与公司账号门禁。开发清单默认不要求登录；正式构建脚本会
+    # 生成 require_login=true 且固化 HTTPS 服务地址的授权清单。
+    try:
+        from core.release_gate import DesktopAuthClient, ReleaseGateError, ReleasePolicy
+        from ui.release_login import ReleaseLoginDialog
+        release_policy = ReleasePolicy.load()
+    except Exception as error:
+        QMessageBox.critical(None, "版本授权异常", str(error))
         sys.exit(1)
+
+    if release_policy.is_expired():
+        QMessageBox.critical(
+            None, "版本已到期",
+            f"当前版本已于 {release_policy.expiry_label} 到期，请联系管理员获取新版本。")
+        sys.exit(1)
+
+    bundle_smoke = "--bundle-smoke" in sys.argv
+    auth_client = None
+    authenticated_user = None
+    if release_policy.require_login and not bundle_smoke:
+        auth_client = DesktopAuthClient(release_policy.auth_base_url)
+        login_dialog = ReleaseLoginDialog(release_policy, auth_client)
+        if login_dialog.exec() != QDialog.DialogCode.Accepted or login_dialog.result is None:
+            sys.exit(0)
+        authenticated_user = login_dialog.result.user
 
     app.setFont(QFont("Segoe UI", 9))
     app.setStyleSheet("QToolTip { color: #ffffff; background-color: #2a2a2a; border: 1px solid #555555; padding: 2px 6px; }")
@@ -192,8 +210,47 @@ if __name__ == '__main__':
     sys.excepthook = handle_exception
 
     # --- 3. QApplication 就绪后再导入业务逻辑 ---
+    if auth_client is not None:
+        from core.release_gate import configure_desktop_control_client
+        configure_desktop_control_client(auth_client)
     from ui.main_window import UltimateEngine
 
     window = UltimateEngine()
-    window.show()
+    if authenticated_user:
+        display_name = str(authenticated_user.get("display_name") or authenticated_user.get("username") or "")
+        if display_name:
+            window.setWindowTitle(f"{window.windowTitle()} · {display_name}")
+    if auth_client is not None:
+        from ui.release_login import DesktopSessionGuard, close_for_invalid_session
+        # Retain the guard on the window; otherwise Qt/Python may collect it.
+        window._release_session_guard = DesktopSessionGuard(
+            release_policy, auth_client, window)
+        window._release_session_guard.invalidated.connect(close_for_invalid_session)
+    if bundle_smoke:
+        # Build-time probe: prove that Qt and the complete main window can be
+        # constructed from the frozen bundle.  It never exposes a usable app
+        # or bypasses the login gate for an interactive session.
+        from PyQt6.QtCore import QTimer
+
+        marker = os.environ.get("CEP_BUNDLE_SMOKE_MARKER", "").strip()
+
+        def _complete_bundle_smoke():
+            if marker:
+                with open(marker, "w", encoding="utf-8") as stream:
+                    json.dump({
+                        "ok": True,
+                        "version": release_policy.version,
+                        "login_required": release_policy.require_login,
+                    }, stream, ensure_ascii=False)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+            # Some multimedia backends crash during offscreen Qt teardown.
+            # The build probe has already proven full construction at this
+            # point, so terminate without exposing an interactive session.
+            os._exit(0)
+
+        window.show()
+        QTimer.singleShot(750, _complete_bundle_smoke)
+    else:
+        window.show()
     sys.exit(app.exec())

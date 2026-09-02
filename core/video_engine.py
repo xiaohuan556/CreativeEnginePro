@@ -14,9 +14,11 @@ import moviepy.video.fx.all as vfx
 from proglog import ProgressBarLogger
 
 class MoviePyProgressListener(ProgressBarLogger):
-    def __init__(self, log_signal):
+    def __init__(self, log_signal, start_pct=0, end_pct=100):
         super().__init__()
         self.log_signal = log_signal
+        self.start_pct = int(start_pct)
+        self.end_pct = int(end_pct)
 
     def callback(self, **changes):
         bars = self.state.get('bars', {})
@@ -27,9 +29,43 @@ class MoviePyProgressListener(ProgressBarLogger):
                 total = bar.get('total') or bar.get('duration')
                 current = bar.get('index') or bar.get('current')
                 if total and total > 0 and current is not None:
-                    p = int((current / total) * 100)
+                    ratio = max(0.0, min(1.0, current / total))
+                    p = int(self.start_pct + (self.end_pct - self.start_pct) * ratio)
                     self.log_signal.emit(f"RENDER_PROGRESS:{max(0, min(100, p))}")
                     return
+
+
+def build_alpha_watermark_command(
+    ffmpeg_path: str, base_video: str, watermark_mov: str, output_path: str,
+    width: int, height: int,
+) -> list[str]:
+    """构建透明 MOV 全画布水印合成命令。
+
+    水印循环到主视频结束，只保留主视频音轨；RGBA 格式确保
+    ProRes 4444 / Animation / PNG codec MOV 的 Alpha 不被丢弃。
+    """
+    width = max(2, int(width))
+    height = max(2, int(height))
+    if width % 2:
+        width += 1
+    if height % 2:
+        height += 1
+    graph = (
+        f"[1:v]setpts=PTS-STARTPTS,scale={width}:{height},format=rgba[wm];"
+        "[0:v][wm]overlay=0:0:shortest=1:format=auto[v]"
+    )
+    return [
+        ffmpeg_path, "-y",
+        "-i", base_video,
+        "-stream_loop", "-1", "-i", watermark_mov,
+        "-filter_complex", graph,
+        "-map", "[v]", "-map", "0:a?",
+        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-preset", "fast", "-crf", "23",
+        "-c:a", "copy", "-shortest", output_path,
+    ]
+
+
 class VideoProcessor:
     """视频处理器：极速导出 + 全量渲染，支持实时取消"""
 
@@ -42,55 +78,67 @@ class VideoProcessor:
         self.current_subprocess = None      # 保存当前子进程对象
         self.current_out_path = None         # 保存当前输出文件路径
 
+    def _stream_ffmpeg_progress(self, cmd, start_pct, end_pct, duration):
+        """运行 FFmpeg，报告进度并支持立即取消。"""
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                universal_newlines=True,
+                encoding="utf-8",
+                errors="ignore",
+                creationflags=(subprocess.CREATE_NO_WINDOW
+                               if sys.platform == "win32" else 0),
+            )
+            self.current_subprocess = process
+            time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
+            while True:
+                if self.is_cancelled:
+                    process.terminate()
+                    process.wait()
+                    self.current_subprocess = None
+                    return False
+                line = process.stderr.readline()
+                if not line and process.poll() is not None:
+                    break
+                if "time=" not in line:
+                    continue
+                match = time_pattern.search(line)
+                if match and duration > 0:
+                    hours, minutes, seconds = map(float, match.groups())
+                    current_seconds = hours * 3600 + minutes * 60 + seconds
+                    ratio = min(1.0, current_seconds / duration)
+                    progress = int(start_pct + (end_pct - start_pct) * ratio)
+                    if self.log_signal:
+                        self.log_signal.emit(
+                            f"RENDER_PROGRESS:{max(0, min(99, progress))}")
+            process.wait()
+            self.current_subprocess = None
+            return process.returncode == 0
+        except Exception as exc:
+            self.emit_log(f"FFmpeg 执行异常: {exc}")
+            return False
+
+    def _apply_alpha_watermark(
+        self, ffmpeg_path: str, base_video: str, watermark_mov: str,
+        output_path: str, start_pct: int, end_pct: int, duration: float,
+    ) -> bool:
+        """将透明 MOV 循环叠加到整条成片，不使用水印音轨。"""
+        cap = cv2.VideoCapture(base_video)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        cap.release()
+        if width <= 0 or height <= 0:
+            self.emit_log("无法读取成片尺寸，透明水印合成已停止")
+            return False
+        command = build_alpha_watermark_command(
+            ffmpeg_path, base_video, watermark_mov, output_path, width, height)
+        return self._stream_ffmpeg_progress(
+            command, start_pct, end_pct, max(0.1, float(duration)))
+
     def fast_remux_process(self, task, config):
         """高兼容性导出函数：支持实时取消"""
-
-        def stream_ffmpeg_progress(cmd, start_pct, end_pct, duration):
-            """运行ffmpeg并实时监控进度，支持取消"""
-            try:
-                # 启动子进程
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    universal_newlines=True,
-                    encoding='utf-8',
-                    errors='ignore',
-                    creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-                )
-                
-                # 保存子进程引用，用于取消时终止
-                self.current_subprocess = process
-                
-                time_pattern = re.compile(r"time=(\d+):(\d+):(\d+\.\d+)")
-                
-                while True:
-                    if self.is_cancelled:
-                        process.terminate()
-                        process.wait()
-                        self.current_subprocess = None
-                        return False
-                    
-                    line = process.stderr.readline()
-                    if not line and process.poll() is not None:
-                        break
-                    
-                    if "time=" in line:
-                        match = time_pattern.search(line)
-                        if match and duration > 0:
-                            hours, minutes, seconds = map(float, match.groups())
-                            current_seconds = hours * 3600 + minutes * 60 + seconds
-                            phase_progress = min(1.0, current_seconds / duration)
-                            actual_progress = int(start_pct + (end_pct - start_pct) * phase_progress)
-                            self.log_signal.emit(f"RENDER_PROGRESS:{max(0, min(99, actual_progress))}")
-                
-                process.wait()
-                self.current_subprocess = None
-                return process.returncode == 0
-                
-            except Exception as e:
-                self.emit_log(f"进度监控异常: {str(e)}")
-                return False
 
         try:
             from utils.ffmpeg_utils import get_ffmpeg_path
@@ -103,6 +151,9 @@ class VideoProcessor:
         try:
             input_path = task['path']
             tail_path = config.get('tail_path')
+            watermark_path = config.get('watermark_path')
+            use_watermark = bool(
+                watermark_path and os.path.isfile(watermark_path))
             out_dir = config.get('out_dir', 'output')
             
             if not os.path.exists(out_dir):
@@ -124,6 +175,15 @@ class VideoProcessor:
             cut_time = task.get('precise_cut_time', task.get('duration', 5))
             if cut_time <= 0:
                 cut_time = 5
+            tail_duration = 0.0
+
+            # 带透明水印时，先输出无水印中间成片，再用 FFmpeg
+            # 统一叠加；这样有无尾页都走同一套 Alpha 可靠路径。
+            if use_watermark:
+                tmpdir = tempfile.mkdtemp(prefix="cep_watermark_")
+                render_out = os.path.join(tmpdir, "base_video.mp4")
+            else:
+                render_out = out_path
 
             si = None
             if sys.platform == "win32":
@@ -135,7 +195,8 @@ class VideoProcessor:
 
             # 有尾页：先各自转码，再 concat 拼接
             if tail_path and os.path.exists(tail_path):
-                tmpdir = tempfile.mkdtemp()
+                if tmpdir is None:
+                    tmpdir = tempfile.mkdtemp(prefix="cep_tail_")
                 tmp_main = os.path.join(tmpdir, 'main_part.mp4')
                 tmp_tail = os.path.join(tmpdir, 'tail_part.mp4')
                 concat_txt = os.path.join(tmpdir, 'concat.txt')
@@ -172,7 +233,8 @@ class VideoProcessor:
                 if self.is_cancelled:
                     return False
                     
-                if not stream_ffmpeg_progress(cmd_main, 0, 70, float(cut_time)):
+                if not self._stream_ffmpeg_progress(
+                        cmd_main, 0, 70, float(cut_time)):
                     self.emit_log("主视频转码失败")
                     return False
 
@@ -201,7 +263,8 @@ class VideoProcessor:
                 if self.is_cancelled:
                     return False
                     
-                if not stream_ffmpeg_progress(cmd_tail, 70, 90, tail_duration):
+                if not self._stream_ffmpeg_progress(
+                        cmd_tail, 70, 90, tail_duration):
                     self.emit_log("尾页转码失败")
                     return False
 
@@ -216,7 +279,7 @@ class VideoProcessor:
                     '-f', 'concat', '-safe', '0',
                     '-i', concat_txt,
                     '-c', 'copy',
-                    out_path
+                    render_out
                 ]
                 
                 if self.is_cancelled:
@@ -241,16 +304,26 @@ class VideoProcessor:
                     '-preset', 'fast',
                     '-crf', '23',
                     '-c:a', 'aac',
-                    out_path
+                    render_out
                 ]
                 
                 if self.is_cancelled:
                     return False
                     
-                if not stream_ffmpeg_progress(cmd, 0, 100, float(cut_time)):
+                if not self._stream_ffmpeg_progress(
+                        cmd, 0, 90 if use_watermark else 100, float(cut_time)):
                     return False
 
-            self.log_signal.emit("RENDER_PROGRESS:100")
+            if use_watermark:
+                self.emit_log("正在合成透明 MOV 水印…")
+                if not self._apply_alpha_watermark(
+                        ffmpeg_exe, render_out, watermark_path, out_path,
+                        90, 100, float(cut_time) + float(tail_duration)):
+                    self.emit_log("透明 MOV 水印合成失败")
+                    return False
+
+            if self.log_signal:
+                self.log_signal.emit("RENDER_PROGRESS:100")
             self.emit_log(f"导出成功: {final_name}")
             return True
 
@@ -415,6 +488,15 @@ class VideoProcessor:
         
         try:
             video_path = task['path']
+            watermark_path = config.get("watermark_path")
+            if watermark_path:
+                if not os.path.isfile(watermark_path):
+                    self.emit_log("透明 MOV 水印文件不存在")
+                    return False
+                from utils.alpha_video import probe_has_alpha
+                if not probe_has_alpha(watermark_path):
+                    self.emit_log("所选 MOV 没有 Alpha 透明通道，已停止导出")
+                    return False
             # 获取用户在下拉框选中的模式文本 (对应你右侧参数面板的下拉框)
             mode = str(config.get('ratio_mode', "")).strip()
 
@@ -461,11 +543,12 @@ class VideoProcessor:
         clip = None
         final_video = None
         out_path = None
+        watermark_tmpdir = None
 
         # 定义可取消的进度监听器
         class CancelableLogger(MoviePyProgressListener):
-            def __init__(self, log_signal, processor):
-                super().__init__(log_signal)
+            def __init__(self, log_signal, processor, start_pct=0, end_pct=100):
+                super().__init__(log_signal, start_pct, end_pct)
                 self.processor = processor
 
             def callback(self, **changes):
@@ -477,6 +560,9 @@ class VideoProcessor:
             # --- 1. 基础参数准备 ---
             video_path = task['path']
             tail_path = config.get('tail_path')
+            watermark_path = config.get('watermark_path')
+            use_watermark = bool(
+                watermark_path and os.path.isfile(watermark_path))
             mode = str(config.get('ratio_mode', "")).strip()
             
             clip = VideoFileClip(video_path)
@@ -552,12 +638,19 @@ class VideoProcessor:
             actual_file_name = os.path.basename(out_path)
             self.emit_log(f"正在全量渲染: {actual_file_name}")
             self.emit_log(f"SET_CURRENT_PATH:{out_path}")
+
+            if use_watermark:
+                watermark_tmpdir = tempfile.mkdtemp(prefix="cep_watermark_")
+                render_out = os.path.join(watermark_tmpdir, "base_video.mp4")
+            else:
+                render_out = out_path
             
             # 使用可取消的日志监听器
-            logger = CancelableLogger(self.log_signal, self)
+            logger = CancelableLogger(
+                self.log_signal, self, 0, 90 if use_watermark else 100)
             
             final_video.write_videofile(
-                out_path, 
+                render_out,
                 codec="libx264", 
                 audio_codec="aac", 
                 fps=clip.fps or 25, 
@@ -566,6 +659,17 @@ class VideoProcessor:
                 logger=logger, 
                 ffmpeg_params=["-pix_fmt", "yuv420p", "-y"]
             )
+
+            if use_watermark:
+                from utils.ffmpeg_utils import get_ffmpeg_path
+                self.emit_log("正在合成透明 MOV 水印…")
+                if not self._apply_alpha_watermark(
+                        get_ffmpeg_path(), render_out, watermark_path, out_path,
+                        90, 100, float(final_video.duration)):
+                    self.emit_log("透明 MOV 水印合成失败")
+                    return False
+                if self.log_signal:
+                    self.log_signal.emit("RENDER_PROGRESS:100")
             return True
 
         except Exception as e:
@@ -593,6 +697,8 @@ class VideoProcessor:
             if 'final_video' in locals() and final_video:
                 try: final_video.close()
                 except Exception: import logging; logging.getLogger("CreativeEnginePro").debug("final_video.close() failed", exc_info=True)
+            if watermark_tmpdir and os.path.isdir(watermark_tmpdir):
+                shutil.rmtree(watermark_tmpdir, ignore_errors=True)
             # 清除当前输出路径引用
             self.current_out_path = None
             import gc

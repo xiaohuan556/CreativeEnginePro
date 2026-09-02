@@ -5,31 +5,37 @@ CreativeEnginePro - 统一配置管理
 import os
 import sys
 from pathlib import Path
+from utils.app_paths import (
+    install_root, output_root, resource_root, user_data_root, work_root,
+)
 
 # ── 项目根目录 ──
-# 打包后 sys.executable 是 exe 位置，__file__ 是临时解压目录
-if getattr(sys, 'frozen', False) and hasattr(sys, '_MEIPASS'):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).parent
+# RESOURCE_ROOT 只读；PROJECT_ROOT 是安装目录；APP_DATA_DIR 永久可写。
+RESOURCE_ROOT = resource_root()
+PROJECT_ROOT = install_root()
+APP_DATA_DIR = user_data_root()
 
 # ── 加载 .env ──
-_env_path = PROJECT_ROOT / ".env"
-if _env_path.exists():
-    with open(_env_path, encoding="utf-8") as _f:
-        for _line in _f:
-            _line = _line.strip()
-            if not _line or _line.startswith("#") or "=" not in _line:
-                continue
-            _key, _, _value = _line.partition("=")
-            _key = _key.strip()
-            _value = _value.strip().strip('"').strip("'")
-            if _key and _key not in os.environ:
-                os.environ[_key] = _value
+_env_candidates = [APP_DATA_DIR / ".env"]
+if PROJECT_ROOT != APP_DATA_DIR:
+    _env_candidates.append(PROJECT_ROOT / ".env")
+for _env_path in _env_candidates:
+    if _env_path.exists():
+        with open(_env_path, encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _key, _, _value = _line.partition("=")
+                _key = _key.strip()
+                _value = _value.strip().strip('"').strip("'")
+                if _key and _key not in os.environ:
+                    os.environ[_key] = _value
 
 # ── 临时工作目录 ──
-WORK_DIR = PROJECT_ROOT / "work_temp"
-OUTPUT_DIR = PROJECT_ROOT / "work_output"
+# 服务端单机部署可将大体积中间文件放到独立数据盘；桌面端默认行为保持不变。
+WORK_DIR = work_root()
+OUTPUT_DIR = output_root()
 
 
 def ensure_work_dir():

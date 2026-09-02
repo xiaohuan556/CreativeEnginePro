@@ -18,6 +18,7 @@ import traceback
 import shutil
 import subprocess
 import uuid
+import copy
 from pathlib import Path
 
 from PyQt6.QtWidgets import (
@@ -47,7 +48,6 @@ from ui.download_panel import DownloadPanel
 from ui.scrape_panel import ScrapePanel
 from ui.openverse_panel import OpenversePanel
 from ui.widgets import CheckMarkBox
-from ui.scene_detect_dialog import SceneDetectDialog
 
 # ══ 模块常量 ══
 PROP_DEBOUNCE_MS = 30       # 属性滑块 debounce
@@ -62,6 +62,7 @@ FFMPEG_TIMEOUT_LONG = 300   # FFmpeg 长操作超时（秒）
 # 自动保存（学习剪映：随时保存）
 AUTOSAVE_DEBOUNCE_MS = 1200  # 改动后防抖落盘（毫秒）
 AUTOSAVE_INTERVAL_MS = 90000 # 后台定时兜底（每 90 秒）
+SENSITIVE_SCENE_THRESHOLD = 0.20  # 智能分镜点击后直接使用灵敏模式
 TAB_STYLE = (
     "QPushButton{background:#1a1a1a;color:#666;border:none;"
     "border-radius:3px;padding:2px 10px;font-size:11px;}"
@@ -275,7 +276,7 @@ class _ASRWorker(QThread):
         super().__init__(); self._path = audio_path; self._lang = src_lang
     def run(self):
         try:
-            self.progress.emit(10, "加载 Whisper 模型…")
+            self.progress.emit(10, "正在加载 Whisper 模型（首次使用需下载模型，请稍候）…")
             from core.whisper_runner import run_whisper_asr
             entries = run_whisper_asr(self._path, language=self._lang)
             self.progress.emit(90, "识别完成，整理字幕…")
@@ -725,6 +726,8 @@ class EditorTab(QWidget):
         self._thumb_workers: list = []  # 保持引用防止 GC
         self._thumb_pending: list = []   # 缩略图待处理队列 (clip, dur)
         self._waveform_workers: list = []  # 音频波形后台任务
+        # 工作台内部片段剪贴板：跨时间线保留视频/音频/字幕及其相对位置。
+        self._clip_clipboard: list[dict] = []
 
         # 属性面板 debounce：快速拖拽滑块时避免每 tick 都 seek，防止卡死闪退
         self._prop_debounce = QTimer(self)
@@ -854,6 +857,17 @@ class EditorTab(QWidget):
         self._tl_tab_layout.setContentsMargins(4, 0, 4, 0)
         self._tl_tab_layout.setSpacing(2)
         self._tl_tab_layout.addStretch()
+        self._tl_more_btn = QPushButton("☰")
+        self._tl_more_btn.setFixedSize(52, 22)
+        self._tl_more_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._tl_more_btn.setToolTip("查看全部时间线")
+        self._tl_more_btn.setStyleSheet(
+            "QPushButton{background:#1a1a1a;color:#bbb;border:1px solid #333;"
+            "border-radius:3px;padding:0 6px;font-size:11px;}"
+            "QPushButton:hover{background:#2a2a2a;color:#fff;border-color:#555;}")
+        self._tl_more_btn.clicked.connect(self._show_timeline_list)
+        self._tl_more_btn.hide()
+        self._tl_tab_layout.addWidget(self._tl_more_btn)
 
         # 拖拽排序状态
         self._drag_btn: QPushButton | None = None
@@ -1020,28 +1034,7 @@ class EditorTab(QWidget):
 
     def _build_right_panel(self) -> QWidget:
         """右侧只保留剪辑属性；AI 生成统一回到制片画布。"""
-        # 顶部小标签切换
-        bar = QWidget()
-        bar.setFixedHeight(28)
-        bar.setStyleSheet("background:#141414; border-bottom:1px solid #2a2a2a;")
-        blay = QHBoxLayout(bar)
-        blay.setContentsMargins(6, 0, 6, 0)
-        blay.setSpacing(4)
-
-        self._right_tabs = QTabWidget()
-        self._right_tabs.setStyleSheet("""
-            QTabWidget::pane { border:none; }
-            QTabBar::tab {
-                background:#1e1e1e; color:#888; border:none;
-                padding:4px 12px; font-size:11px; min-width:50px;
-            }
-            QTabBar::tab:selected { color:#fff; border-bottom:2px solid #3d8ef8; }
-            QTabBar::tab:hover { color:#ccc; }
-        """)
-        self._right_tabs.setTabPosition(QTabWidget.TabPosition.North)
-        self._right_tabs.setDocumentMode(True)
-
-        # 页 0：属性面板（保留原 ClipPropertiesPanel 的滚动容器）
+        # 属性面板直接作为右侧内容；不再套一层重复的“属性”页签。
         props_scroll = QScrollArea()
         props_scroll.setWidgetResizable(True)
         props_scroll.setStyleSheet(
@@ -1060,11 +1053,10 @@ class EditorTab(QWidget):
         lay.addWidget(self.props_panel, 1)
         lay.addStretch()
         props_scroll.setWidget(container)
-        self._right_tabs.addTab(props_scroll, "📋 属性")
 
         # 栈容器（预留扩展位）
         self._right_stack = QStackedWidget()
-        self._right_stack.addWidget(self._right_tabs)
+        self._right_stack.addWidget(props_scroll)
 
         wrap = QWidget()
         wraplay = QVBoxLayout(wrap)
@@ -1302,6 +1294,15 @@ class EditorTab(QWidget):
         sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
         sc.activated.connect(self._on_shortcut_split)
 
+        # Ctrl+C / Ctrl+V：跨时间线复制、粘贴视频/音频/字幕片段
+        sc = QShortcut(QKeySequence("Ctrl+C"), self)
+        sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc.activated.connect(self._on_shortcut_copy_clips)
+
+        sc = QShortcut(QKeySequence("Ctrl+V"), self)
+        sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        sc.activated.connect(self._on_shortcut_paste_clips)
+
         # V：隐藏/显示选中片段
         sc = QShortcut(QKeySequence(Qt.Key.Key_V), self)
         sc.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -1354,6 +1355,92 @@ class EditorTab(QWidget):
         if not self.isVisible() or self._in_text_field():
             return
         self.timeline_widget._do_split()
+
+    def _selected_clip_items(self) -> list:
+        """返回当前时间线选中的片段及轨道信息，兼容单选与框选多选。"""
+        canvas = self.timeline_widget._canvas
+        selected = list(getattr(canvas, "_marquee_selected", []) or [])
+        clip = getattr(canvas, "_selected_clip", None)
+        td = getattr(canvas, "_selected_td", None)
+        if clip is not None and td is not None and all(c is not clip for c, _ in selected):
+            selected.append((clip, td))
+
+        items = []
+        seen = set()
+        for clip, td in selected:
+            kind = getattr(td, "kind", "")
+            if kind not in ("video", "audio", "subtitle") or id(clip) in seen:
+                continue
+            seen.add(id(clip))
+            items.append((clip, kind, max(0, int(getattr(td, "idx", 0)))))
+        return items
+
+    def _on_shortcut_copy_clips(self):
+        """复制选中片段；切换时间线后剪贴板仍然有效。"""
+        focused = QApplication.focusWidget()
+        if self._in_text_field():
+            if hasattr(focused, "copy"):
+                focused.copy()
+            return
+        if not self.isVisible():
+            return
+        selected = self._selected_clip_items()
+        if not selected:
+            self.status_msg.emit("请先选中要复制的视频、音频或字幕片段", "info")
+            return
+
+        anchor = min(float(c.timeline_start) for c, _, _ in selected)
+        self._clip_clipboard = [{
+            "clip": copy.deepcopy(clip),
+            "kind": kind,
+            "track_idx": track_idx,
+            "offset": float(clip.timeline_start) - anchor,
+        } for clip, kind, track_idx in selected]
+        self.status_msg.emit(f"已复制 {len(self._clip_clipboard)} 个片段", "success")
+
+    def _on_shortcut_paste_clips(self):
+        """把内部剪贴板粘贴到当前时间线播放头，冲突时自动增加同类轨道。"""
+        focused = QApplication.focusWidget()
+        if self._in_text_field():
+            if hasattr(focused, "paste"):
+                focused.paste()
+            return
+        if not self.isVisible():
+            return
+        if not self._clip_clipboard:
+            self.status_msg.emit("片段剪贴板为空，请先按 Ctrl+C 复制", "info")
+            return
+
+        canvas = self.timeline_widget._canvas
+        pasted = self.timeline.paste_clips(
+            self._clip_clipboard, self.timeline_widget.get_playhead())
+        if not pasted:
+            return
+
+        # changed 信号已同步重建轨道描述；选中新粘贴内容，便于继续移动/复制。
+        selected_pairs = []
+        for clip, kind, track_idx in pasted:
+            td = next((track for track in canvas._tracks
+                       if track.kind == kind and track.idx == track_idx), None)
+            if td is not None:
+                selected_pairs.append((clip, td))
+            if kind == "audio" and not getattr(clip, "waveform", None):
+                self._start_waveform_worker(clip)
+            if kind == "video":
+                try:
+                    self.preview._ensure_audio_for_video(clip.source_path)
+                except Exception:
+                    pass
+
+        if selected_pairs:
+            first_clip, first_td = selected_pairs[0]
+            canvas._selected_clip = first_clip
+            canvas._selected_td = first_td
+            canvas._selected_track = first_td.kind
+            canvas._marquee_selected = selected_pairs if len(selected_pairs) > 1 else []
+            canvas.selection_changed.emit(first_clip, first_td.kind, first_td.idx)
+        canvas.update()
+        self.status_msg.emit(f"已粘贴 {len(pasted)} 个片段", "success")
 
     def _on_shortcut_delete(self):
         if not self.isVisible() or self._in_text_field():
@@ -1445,6 +1532,8 @@ class EditorTab(QWidget):
         tw.reverse_requested.connect(self._on_reverse)
         tw.subtitle_edit_requested.connect(self._on_subtitle_edit_requested)
         tw.clip_trimmed.connect(self._on_clip_trimmed)
+        tw.copy_requested.connect(self._on_shortcut_copy_clips)
+        tw.paste_requested.connect(self._on_shortcut_paste_clips)
         # 注入 PreviewPlayer 到 TimelineWidget，使其可以控制音频
         tw._preview_player = self.preview
         # 每个时间线独有的 changed 信号（共享对象信号已在 _connect_signals 中一次性连接）
@@ -1473,6 +1562,8 @@ class EditorTab(QWidget):
             (tw.reverse_requested, self._on_reverse),
             (tw.subtitle_edit_requested, self._on_subtitle_edit_requested),
             (tw.clip_trimmed, self._on_clip_trimmed),
+            (tw.copy_requested, self._on_shortcut_copy_clips),
+            (tw.paste_requested, self._on_shortcut_paste_clips),
             # 必须断开旧时间线的 changed 信号，否则跨时间线 pollution
             (tw.tl.changed, self._on_timeline_changed),
             (tw.tl.overlays_changed, self._on_overlays_changed),
@@ -1497,9 +1588,12 @@ class EditorTab(QWidget):
     def _create_tab_button(self, idx: int, name: str, checked: bool) -> QPushButton:
         """创建标签按钮（消除重复代码）"""
         btn = QPushButton(name)
+        btn.setProperty("timeline_index", idx)
         btn.setCheckable(True)
         btn.setChecked(checked)
         btn.setFixedHeight(22)
+        btn.setMaximumWidth(180)
+        btn.setToolTip(name)
         btn.setMouseTracking(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setStyleSheet(TAB_STYLE)
@@ -1511,6 +1605,93 @@ class EditorTab(QWidget):
         btn.mouseDoubleClickEvent = lambda e, b=btn, i=idx: self._rename_timeline_tab(b, i)
         btn.installEventFilter(self)
         return btn
+
+    def _timeline_tab_buttons(self) -> list[QPushButton]:
+        """按时间线顺序返回标签按钮，排除右侧收纳按钮。"""
+        buttons = []
+        for i in range(self._tl_tab_layout.count()):
+            widget = self._tl_tab_layout.itemAt(i).widget()
+            if (isinstance(widget, QPushButton)
+                    and widget.property("timeline_index") is not None):
+                buttons.append(widget)
+        return buttons
+
+    def _clear_timeline_tab_buttons(self):
+        """清空时间线标签，保留 stretch 和右侧列表按钮。"""
+        for btn in self._timeline_tab_buttons():
+            self._tl_tab_layout.removeWidget(btn)
+            btn.removeEventFilter(self)
+            btn.deleteLater()
+
+    def _refresh_timeline_tab_overflow(self):
+        """可用宽度不足时，把多余标签收进右侧列表。"""
+        if not hasattr(self, "_tl_more_btn"):
+            return
+        buttons = self._timeline_tab_buttons()
+        if not buttons:
+            self._tl_more_btn.hide()
+            return
+
+        layout_margins = self._tl_tab_layout.contentsMargins()
+        usable = max(
+            0,
+            self._tl_tab_bar.width()
+            - layout_margins.left() - layout_margins.right(),
+        )
+        spacing = max(0, self._tl_tab_layout.spacing())
+        widths = [max(1, btn.sizeHint().width()) for btn in buttons]
+        all_width = sum(widths) + spacing * max(0, len(buttons) - 1)
+
+        if all_width <= usable:
+            for btn in buttons:
+                btn.show()
+            self._tl_more_btn.hide()
+            return
+
+        self._tl_more_btn.show()
+        budget = max(1, usable - self._tl_more_btn.width() - spacing)
+        active = min(max(0, self._active_tl_idx), len(buttons) - 1)
+
+        # 始终为当前时间线预留位置，剩余空间按原顺序填充。
+        visible = []
+        used = 0
+        active_width = widths[active]
+        for index, width in enumerate(widths):
+            if index == active:
+                continue
+            needed = width + (spacing if visible else 0)
+            reserved = active_width + (spacing if visible else 0)
+            if used + needed + reserved <= budget:
+                visible.append(index)
+                used += needed
+        visible.append(active)
+        visible_set = set(visible)
+        for index, btn in enumerate(buttons):
+            btn.setVisible(index in visible_set)
+
+        hidden_count = len(buttons) - len(visible_set)
+        self._tl_more_btn.setText(f"☰ {hidden_count}")
+        self._tl_more_btn.setToolTip(
+            f"还有 {hidden_count} 条时间线，点击查看列表")
+
+    def _show_timeline_list(self):
+        """在右侧弹出全部时间线列表，可直接切换。"""
+        from PyQt6.QtWidgets import QMenu
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu{background:#222;color:#ddd;border:1px solid #444;}"
+            "QMenu::item{padding:6px 24px 6px 12px;}"
+            "QMenu::item:selected{background:#3d8ef8;color:#fff;}"
+            "QMenu::indicator:checked{background:#3d8ef8;}")
+        for index, btn in enumerate(self._timeline_tab_buttons()):
+            action = menu.addAction(f"{index + 1}.  {btn.text()}")
+            action.setCheckable(True)
+            action.setChecked(index == self._active_tl_idx)
+            action.triggered.connect(
+                lambda _checked=False, i=index: self._switch_timeline(i))
+        menu.exec(self._tl_more_btn.mapToGlobal(
+            self._tl_more_btn.rect().bottomLeft()))
 
     # ─────────────────────────────────────────
     def _on_new_timeline(self):
@@ -1533,12 +1714,13 @@ class EditorTab(QWidget):
         tab_name = name or f"时间线 {len(self._tl_widgets)}"
         btn = self._create_tab_button(idx, tab_name, is_first)
 
-        # 插入到 stretch 之前
+        # 插入到 stretch 之前（最后两项是 stretch + 收纳按钮）
         self._tl_tab_layout.insertWidget(
-            self._tl_tab_layout.count() - 1, btn)
+            self._tl_tab_layout.count() - 2, btn)
 
         if not is_first:
             self._switch_timeline(idx)
+        self._refresh_timeline_tab_overflow()
 
     def _switch_timeline(self, idx: int):
         """切换到指定时间线"""
@@ -1570,10 +1752,8 @@ class EditorTab(QWidget):
         except Exception: pass
 
         # 更新按钮样式
-        for i in range(self._tl_tab_layout.count()):
-            w = self._tl_tab_layout.itemAt(i).widget()
-            if isinstance(w, QPushButton) and w.isCheckable():
-                w.setChecked(i == idx)
+        for btn in self._timeline_tab_buttons():
+            btn.setChecked(btn.property("timeline_index") == idx)
 
         # 切换堆叠
         self._tl_stack.setCurrentIndex(idx)
@@ -1586,6 +1766,7 @@ class EditorTab(QWidget):
 
         # 刷新预览
         self.preview.seek(self.timeline_widget.get_playhead())
+        self._refresh_timeline_tab_overflow()
 
     def _tab_context_menu(self, pos, btn: QPushButton, idx: int):
         """标签右键菜单：重命名、关闭"""
@@ -1613,9 +1794,11 @@ class EditorTab(QWidget):
         name, ok = QInputDialog.getText(self, "重命名", "时间线名称:", text=cur_name)
         if ok and name.strip():
             btn.setText(name.strip())
+            btn.setToolTip(name.strip())
             if idx < len(self._timelines):
                 self._timelines[idx].name = name.strip()
                 self._mark_dirty()
+            self._refresh_timeline_tab_overflow()
 
     def _close_timeline(self, idx: int):
         """关闭指定时间线（至少保留一条）"""
@@ -1645,28 +1828,23 @@ class EditorTab(QWidget):
 
     def _rebuild_tab_bar(self):
         """重建标签栏（关闭/重排时间线后）"""
-        # 清空现有按钮（保留最后的 stretch）
-        while self._tl_tab_layout.count() > 1:
-            w = self._tl_tab_layout.takeAt(0).widget()
-            if w:
-                w.removeEventFilter(self)
-                w.deleteLater()
+        self._clear_timeline_tab_buttons()
         # 重建按钮
         for i in range(len(self._timelines)):
             tl = self._timelines[i]
             tl_name = tl.name if tl.name else f"时间线 {i + 1}"
             btn = self._create_tab_button(i, tl_name, i == self._active_tl_idx)
             self._tl_tab_layout.insertWidget(
-                self._tl_tab_layout.count() - 1, btn)
+                self._tl_tab_layout.count() - 2, btn)
+        self._refresh_timeline_tab_overflow()
 
     def _calc_drop_target(self, x: int) -> int:
         """根据鼠标 X 坐标计算拖拽落点索引"""
-        for i in range(self._tl_tab_layout.count()):
-            w = self._tl_tab_layout.itemAt(i).widget()
-            if isinstance(w, QPushButton) and w.isCheckable():
-                rect = w.geometry()
+        for btn in self._timeline_tab_buttons():
+            if not btn.isHidden():
+                rect = btn.geometry()
                 if x < rect.center().x():
-                    return i
+                    return int(btn.property("timeline_index"))
         # 落在所有标签右边 → 最后一个位置
         return len(self._timelines) - 1
 
@@ -1750,6 +1928,10 @@ class EditorTab(QWidget):
         """拦截整个应用内的按键事件 + 标签栏拖拽排序 + 预览退出"""
         from PyQt6.QtCore import QEvent
 
+        if obj is getattr(self, "_tl_tab_bar", None) and event.type() == QEvent.Type.Resize:
+            # 等布局完成本次尺寸分配后再计算溢出，避免反复抖动。
+            QTimer.singleShot(0, self._refresh_timeline_tab_overflow)
+
         # ── 字幕编辑中按 Escape 全局退出（即使焦点不在画布上）──
         if (event.type() == QEvent.Type.KeyPress
                 and event.key() == Qt.Key.Key_Escape
@@ -1778,13 +1960,10 @@ class EditorTab(QWidget):
         if isinstance(obj, QPushButton) and obj.isCheckable() and obj.parent() is self._tl_tab_bar:
             if event.type() == QEvent.Type.MouseButtonPress and event.button() == Qt.MouseButton.LeftButton:
                 # 记录起始位置，但不消耗事件（让按钮保持正常 press/click 行为）
-                for i in range(self._tl_tab_layout.count()):
-                    if self._tl_tab_layout.itemAt(i).widget() is obj:
-                        self._drag_source_idx = i
-                        self._drag_btn = obj
-                        self._drag_offset_x = event.position().x()
-                        self._drag_started = False
-                        break
+                self._drag_source_idx = int(obj.property("timeline_index"))
+                self._drag_btn = obj
+                self._drag_offset_x = event.position().x()
+                self._drag_started = False
                 return False
             elif event.type() == QEvent.Type.MouseMove and self._drag_btn is obj:
                 if not getattr(self, '_drag_started', False):
@@ -1902,7 +2081,7 @@ class EditorTab(QWidget):
         self.preview._last_raw_img = None
         self.preview._last_raw_overlays = []
         self.preview.seek(self.timeline_widget.get_playhead(), force=True)
-        # 同步素材库「已添加/未添加」角标
+        # 同步素材库“时间线中”角标；未使用的素材不显示角标。
         try:
             self.media_lib.refresh_statuses(self._paths_on_timeline())
         except Exception:
@@ -3156,7 +3335,12 @@ class EditorTab(QWidget):
     def _on_ai_error(self, msg: str):
         """AI 操作错误回调"""
         self._clear_ai_progress()
+        logging.error("AI operation failed: %s", msg)
         self.status_msg.emit(msg, "error")
+        # 主窗口目前只会把 status_msg 打印到控制台。AI 任务通常由按钮直接触发，
+        # 因此必须给出可见反馈，否则缺依赖/模型加载失败会表现成“点击没反应”。
+        first_line = (msg or "未知错误").splitlines()[0][:300]
+        QMessageBox.warning(self, "AI 处理失败", first_line)
 
     def _clear_ai_progress(self):
         """隐藏 AI 进度条"""
@@ -3395,10 +3579,12 @@ class EditorTab(QWidget):
         if clip.duration < 0.6:
             QMessageBox.information(self, "智能分镜", "片段太短，无需继续截开。")
             return
-        dialog = SceneDetectDialog(clip.duration, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        config = dialog.config()
+        # 点击即开始：固定使用“灵敏”预设，不再弹出参数确认窗。
+        config = {
+            "threshold": SENSITIVE_SCENE_THRESHOLD,
+            "min_length": min(0.8, max(0.3, clip.duration / 2)),
+            "filter_flashes": True,
+        }
         self._scene_detect_clip = clip
         self._stop_ai_worker()
         worker = _SceneDetectWorker(clip, **config)
@@ -3425,8 +3611,8 @@ class EditorTab(QWidget):
             return
         if not cuts:
             QMessageBox.information(
-                self, "智能分镜", "没有检测到足够明显的画面跳变。\n\n"
-                "可以重新检测并选择“灵敏”，或降低自定义阈值。")
+                self, "智能分镜", "已使用灵敏模式分析，"
+                "但没有检测到可用的画面跳变。")
             self.status_msg.emit("智能分镜：未检测到有效切点", "info")
             return
         if len(cuts) > 100:
@@ -3510,6 +3696,19 @@ class EditorTab(QWidget):
         if not audio:
             QMessageBox.warning(self, "错误", "找不到音频文件"); return
 
+        # Whisper 在独立子进程中运行，但使用的仍是当前解释器环境。启动线程前
+        # 先检查依赖，避免按钮点击后线程瞬间退出、错误只落到控制台。
+        import importlib.util
+        if importlib.util.find_spec("whisper") is None:
+            message = (
+                "当前程序环境没有安装语音识别组件 openai-whisper，"
+                "因此无法开始文字粗剪。\n\n"
+                "请先安装项目依赖后重启工作台。"
+            )
+            self.status_msg.emit(message, "error")
+            QMessageBox.warning(self, "语音识别不可用", message)
+            return
+
         self.status_msg.emit(f"识别中：{Path(audio).name}…", "info")
         self._stop_ai_worker()  # 安全停止旧 Worker
         w = _ASRWorker(audio)
@@ -3517,6 +3716,8 @@ class EditorTab(QWidget):
         w.finished.connect(self._on_asr_done)
         w.error.connect(lambda e: self._on_ai_error(f"识别失败: {e[:80]}"))
         self._ai_worker = w
+        self._on_ai_progress(
+            5, "正在启动语音识别（首次使用需下载 Whisper 模型）…")
         w.start()
 
     def _on_asr_done(self, entries):
@@ -3842,11 +4043,8 @@ class EditorTab(QWidget):
         self._timelines.clear()
         self._tl_widgets.clear()
 
-        # 重建标签栏
-        while self._tl_tab_layout.count() > 1:
-            w = self._tl_tab_layout.takeAt(0).widget()
-            if w:
-                w.deleteLater()
+        # 重建标签栏，保留右侧收纳列表按钮。
+        self._clear_timeline_tab_buttons()
 
         # 加载时间线
         tl_dicts = data.get("timelines", [])
@@ -3862,7 +4060,7 @@ class EditorTab(QWidget):
             tab_name = tl.name if tl.name else f"时间线 {i + 1}"
             btn = self._create_tab_button(i, tab_name, False)
             self._tl_tab_layout.insertWidget(
-                self._tl_tab_layout.count() - 1, btn)
+                self._tl_tab_layout.count() - 2, btn)
 
         if not self._timelines:
             # 无内容时创建默认时间线
@@ -3892,6 +4090,8 @@ class EditorTab(QWidget):
         ml_paths = data.get("media_library", [])
         if ml_paths:
             self.media_lib.clear_and_load_paths(ml_paths)
+            # 工程打开时立即恢复轨道使用状态，无需等用户再次添加/删除片段。
+            self.media_lib.refresh_statuses(self._paths_on_timeline())
 
         # 恢复分隔条布局
         st = data.get("splitter_top")
@@ -3910,10 +4110,10 @@ class EditorTab(QWidget):
         self._switch_timeline(min(active, len(self._timelines) - 1))
         self._rebuild_tab_bar()
         # 更新所有标签按钮为当前状态
-        for i in range(self._tl_tab_layout.count()):
-            w = self._tl_tab_layout.itemAt(i).widget()
-            if isinstance(w, QPushButton) and w.isCheckable():
-                w.setChecked(i == self._active_tl_idx)
+        for btn in self._timeline_tab_buttons():
+            btn.setChecked(
+                btn.property("timeline_index") == self._active_tl_idx)
+        self._refresh_timeline_tab_overflow()
 
         # 恢复播放头位置
         ph = data.get("playhead", 0)
@@ -4101,7 +4301,10 @@ class EditorTab(QWidget):
 
         if not has_video and has_audio:
             # ── 纯音频导出 ──
-            dlg = AudioExportDialog(self)
+            proj_name = self._project_name if self._project_name != "未命名工程" else ""
+            project_dir = os.path.dirname(self._project_path) if self._project_path else ""
+            dlg = AudioExportDialog(
+                self, default_name=proj_name, default_directory=project_dir)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 self._exporting = False
                 return
@@ -4130,7 +4333,10 @@ class EditorTab(QWidget):
         # 根据画布比例计算推荐分辨率
         canvas_size = self._get_canvas_resolution()
         proj_name = self._project_name if self._project_name != "未命名工程" else ""
-        dlg = ExportDialog(self, canvas_size=canvas_size, default_name=proj_name)
+        project_dir = os.path.dirname(self._project_path) if self._project_path else ""
+        dlg = ExportDialog(
+            self, canvas_size=canvas_size, default_name=proj_name,
+            default_directory=project_dir)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             self._exporting = False
             return

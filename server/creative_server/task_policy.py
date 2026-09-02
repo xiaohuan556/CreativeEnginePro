@@ -23,6 +23,7 @@ MINIMUM_CREDITS = {
     "text_to_video": 60,
     "image_to_video": 60,
     "continue_video": 60,
+    "video_edit": 60,
     "text_to_speech": 1,
     "image": 10,
     "video": 60,

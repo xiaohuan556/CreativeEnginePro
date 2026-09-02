@@ -474,11 +474,13 @@ class PreviewPlayer(QWidget):
         # 后台线程存放 overlay raw 数据 [(clip, ("image"|"video", data), w, h)]
         self._pending_raw_overlays: list = []
         self._frame_lock = threading.Lock()
-        # ── Phase 1：帧缓存环（解码预读 + 回拖命中，避免重复 decode）──
+        # ── Phase 1：帧缓存环（已合成帧的短回看窗口）──
         # key = round(sec, 3)；value = 完整帧载荷 dict（主帧+叠加+字幕+转场）
         self._payload_ring: "OrderedDict[float, dict]" = OrderedDict()
         self._payload_ring_max = 8            # 环容量（约 0.27s@30fps 的回放窗口）
-        # 领先解码帧数；须 >= 解码器 _FILL_AHEAD(12)。
+        # 领先解码只发生在 ClipDecoder 的轻量原始帧缓存中。这里保留该值作为
+        # “播放态”请求标记，绝不能据此提前完整合成字幕/叠加轨未来帧；旧实现
+        # 每 tick 合成 12 个未来帧，却只有 8 帧成品缓存，当前帧会被反向挤掉。
         self._decode_ahead_frames = 12
                                              # 太小(原=1)→切片段时新 clip 窗口未预取→整 tick 走 seek+预填(93ms)
                                              # → 播放头前跳。与解码器预填窗口对齐后 bench 实测切段 tick 93ms→9ms。
@@ -566,6 +568,9 @@ class PreviewPlayer(QWidget):
         # 多路音频播放器：每个 slot 对应一条音源（视频轨/音频轨各独立）
         self._audio_players: list = []
         self._audio_sources: dict = {}   # slot → 当前 setSource 的路径
+        self._audio_rates: dict = {}     # slot → 当前实际播放倍速（避免同源切片沿用旧倍速）
+        # slot 0 当前真正启动的片段时间映射；播放器给出的是源文件时间。
+        self._audio_clock_map = None      # (timeline_start, trim_start, speed)
         self._audio_pending: dict = {}   # slot → (ms, rate) 待 seek 参数
         # 向后兼容：保留 _audio_player 指向第0个 player
         self._audio_player = None
@@ -924,7 +929,7 @@ class PreviewPlayer(QWidget):
         if not os.path.exists(source_path):
             logging.debug("play_audio: source not found %s", source_path)
             return False
-        player, _ = self._ensure_audio_player(slot)
+        player, output = self._ensure_audio_player(slot)
         if player is None:
             logging.debug("play_audio: no player available (slot=%d)", slot)
             return False
@@ -939,7 +944,14 @@ class PreviewPlayer(QWidget):
         # 应用音量（clip.volume 范围 0~2，限制到播放器 0~1）
         vol = max(0.0, min(2.0, float(volume)))
         try:
-            player.setVolume(vol)
+            # Qt6 moved volume control from QMediaPlayer to QAudioOutput.
+            # The subprocess compatibility player still exposes setVolume(),
+            # so support both APIs here instead of silently leaving Qt at an
+            # unknown volume.
+            if hasattr(player, 'setVolume'):
+                player.setVolume(vol)
+            elif output is not None:
+                output.setVolume(min(1.0, vol))
         except Exception:
             pass
 
@@ -947,6 +959,9 @@ class PreviewPlayer(QWidget):
             ms = int(offset_sec * 1000)
             dur_ms = int(duration_sec * 1000) if duration_sec > 0 else 0
             last_src = self._audio_sources.get(slot)
+            rate = max(0.25, min(4.0, float(rate)))
+            last_rate = float(self._audio_rates.get(slot, 1.0))
+            rate_changed = abs(last_rate - rate) > 0.001
 
             if last_src == actual_source:
                 # 同文件（如视频截断后的相邻片段）—
@@ -954,38 +969,67 @@ class PreviewPlayer(QWidget):
                 # 不重启进程：单进程连续输出 PCM 流天然无间隙。
                 # 兜底：若 ffplay 已意外退出则重启。
                 if player.playbackState() != player.__class__.PlaybackState.PlayingState:
-                    player.setDuration(dur_ms)
+                    if hasattr(player, 'setDuration'):
+                        player.setDuration(dur_ms)
                     player.setPosition(ms)
-                    if rate != 1.0:
-                        player.setPlaybackRate(rate)
-                    player.play(fade_in, fade_out, duration_sec)
+                    player.setPlaybackRate(rate)
+                    if isinstance(player, _AudioPlayerSD):
+                        player.play(fade_in, fade_out, duration_sec)
+                    else:
+                        player.play()
                 else:
-                    player.setDuration(dur_ms + 500)
-                    player.setPosition(ms)
-                    if rate != 1.0:
+                    if hasattr(player, 'setDuration'):
+                        player.setDuration(dur_ms + 500)
+                    if isinstance(player, _AudioPlayerSD):
+                        # 子进程播放时 setPosition/setPlaybackRate 只改元数据，无法
+                        # 改变已启动的 ffplay。倍速变化或非连续裁剪必须无缝重启。
+                        try:
+                            source_clock = player.audio_clock_sec()
+                        except Exception:
+                            source_clock = offset_sec
+                        discontinuous = abs(source_clock - offset_sec) > 0.12
+                        if rate_changed or discontinuous:
+                            player.seamless_position(ms, dur_ms, rate)
+                    else:
+                        # Qt 后端支持运行中改倍速；即使回到 1x 也必须显式设置，
+                        # 否则同一素材上一片段的 2x 会“粘”到下一片段。
                         player.setPlaybackRate(rate)
-                # 已在播放 → 不调 play/seamless_position，避免重启引入间隙
+                        try:
+                            source_clock = player.position() / 1000.0
+                        except Exception:
+                            source_clock = offset_sec
+                        if abs(source_clock - offset_sec) > 0.12:
+                            player.setPosition(ms)
+                # 连续同速片段保持原进程；仅倍速变化/非连续裁剪做无缝切换。
             else:
                 # 不同文件 — 也尝试无缝切换：先设好新源参数，启动新进程，
                 # 再杀旧进程。只有在旧进程正在播放时才走无缝路径。
                 if player.playbackState() == player.__class__.PlaybackState.PlayingState:
                     player.stop()  # 先停旧源（此处仍有微小间隙，但跨文件不可避）
-                player.setDuration(dur_ms)
+                if hasattr(player, 'setDuration'):
+                    player.setDuration(dur_ms)
                 player.setSource(QUrl.fromLocalFile(actual_source))
                 self._audio_sources[slot] = actual_source
-                if rate != 1.0:
-                    player.setPlaybackRate(rate)
+                player.setPlaybackRate(rate)
                 player.setPosition(ms)
-                player.play(fade_in, fade_out, duration_sec)
+                if isinstance(player, _AudioPlayerSD):
+                    player.play(fade_in, fade_out, duration_sec)
+                else:
+                    # QMediaPlayer.play() takes no arguments.  Passing the
+                    # subprocess-only fade/duration arguments raises TypeError
+                    # before playback starts, which made the editor silent on
+                    # every standard installation without sounddevice.
+                    player.play()
                 # 异步加载后延迟再设一次位置
 
                 def _retry_seek(p=player, m=ms):
                     try:
-                        if p.isAvailable():
+                        if not hasattr(p, 'isAvailable') or p.isAvailable():
                             p.setPosition(m)
                     except Exception:
                         pass
                 QTimer.singleShot(100, _retry_seek)
+            self._audio_rates[slot] = rate
             return True
         except Exception as e:
             logging.debug("play_audio failed slot=%d path=%s: %s",
@@ -1008,12 +1052,15 @@ class PreviewPlayer(QWidget):
         """停止音频。slot=-1 停止所有，否则停止指定 slot"""
         if slot == -1:
             self._audio_pending.clear()
+            self._audio_clock_map = None
             for player, _ in self._audio_players:
                 if player:
                     try:
                         player.stop()
                     except Exception: import traceback; traceback.print_exc()
         else:
+            if slot == 0:
+                self._audio_clock_map = None
             if slot < len(self._audio_players):
                 player, _ = self._audio_players[slot]
                 if player:
@@ -1125,6 +1172,21 @@ class PreviewPlayer(QWidget):
         """
         active_slots, total_slots = self._collect_active_audio(sec)
 
+        # 固定 slot 0 实际对应的片段。跨倍速/跳剪边界时，预览位置和播放器
+        # position 可能各滞后一拍；不能根据 _current_sec 临时猜测时钟映射。
+        clock_map = None
+        if 0 in active_slots and getattr(self.tl, 'video_tracks', None):
+            for clip in self.tl.video_tracks[0]:
+                if (getattr(clip, 'visible', True)
+                        and not getattr(clip, 'mute', False)
+                        and clip.timeline_start <= sec < clip.timeline_end):
+                    clock_map = (
+                        float(clip.timeline_start),
+                        float(clip.trim_start),
+                        max(float(getattr(clip, 'speed', 1.0) or 1.0), 0.01),
+                    )
+                    break
+
         # ── 第二阶段：播放活跃 slot，停止非活跃 slot ──
         max_slot = max(total_slots, max(active_slots.keys()) + \
                        1) if active_slots else total_slots
@@ -1146,6 +1208,7 @@ class PreviewPlayer(QWidget):
         for s in range(max_slot, len(self._audio_players)):
             self.stop_audio(s)
             self._audio_pending.pop(s, None)
+        self._audio_clock_map = clock_map
 
     def _retry_ready_audio(self, source_path: str):
         """后台转码完成后，从当前播放头补启该素材对应的未启动音轨。"""
@@ -1231,8 +1294,40 @@ class PreviewPlayer(QWidget):
         players = getattr(self, '_audio_players', [])
         if len(players) > 0:
             p0 = players[0][0]
-            if p0 is not None and p0.is_playing():
-                return p0.audio_clock_sec()
+            # Both QMediaPlayer and the subprocess compatibility player expose
+            # playbackState().  Their clocks differ: the fallback calculates
+            # its own clock while Qt reports the current position in ms.
+            if (p0 is not None and
+                    p0.playbackState() == p0.PlaybackState.PlayingState):
+                if hasattr(p0, 'audio_clock_sec'):
+                    source_clock = p0.audio_clock_sec()
+                elif hasattr(p0, 'position'):
+                    source_clock = p0.position() / 1000.0
+                else:
+                    return None
+
+                # 播放器时钟是“源文件时间”。时间轴需要的是“成片时间”：
+                # 2x 片段的源时钟每秒前进 2 秒，但时间轴仍只能前进 1 秒。
+                # 旧代码直接返回 source_clock，随后预览取帧又乘一次 clip.speed，
+                # 导致倍速被重复应用（2x 接近按 4x 取帧），产生明显跳帧卡顿。
+                clock_map = getattr(self, '_audio_clock_map', None)
+                if clock_map is not None:
+                    timeline_start, trim_start, speed = clock_map
+                    return (timeline_start
+                            + (float(source_clock) - trim_start) / speed)
+
+                # 兼容直接注入播放器/旧调用方：无显式映射时再按当前位置推断。
+                tracks = getattr(self.tl, 'video_tracks', []) or []
+                if tracks:
+                    for clip in tracks[0]:
+                        if (getattr(clip, 'visible', True)
+                                and not getattr(clip, 'mute', False)
+                                and clip.timeline_start <= self._current_sec < clip.timeline_end):
+                            speed = max(float(getattr(clip, 'speed', 1.0) or 1.0), 0.01)
+                            return (float(clip.timeline_start)
+                                    + (float(source_clock) - float(clip.trim_start)) / speed)
+                # 兼容直接调用 play_audio() 的场景（不依附视频时间线）。
+                return source_clock
         return None
 
     # ─── 主接口：接收播放头位置 ───
@@ -1244,10 +1339,16 @@ class PreviewPlayer(QWidget):
         if same_pos and not force:
             self._recompose_overlays()
             return
-        self._last_frame_image = None  # 清除帧缓存，确保 seek 后显示正确画面
-        self._last_frame_no_subs = None  # 同步清除无字幕底图，防止 _subtitle_base_canvas 复用过期帧
-        self._last_raw_img = None       # 同步清除原始帧缓存
-        self._last_raw_overlays = []
+        # 时间轴拖动/裁剪会高频 seek。旧请求可能在片段边界已经改变后才完成，
+        # 暂时返回“此处无片段”；若这里提前清掉最后有效帧，刷新器就会闪回
+        # “拖入视频预览”占位画面。scrubbing 期间采用 hold-last-frame：
+        # 新帧原子到达后自然覆盖，真正删除/普通跳转仍清缓存保证正确性。
+        hold_last_frame = (self._decode_state == "scrubbing" and not force)
+        if not hold_last_frame:
+            self._last_frame_image = None  # 清除帧缓存，确保 seek 后显示正确画面
+            self._last_frame_no_subs = None  # 同步清除无字幕底图，防止复用过期帧
+            self._last_raw_img = None       # 同步清除原始帧缓存
+            self._last_raw_overlays = []
         if force:
             # 强制刷新时清除帧缓存环中当前位置的旧帧，
             # 避免 _flush_frame 回退到过期帧（如删除片段后残留画面）
@@ -1633,25 +1734,17 @@ class PreviewPlayer(QWidget):
         """后台线程入口（由 _fetch_loop 调用）：
         1. 计算 sec 处完整载荷并写入 _pending_raw*（write_pending=True）；
         2. 把该载荷按 round(sec,3) 存入帧缓存环；
-        3. 若 ahead>0 且正在播放，领先解码 [sec+1/fps .. sec+ahead/fps] 窗口帧，
-           仅入环（write_pending=False），实现 decode-ahead，消除播放卡顿。"""
+        3. 原始视频的 decode-ahead 由 ClipDecoder.request() 完成；这里每个请求
+           只合成一个真正要显示的帧，避免对字幕、绿幕和叠加轨做无效预渲染。
+
+        ``ahead`` 为兼容旧队列项保留。它只代表播放态，不再触发未来成品帧合成。
+        """
         payload = self._compute_payload(sec, write_pending=True)
         if payload is not None and payload.get('raw') is not None:
             with self._frame_lock:
                 self._payload_ring[self._ring_key(sec)] = payload
                 while len(self._payload_ring) > self._payload_ring_max:
                     self._payload_ring.popitem(last=False)
-        # decode-ahead：仅入环，不写 _pending_raw，避免污染主消费路径
-        if ahead and self._playing and payload is not None and payload.get('raw') is not None:
-            fps = getattr(self.tl, 'fps', 30) or 30
-            for i in range(1, int(ahead) + 1):
-                s = sec + i / fps
-                p2 = self._compute_payload(s, write_pending=False)
-                if p2 is not None and p2.get('raw') is not None:
-                    with self._frame_lock:
-                        self._payload_ring[self._ring_key(s)] = p2
-                        while len(self._payload_ring) > self._payload_ring_max:
-                            self._payload_ring.popitem(last=False)
 
     def _ring_key(self, sec: float) -> float:
         """帧缓存环的 key：毫秒精度，与 _flush_frame 用 _current_sec 查环对齐。"""
@@ -1884,7 +1977,14 @@ class PreviewPlayer(QWidget):
                     # ── 非 alpha 视频：走状态机解码器（连续 read + 窗口缓存，根除每帧 seek）──
                     dec = self._decoders.get(clip)
                     if dec is not None:
-                        _ahead = 5 if (self._playing and write_pending) else 1
+                        # 只预读“原始解码帧”，不预合成未来画面。按源帧率和倍速
+                        # 估算下一时间轴 tick 的源帧跨度；高速片段也能连续命中 ring。
+                        if self._playing and write_pending:
+                            source_step = (float(dec.fps or 30.0) / 30.0
+                                           * max(float(clip.speed or 1.0), 0.01))
+                            _ahead = max(3, min(16, int(source_step + 0.999) + 2))
+                        else:
+                            _ahead = 1
                         res = dec.request(
                             src_sec, self._decode_state, ahead_frames=_ahead)
                         if res is not None:
@@ -2015,7 +2115,12 @@ class PreviewPlayer(QWidget):
                                 else:
                                     res_o = None
                             else:
-                                _ov_ahead = 5 if (self._playing and write_pending) else 1
+                                if self._playing and write_pending:
+                                    source_step = (float(dec_o.fps or 30.0) / 30.0
+                                                   * max(float(oc.speed or 1.0), 0.01))
+                                    _ov_ahead = max(3, min(16, int(source_step + 0.999) + 2))
+                                else:
+                                    _ov_ahead = 1
                                 res_o = dec_o.request(src_o, self._decode_state, ahead_frames=_ov_ahead)
                             if res_o is not None:
                                 o_rgb, w, h = res_o
@@ -2104,15 +2209,17 @@ class PreviewPlayer(QWidget):
                 self._stall_count = 0
 
             self._flush_frame()
-            # 自适应刷新率：播放/拖拽/缩放/内联编辑 → 8ms；空闲 → 200ms
-            is_busy = (getattr(self, '_playing', False)
-                       or getattr(self, '_preview_active', False)
-                       or self._sub_interaction is not None
-                       or self._resize_handle is not None
-                       or self._rotation_active
-                       or self._dragging_video is not None
-                       or getattr(self, '_editing_sub', None) is not None)
-            target = 8 if is_busy else self._refresh_timeout_idle
+            # 自适应刷新率：直接操控保持 8ms 跟手；普通播放 16ms 已足够承接
+            # 24/30/60fps 帧，同时把主线程空轮询从 120Hz 降到 60Hz。
+            is_interacting = (self._sub_interaction is not None
+                              or self._resize_handle is not None
+                              or self._rotation_active
+                              or self._dragging_video is not None
+                              or getattr(self, '_editing_sub', None) is not None)
+            is_playback = (getattr(self, '_playing', False)
+                           or getattr(self, '_preview_active', False))
+            target = (8 if is_interacting else
+                      16 if is_playback else self._refresh_timeout_idle)
             if self._refresh_timer.interval() != target:
                 self._refresh_timer.setInterval(target)
         except Exception:

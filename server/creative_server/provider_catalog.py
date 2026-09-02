@@ -31,9 +31,17 @@ def available_providers() -> list[dict]:
         ])
     if getattr(config, "SEEDREAM_API_KEY", ""):
         seedance_default = "doubao-seedance-2-0-260128" if str(getattr(config, "SEEDREAM_API_KEY", "")).startswith("ark-") else "doubao-seedance-2.0"
+        try:
+            from ai.providers.video.seedance_models import seedance_model_profile, seedance_models_payload
+            seedance_models = seedance_models_payload()
+        except Exception:
+            seedance_models = []
+            seedance_model_profile = lambda _model: {"reference_assets": 9}
+        selected_seedance_model = str(os.environ.get("SEEDANCE_MODEL") or seedance_default)
+        selected_seedance_profile = seedance_model_profile(selected_seedance_model)
         result.extend([
             {"name": "seedream", "capabilities": ["text_to_image", "image_edit"], "profile": {"reference_assets": 10, "model": _configured_model("seedream", "SEEDREAM_MODEL", "doubao-seedream-5-0-pro-260628")}},
-            {"name": "seedance", "capabilities": ["text_to_video", "image_to_video"], "profile": {"reference_assets": 9, "native_audio": True, "model": str(os.environ.get("SEEDANCE_MODEL") or seedance_default)}},
+            {"name": "seedance", "capabilities": ["text_to_video", "image_to_video", "video_edit"], "profile": {"reference_assets": int(selected_seedance_profile.get("reference_assets") or 9), "native_audio": True, "model": selected_seedance_model, "models": seedance_models}},
         ])
     try:
         from api_config import get as api_get

@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
 from ai.providers.base import TaskRequest
 from ai.service import get_ai_manager
 from ai.storyboard import extract_json
+from utils.app_paths import work_root
 
 
 ANNOTATION_TYPES = {
@@ -619,7 +620,7 @@ class HanddrawStoryboardDialog(QDialog):
 
     def _folder(self):
         board_id = str(self.board.get("id") or "untitled")
-        folder = Path.cwd() / "data" / "storyboard_sketches" / board_id
+        folder = work_root() / "storyboard_sketches" / board_id
         folder.mkdir(parents=True, exist_ok=True); return folder
 
     def export_current(self):

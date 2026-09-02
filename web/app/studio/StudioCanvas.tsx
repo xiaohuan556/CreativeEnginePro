@@ -47,6 +47,20 @@ type WorkflowTemplate = { id: string; name: string; definition: { nodes?: Studio
 type ProjectSummary = { id: string; title: string; version: number; owner_id?: string; updated_at?: string; updatedAt?: string | number };
 type SyncedProjectDraft = { title: string; nodes: StudioNode[]; edges: Edge[] };
 
+function chineseGenerationError(error?: string) {
+  const raw = String(error || "").trim();
+  if (!raw) return "";
+  const lowered = raw.toLowerCase();
+  if (lowered.includes("moderation_blocked") || lowered.includes("safety system") || lowered.includes("content policy") || lowered.includes("safety policy")) {
+    const requestId = raw.match(/request(?:\s+id)?[ '\":：]+([a-z0-9-]{12,})/i)?.[1];
+    return `图片请求未通过安全审核。请检查提示词和参考图，调整可能涉及敏感内容的描述后重试。${requestId ? ` 请求编号：${requestId}` : ""}`;
+  }
+  if (/\b(?:502|503|504)\b/.test(lowered) || lowered.includes("gateway timeout") || lowered.includes("service unavailable") || lowered.includes("upstream timed out")) {
+    return "AI 服务暂时不可用或响应超时，请稍后重试。";
+  }
+  return raw;
+}
+
 const kindIcons: Record<StudioNodeKind, typeof Sparkles> = {
   project: Clapperboard,
   storyboard: Sparkles,
@@ -691,7 +705,7 @@ function CanvasApp() {
       setNodes((current) => current.map((node) => node.id === group.id ? { ...node, data: { ...node.data, status: data.run.status === "completed" ? "工作流完成" : data.run.status === "paused" ? "工作流已暂停" : data.run.status === "failed" ? "工作流失败" : `顺序执行 · ${data.run.current_index + 1}/${data.run.total_items}`, progress: data.run.progress, desktopPayload: { ...(node.data.desktopPayload || {}), workflow_run_id: runId, workflow_status: data.run.status } } } : node));
       if (["completed", "failed", "paused", "cancelled"].includes(data.run.status)) {
         for (const childId of Array.isArray(group.data.desktopPayload?.group_nodes) ? group.data.desktopPayload.group_nodes.map(String) : []) await mergeServerResult(childId);
-        setNotice(data.run.error_message || (data.run.status === "completed" ? "工作流已完成，所有结果已写回画布" : `工作流：${data.run.status}`)); return;
+        setNotice(chineseGenerationError(data.run.error_message) || (data.run.status === "completed" ? "工作流已完成，所有结果已写回画布" : `工作流：${data.run.status}`)); return;
       }
     }
   }
@@ -913,7 +927,7 @@ function CanvasApp() {
           return { ...node, data: { ...node.data, status: data.task.status === "completed" ? "生成完成" : data.task.status === "failed" ? "生成失败" : `AI 制片中 · ${data.task.progress}%`, progress: data.task.progress, desktopPayload: { ...(node.data.desktopPayload || {}), ...(output.asset_ids ? { output_asset_ids: output.asset_ids } : {}), ...(output.analysis ? { analysis_result: output.analysis } : {}) } } };
         }));
         if (data.task.status === "completed") { await new Promise((resolve) => window.setTimeout(resolve, 200)); await mergeServerResult(nodeId); setNotice("生成完成，结果已写回画布节点"); return; }
-        if (["failed", "cancelled"].includes(data.task.status)) { await mergeServerResult(nodeId); setNotice(data.task.error_message || "任务已停止"); return; }
+        if (["failed", "cancelled"].includes(data.task.status)) { await mergeServerResult(nodeId); setNotice(chineseGenerationError(data.task.error_message) || "任务已停止"); return; }
       } catch { return; }
     }
   }
@@ -925,7 +939,7 @@ function CanvasApp() {
       if (!response.ok) return;
       const data = await response.json() as { run: { status: string; stage: number; stage_name: string; completed_stage: number; active_task_id?: string; error_message?: string } };
       setNodes((current) => current.map((node) => node.id === nodeId ? { ...node, data: { ...node.data, status: data.run.status === "waiting_review" ? `等待确认 · ${data.run.stage_name}` : data.run.status === "complete" ? "全流程完成" : data.run.status === "paused" ? "流程已暂停" : data.run.status === "failed" ? "阶段失败" : `AI 制片中 · ${data.run.stage}/7`, progress: Math.round(data.run.completed_stage / 7 * 100), desktopPayload: { ...(node.data.desktopPayload || {}), production_run_id: runId, pipeline_stage: data.run.stage, production_completed_stage: data.run.completed_stage, production_status: data.run.status } } } : node));
-      if (["waiting_review", "complete", "paused", "failed"].includes(data.run.status)) { await mergeServerResult(nodeId); setNotice(data.run.error_message || (data.run.status === "waiting_review" ? "到达确认节点：审片通过或接受风险后才会继续" : `制片流程：${data.run.status}`)); return; }
+      if (["waiting_review", "complete", "paused", "failed"].includes(data.run.status)) { await mergeServerResult(nodeId); setNotice(chineseGenerationError(data.run.error_message) || (data.run.status === "waiting_review" ? "到达确认节点：审片通过或接受风险后才会继续" : `制片流程：${data.run.status}`)); return; }
     }
   }
 
@@ -1169,7 +1183,7 @@ function CanvasApp() {
   return (
     <main className="studio-shell">
       <header className="topbar">
-        <div className="brand-mark"><Clapperboard size={18} /></div>
+        <div className="brand-mark" role="img" aria-label="AI 无限画布" />
         <div className="project-heading">
           <strong>AI 无限画布</strong><span className="project-separator">/</span>
           <button className="project-name" aria-expanded={projectMenuOpen} onClick={() => setProjectMenuOpen((value) => !value)}>{projectTitle} <ChevronDown size={14} /></button>
@@ -1219,7 +1233,7 @@ function CanvasApp() {
             {contextMenu.nodeId ? <>{(() => { const node = nodes.find((item) => item.id === contextMenu.nodeId); if (!node) return null; const hasMedia = Boolean(node.data.desktopPayload?.asset_id || (Array.isArray(node.data.desktopPayload?.output_asset_ids) && node.data.desktopPayload.output_asset_ids.length)); return <><button disabled={!hasMedia} onClick={() => { setContextMenu(null); void saveContextNodeToLibrary(node.id); }}><PackagePlus size={15} />保存到我的资产</button><button onClick={() => { void navigator.clipboard.writeText(node.data.description); setContextMenu(null); setNotice("节点文字已复制"); }}><ClipboardCopy size={15} />复制文字</button><button onClick={() => { duplicateNode(node.id); setContextMenu(null); }}><Copy size={15} />复制节点</button><span className="context-menu-divider" /><button className="is-danger" onClick={() => { setSelectedId(""); setNodes((current) => current.filter((item) => item.id !== node.id)); setEdges((current) => current.filter((edge) => edge.source !== node.id && edge.target !== node.id)); setContextMenu(null); }}><Trash2 size={15} />删除</button></>; })()}</> : <><button onClick={() => { arrangeCanvas(); setContextMenu(null); }}><LayoutGrid size={15} />优化工作流布局</button><button onClick={() => { importInputRef.current?.click(); setContextMenu(null); }}><Import size={15} />导入素材</button></>}
           </div>}
           {selectedNodeIds.length > 0 && <div className="selection-toolbar"><span>已选择 {selectedNodeIds.length} 个节点</span>{canWrite && <button onClick={deleteSelectedNodes}><Trash2 size={15} /> 删除</button>}</div>}
-          {sideView !== "canvas" && <aside className="canvas-side-panel"><header><div><strong>{sideView === "assets" ? "资产库副本" : "公司任务队列"}</strong><span>{sideView === "assets" ? "只有主动保存的媒体才进入这里" : "查看生成进度、失败原因并阻止重复提交"}</span></div><button onClick={() => setSideView("canvas")}><X size={16} /></button></header>{sideView === "assets" ? <div className="side-list">{libraryAssets.length ? libraryAssets.map((asset) => <article key={asset.id}><span className="side-kind">{asset.kind}</span><div><strong>{asset.name}</strong><small>{Math.max(1, Math.round(asset.size / 1024))} KB</small></div><button onClick={() => copyAssetToCanvas(asset)}>复制到画布</button></article>) : <p>还没有保存到资产库的媒体。</p>}</div> : <div className="side-list">{queueTasks.length ? queueTasks.map((task) => <article key={task.id}><span className={`task-state state-${task.status}`}>{task.progress}%</span><div><strong>{task.kind} · {task.provider || "local"}</strong><small>{task.status === "workflow_waiting" ? "工作流中等待前序节点" : task.status}{task.error_message ? ` · ${task.error_message}` : ""}{task.managed_by !== "task" && ["failed", "cancelled"].includes(task.status) ? " · 请在所属流程节点恢复" : ""}</small></div><span className="task-actions">{task.managed_by === "task" && task.status === "queued" && <button onClick={() => void commandQueueTask(task, "pause")}>暂停</button>}{task.managed_by === "task" && task.status === "paused" && <button onClick={() => void commandQueueTask(task, "resume")}>继续</button>}{task.managed_by === "task" && ["queued", "running", "paused"].includes(task.status) && <button onClick={() => void commandQueueTask(task, "cancel")}>取消</button>}{task.managed_by === "task" && ["failed", "cancelled"].includes(task.status) && <button onClick={() => void commandQueueTask(task, "retry")}>重试</button>}</span></article>) : <p>当前项目还没有任务。</p>}</div>}</aside>}
+          {sideView !== "canvas" && <aside className="canvas-side-panel"><header><div><strong>{sideView === "assets" ? "资产库副本" : "公司任务队列"}</strong><span>{sideView === "assets" ? "只有主动保存的媒体才进入这里" : "查看生成进度、失败原因并阻止重复提交"}</span></div><button onClick={() => setSideView("canvas")}><X size={16} /></button></header>{sideView === "assets" ? <div className="side-list">{libraryAssets.length ? libraryAssets.map((asset) => <article key={asset.id}><span className="side-kind">{asset.kind}</span><div><strong>{asset.name}</strong><small>{Math.max(1, Math.round(asset.size / 1024))} KB</small></div><button onClick={() => copyAssetToCanvas(asset)}>复制到画布</button></article>) : <p>还没有保存到资产库的媒体。</p>}</div> : <div className="side-list">{queueTasks.length ? queueTasks.map((task) => <article key={task.id}><span className={`task-state state-${task.status}`}>{task.progress}%</span><div><strong>{task.kind} · {task.provider || "local"}</strong><small>{task.status === "workflow_waiting" ? "工作流中等待前序节点" : task.status}{task.error_message ? ` · ${chineseGenerationError(task.error_message)}` : ""}{task.managed_by !== "task" && ["failed", "cancelled"].includes(task.status) ? " · 请在所属流程节点恢复" : ""}</small></div><span className="task-actions">{task.managed_by === "task" && task.status === "queued" && <button onClick={() => void commandQueueTask(task, "pause")}>暂停</button>}{task.managed_by === "task" && task.status === "paused" && <button onClick={() => void commandQueueTask(task, "resume")}>继续</button>}{task.managed_by === "task" && ["queued", "running", "paused"].includes(task.status) && <button onClick={() => void commandQueueTask(task, "cancel")}>取消</button>}{task.managed_by === "task" && ["failed", "cancelled"].includes(task.status) && <button onClick={() => void commandQueueTask(task, "retry")}>重试</button>}</span></article>) : <p>当前项目还没有任务。</p>}</div>}</aside>}
 
           <div className="dock-wrap">
             <nav className="creation-dock" aria-label="画布程序坞">

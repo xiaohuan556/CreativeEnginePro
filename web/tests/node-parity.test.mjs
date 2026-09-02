@@ -25,6 +25,9 @@ test("web canvas exposes explicit media roles, safe result adoption, native audi
   }
   assert.match(canvas, /selectedAction === "图生视频" \? "image_to_video" : "text_to_video"/);
   assert.match(canvas, /任务未提交，避免错误扣费/);
+  assert.match(canvas, /function chineseGenerationError/);
+  assert.match(canvas, /图片请求未通过安全审核/);
+  assert.match(canvas, /moderation_blocked/);
   assert.match(canvas, /NodeEditorPortal/);
   assert.match(canvas, /node-editor-slot-/);
   assert.match(canvas, /node-inline-editor/);

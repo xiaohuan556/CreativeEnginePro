@@ -321,7 +321,23 @@ class AssetDB:
             str(self.db_path), timeout=10.0, check_same_thread=False)
         try:
             connection.execute("PRAGMA busy_timeout=10000")
-            connection.execute("PRAGMA journal_mode=WAL")
+            # Re-applying ``journal_mode=WAL`` on every reconnect asks SQLite
+            # for a write/exclusive lock even when the database is already in
+            # WAL mode.  On Windows this can intermittently fail with
+            # ``disk I/O error`` while another process (or a virus scanner) has
+            # the WAL/SHM files open.  Reading the current mode does not require
+            # that transition, so only request WAL for a new/non-WAL database.
+            current_mode = connection.execute("PRAGMA journal_mode").fetchone()
+            current_mode = str(current_mode[0] if current_mode else "").lower()
+            if current_mode != "wal":
+                try:
+                    connection.execute("PRAGMA journal_mode=WAL")
+                except sqlite3.OperationalError as error:
+                    # WAL is an optimisation, not a schema requirement.  A
+                    # usable DELETE/TRUNCATE journal is preferable to aborting
+                    # application startup on filesystems that cannot host WAL.
+                    if not self._is_transient_io_error(error):
+                        raise
             connection.execute("PRAGMA synchronous=NORMAL")
             # Asset rows are small. Frequent checkpoints keep the WAL bounded
             # and reduce Windows filesystem/antivirus timing races.
@@ -341,14 +357,14 @@ class AssetDB:
             if self._conn is not None:
                 return self._conn
             last_error = None
-            for attempt in range(2):
+            for attempt in range(4):
                 try:
                     return self._open_connection()
                 except sqlite3.OperationalError as error:
                     last_error = error
-                    if attempt or not self._is_transient_io_error(error):
+                    if attempt == 3 or not self._is_transient_io_error(error):
                         raise
-                    time.sleep(0.08)
+                    time.sleep(0.08 * (attempt + 1))
             raise last_error  # pragma: no cover
 
     def _migrate(self):

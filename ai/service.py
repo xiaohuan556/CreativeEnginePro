@@ -27,8 +27,32 @@ _assets: "AssetDB | None" = None
 
 def _build_registry() -> ProviderRegistry:
     reg = ProviderRegistry()
+    # Formal desktop releases never receive provider API keys.  After the
+    # account login succeeds, expose only the centrally approved provider set;
+    # paid work executes on the owner's Worker and is therefore revocable,
+    # quota-controlled and auditable.
+    try:
+        from core.release_gate import desktop_control_client
+        client = desktop_control_client()
+        if client is not None:
+            from .providers.control_plane import ControlPlaneProvider
+            payload = client.request_json("GET", "/api/providers")
+            for descriptor in payload.get("providers", []):
+                provider = ControlPlaneProvider(client, descriptor)
+                if provider.name and provider.capabilities:
+                    reg.register(provider)
+            from .providers.voice import WhisperProvider
+            reg.register(WhisperProvider())
+            return reg
+    except Exception:
+        # Keep the registry empty on a control-plane error.  Falling back to
+        # local secrets would bypass account policy and usage limits.
+        return reg
+
     # 1) Edge TTS —— 免费，永远可用
     reg.register(EdgeTTSProvider())
+    from .providers.voice import WhisperProvider
+    reg.register(WhisperProvider())
 
     # 2) LLM（OpenAI / DeepSeek）
     try:
@@ -68,6 +92,15 @@ def _build_registry() -> ProviderRegistry:
         if fish_audio_key:
             from .providers.voice import FishAudioProvider
             reg.register(FishAudioProvider(api_key=fish_audio_key))
+    except Exception:
+        pass
+
+    # 自托管 CosyVoice：模型运行在独立 GPU 服务，主应用只发送参考录音与文字。
+    try:
+        import os
+        cosyvoice_url = os.getenv("COSYVOICE_BASE_URL", "").strip() or "http://127.0.0.1:50000"
+        from .providers.voice import CosyVoiceProvider
+        reg.register(CosyVoiceProvider(cosyvoice_url))
     except Exception:
         pass
 

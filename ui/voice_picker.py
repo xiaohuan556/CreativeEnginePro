@@ -16,9 +16,10 @@ from PyQt6.QtWidgets import (
     QScrollArea, QGridLayout, QWidget, QSizePolicy, QProgressBar,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QUrl, QThread
+from utils.app_paths import user_file
 
 # ── 声音列表磁盘缓存（避免每次打开弹窗都重新联网拉取）──
-_VOICE_CACHE_DIR = Path(__file__).parent.parent / "Cache" / "voices"
+_VOICE_CACHE_DIR = user_file("Cache", "voices")
 
 
 def _key_salt_for(engine: str) -> str:
@@ -559,7 +560,7 @@ class VoicePickerPopup(QFrame):
     def _load_favorites(self) -> set:
         """加载当前引擎的收藏列表"""
         import json
-        fav_file = Path(__file__).parent.parent / "hooks" / f"fav_{self._engine}.json"
+        fav_file = user_file("voice_favorites", f"fav_{self._engine}.json")
         try:
             if fav_file.exists():
                 return set(json.loads(fav_file.read_text(encoding="utf-8")))
@@ -570,7 +571,7 @@ class VoicePickerPopup(QFrame):
     def _save_favorites(self):
         """保存当前引擎的收藏列表"""
         import json
-        fav_file = Path(__file__).parent.parent / "hooks" / f"fav_{self._engine}.json"
+        fav_file = user_file("voice_favorites", f"fav_{self._engine}.json")
         fav_file.parent.mkdir(parents=True, exist_ok=True)
         fav_file.write_text(json.dumps(list(self._favorites), ensure_ascii=False), encoding="utf-8")
 

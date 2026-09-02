@@ -448,6 +448,57 @@ def numpy_from_qimage(img):
     return arr
 
 
+def _extract_selected_rgba(image_rgba, selection, soft_selection=None):
+    """按像素选区提取 RGBA；选区外强制透明，并裁到选区包围盒。"""
+    pixels = np.asarray(image_rgba, dtype=np.uint8)
+    mask = np.asarray(selection, dtype=bool)
+    if pixels.ndim != 3 or pixels.shape[2] != 4 or mask.ndim != 2:
+        return None, None
+    h = min(pixels.shape[0], mask.shape[0])
+    w = min(pixels.shape[1], mask.shape[1])
+    if h <= 0 or w <= 0:
+        return None, None
+
+    if soft_selection is not None:
+        soft = np.asarray(soft_selection, dtype=np.float32)
+        if soft.ndim != 2:
+            return None, None
+        h = min(h, soft.shape[0])
+        w = min(w, soft.shape[1])
+        weights = soft[:h, :w]
+        weights = np.clip(weights, 0.0, 1.0)
+        selected = weights > 0.001
+    else:
+        selected = mask[:h, :w]
+        weights = selected.astype(np.float32)
+    ys, xs = np.where(selected)
+    if len(xs) == 0:
+        return None, None
+
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    out = np.ascontiguousarray(pixels[y0:y1, x0:x1]).copy()
+    local_weights = weights[y0:y1, x0:x1]
+    out[:, :, 3] = np.clip(
+        out[:, :, 3].astype(np.float32) * local_weights, 0, 255
+    ).astype(np.uint8)
+    out[out[:, :, 3] == 0, :3] = 0
+    return out, (x0, y0)
+
+
+def _trim_transparent_rgba(image_rgba):
+    """去掉 RGBA 图四周完全透明的空白，返回内容及相对偏移。"""
+    pixels = np.asarray(image_rgba, dtype=np.uint8)
+    if pixels.ndim != 3 or pixels.shape[2] != 4 or pixels.size == 0:
+        return None, None
+    ys, xs = np.where(pixels[:, :, 3] > 0)
+    if len(xs) == 0:
+        return None, None
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    return np.ascontiguousarray(pixels[y0:y1, x0:x1]), (x0, y0)
+
+
 # ───────────────────────────── 画布视图 ─────────────────────────────
 class CanvasView(QGraphicsView):
     def __init__(self, editor):
@@ -2583,6 +2634,9 @@ class ImageEditorWidget(QWidget):
         self._add_menu_action(menu_edit, "撤销", self.undo, "Ctrl+Z")
         self._add_menu_action(menu_edit, "重做", self.redo, "Ctrl+Y")
         menu_edit.addSeparator()
+        self._add_menu_action(menu_edit, "复制选区", self.copy_selection, "Ctrl+C")
+        self._add_menu_action(menu_edit, "粘贴", self.paste_image, "Ctrl+V")
+        menu_edit.addSeparator()
         self._add_menu_action(menu_edit, "自由变换", self._start_free_transform, "Ctrl+T")
         self._add_menu_action(menu_edit, "变换复制", self._transform_copy, "Ctrl+Alt+T")
         btn_edit.setMenu(menu_edit)
@@ -3346,6 +3400,34 @@ class ImageEditorWidget(QWidget):
         self._refresh_layers()
         self._redraw()
 
+    _SELECTION_ORIGIN_MIME = "application/x-creativeenginepro-selection-origin"
+
+    def copy_selection(self):
+        """复制当前像素选区的真实 RGBA 内容，不包含棋盘格或选区外画面。"""
+        if self.selection is None or not self.selection.any():
+            self.status_tool.setText("请先框选需要复制的区域")
+            return False
+        if self.active_artboard is not None:
+            image = self._render_artboard(self.active_artboard)
+        else:
+            image = self._render_composite(for_export=True)
+        pixels, origin = _extract_selected_rgba(
+            numpy_from_qimage(image), self.selection, self.sel_alpha)
+        if pixels is None:
+            self.status_tool.setText("选区为空，未复制")
+            return False
+
+        mime = QMimeData()
+        mime.setImageData(qimage_from_numpy(pixels))
+        mime.setData(
+            self._SELECTION_ORIGIN_MIME,
+            f"{origin[0]},{origin[1]}".encode("ascii"),
+        )
+        QApplication.clipboard().setMimeData(mime)
+        self.status_tool.setText(
+            f"已复制选区 {pixels.shape[1]} × {pixels.shape[0]}（透明背景已保留）")
+        return True
+
     def paste_image(self):
         """从系统剪贴板粘贴图片（如截图 / 从文件复制的图片）。"""
         cb = QApplication.clipboard()
@@ -3359,15 +3441,29 @@ class ImageEditorWidget(QWidget):
         iw, ih = arr.shape[1], arr.shape[0]
         layer = ImageLayer("粘贴图片", pixels=arr, w=iw, h=ih, kind="image")
         self._push_undo("粘贴图片")
+        copied_origin = None
+        mime = cb.mimeData()
+        if mime is not None and mime.hasFormat(self._SELECTION_ORIGIN_MIME):
+            try:
+                raw = bytes(mime.data(self._SELECTION_ORIGIN_MIME)).decode("ascii")
+                ox, oy = raw.split(",", 1)
+                copied_origin = (float(ox), float(oy))
+            except (TypeError, ValueError, UnicodeError):
+                copied_origin = None
         ab = self.active_artboard
         if self.project.artboards and ab is None:
             ab = self.project.artboards[0]
             self.active_artboard = ab
         if ab is not None:
-            sc = min(ab.w / iw, ab.h / ih, 1.0) * 0.9
-            layer.scale = sc
-            layer.x = ab.w / 2.0
-            layer.y = ab.h / 2.0
+            if copied_origin is not None:
+                layer.scale = 1.0
+                layer.x = copied_origin[0] + iw / 2.0
+                layer.y = copied_origin[1] + ih / 2.0
+            else:
+                sc = min(ab.w / iw, ab.h / ih, 1.0) * 0.9
+                layer.scale = sc
+                layer.x = ab.w / 2.0
+                layer.y = ab.h / 2.0
             ab.layers.append(layer)
         else:
             # 仅在画布完全为空时自动匹配图片尺寸；其余情况保持当前画布、居中缩放
@@ -3379,14 +3475,21 @@ class ImageEditorWidget(QWidget):
                 layer.y = ih / 2.0
             else:
                 cw, ch = self.project.w, self.project.h
-                sc = min(cw / iw, ch / ih, 1.0) * 0.9
-                layer.scale = sc
-                layer.x = cw / 2.0
-                layer.y = ch / 2.0
+                if copied_origin is not None:
+                    layer.scale = 1.0
+                    layer.x = copied_origin[0] + iw / 2.0
+                    layer.y = copied_origin[1] + ih / 2.0
+                else:
+                    sc = min(cw / iw, ch / ih, 1.0) * 0.9
+                    layer.scale = sc
+                    layer.x = cw / 2.0
+                    layer.y = ch / 2.0
             self.project.add_layer(layer)
         self.set_active(layer)
         self._refresh_layers()
         self._redraw()
+        self.status_tool.setText(
+            f"已粘贴 {iw} × {ih}（透明背景已保留）")
 
     # ═══════ 键盘快捷键（PS 风格）═══════
     def _swap_colors(self):
@@ -3448,6 +3551,13 @@ class ImageEditorWidget(QWidget):
             return
         if ctrl and e.key() == Qt.Key.Key_A:
             self._select_all_layers()
+            return
+        if ctrl and e.key() == Qt.Key.Key_C:
+            fw = QApplication.focusWidget()
+            if isinstance(fw, (QLineEdit, QPlainTextEdit, QSpinBox, QComboBox)):
+                super().keyPressEvent(e)
+                return
+            self.copy_selection()
             return
         if ctrl and e.key() == Qt.Key.Key_V:
             fw = QApplication.focusWidget()
@@ -4524,7 +4634,8 @@ class ImageEditorWidget(QWidget):
         import time as _time
         if layer is None or layer.kind not in ("image", "shape", "text"):
             return
-        folder = Path(__file__).parent.parent / "work_temp" / "resource_imports"
+        from utils.app_paths import work_root
+        folder = work_root() / "resource_imports"
         folder.mkdir(parents=True, exist_ok=True)
         path = folder / f"resource_{int(_time.time() * 1000)}.png"
         try:
@@ -6120,6 +6231,7 @@ class ImageEditorWidget(QWidget):
         from PyQt6.QtWidgets import QMenu
         menu = QMenu(self)
         if self.selection is not None:
+            menu.addAction("📋 复制选区", self.copy_selection)
             menu.addAction("✨ AI 局部修改…", self._prompt_ai_inpaint)
             menu.addSeparator()
             menu.addAction("🗑 删除选区", lambda: self.delete_selection(silent=True))
@@ -6318,9 +6430,11 @@ class ImageEditorWidget(QWidget):
         self._sel_base = self.selection.copy()  # 记录羽化前原始二值选区
 
     def _commit_rect_sel(self, a, b, tool, mode):
+        a = self._doc_to_local(a)
+        b = self._doc_to_local(b)
         x0, y0 = int(min(a.x(), b.x())), int(min(a.y(), b.y()))
         x1, y1 = int(max(a.x(), b.x())), int(max(a.y(), b.y()))
-        h, w = self.project.h, self.project.w
+        w, h = self._ctx_size()
         mask = np.zeros((h, w), bool)
         mask[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = True
         if tool == Tool.SELECT_ELLIPSE and x1 > x0 and y1 > y0:
@@ -6337,12 +6451,14 @@ class ImageEditorWidget(QWidget):
         """虚线框预览选区（不填充）"""
         # 暂停已提交选区的蚂蚁线动画，避免与实时预览写入同一图层产生残影
         self._stop_sel_anim()
+        a = self._doc_to_local(a)
+        b = self._doc_to_local(b)
         x0, y0 = int(min(a.x(), b.x())), int(min(a.y(), b.y()))
         x1, y1 = int(max(a.x(), b.x())), int(max(a.y(), b.y()))
         if x1 - x0 < 2 and y1 - y0 < 2:
             self.view.sel_item.setPixmap(QPixmap())
             return
-        h, w = self.project.h, self.project.w
+        w, h = self._ctx_size()
         img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
@@ -6365,12 +6481,17 @@ class ImageEditorWidget(QWidget):
             p.setPen(pen_b); p.drawEllipse(r)
             p.setPen(pen_w); p.drawEllipse(r)
         p.end()
+        if self.active_artboard is not None:
+            self.view.sel_item.setOffset(*self._ab_screen(self.active_artboard))
+        else:
+            self.view.sel_item.setOffset(0, 0)
         self.view.sel_item.setPixmap(QPixmap.fromImage(img))
 
     def _preview_lasso(self, pts):
         # 暂停已提交选区的蚂蚁线动画，避免与实时预览写入同一图层产生残影
         self._stop_sel_anim()
-        h, w = self.project.h, self.project.w
+        pts = [self._doc_to_local(pt) for pt in pts]
+        w, h = self._ctx_size()
         img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
@@ -6389,6 +6510,10 @@ class ImageEditorWidget(QWidget):
         p.setPen(pen_b); p.drawPolyline(poly)
         p.setPen(pen_w); p.drawPolyline(poly)
         p.end()
+        if self.active_artboard is not None:
+            self.view.sel_item.setOffset(*self._ab_screen(self.active_artboard))
+        else:
+            self.view.sel_item.setOffset(0, 0)
         self.view.sel_item.setPixmap(QPixmap.fromImage(img))
 
     # ═══════ P3 裁剪 ═══════
@@ -6456,11 +6581,11 @@ class ImageEditorWidget(QWidget):
         nw, nh = x1 - x0, y1 - y0
         if nw < 2 or nh < 2:
             return
-        # 渲染当前上下文为整张图，再裁出目标区域
+        # 渲染真实 RGBA 内容（禁止把编辑态棋盘格写进裁剪结果），再裁出目标区域。
         if self.active_artboard is not None:
             base = self._render_artboard(self.active_artboard)
         else:
-            base = self._render_composite()
+            base = self._render_composite(for_export=True)
         base_arr = numpy_from_qimage(base)
         if y1 > base_arr.shape[0]:
             y1 = base_arr.shape[0]
@@ -6469,6 +6594,15 @@ class ImageEditorWidget(QWidget):
         crop = np.ascontiguousarray(base_arr[y0:y1, x0:x1])
         if crop.size == 0:
             return
+        # 透明画布常在框选边缘留有空白；裁剪结果自动收紧到实际像素内容。
+        trimmed, offset = _trim_transparent_rgba(crop)
+        if trimmed is None:
+            self.status_tool.setText("裁剪区域没有可见内容")
+            return
+        crop = trimmed
+        x0 += offset[0]
+        y0 += offset[1]
+        nh, nw = crop.shape[:2]
         host = getattr(self, "host", None)
         if host is not None:
             name = (self.doc_name + " 裁剪") if self.doc_name else "裁剪结果"
@@ -6564,7 +6698,8 @@ class ImageEditorWidget(QWidget):
     def _commit_lasso(self, pts, mode):
         if len(pts) < 3:
             return
-        h, w = self.project.h, self.project.w
+        pts = [self._doc_to_local(pt) for pt in pts]
+        w, h = self._ctx_size()
         img = QImage(w, h, QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
@@ -6584,13 +6719,14 @@ class ImageEditorWidget(QWidget):
         if not layer or layer.kind != "image" or layer.pixels is None:
             QMessageBox.information(self, "提示", "请先选中一个图片图层再用魔棒。")
             return
-        lp = layer.canvas_to_layer(pt.x(), pt.y())
+        local_pt = self._doc_to_local(pt)
+        lp = layer.canvas_to_layer(local_pt.x(), local_pt.y())
         if lp is None:
             return
         lx, ly = int(round(lp[0])), int(round(lp[1]))
         mask_layer = self._flood(layer.pixels, ly, lx, tol)
         # 变换回画布空间
-        h, w = self.project.h, self.project.w
+        w, h = self._ctx_size()
         tmp = np.zeros((layer.h, layer.w, 4), np.uint8)
         tmp[mask_layer, 0:3] = 255
         tmp[mask_layer, 3] = 255
@@ -6653,7 +6789,8 @@ class ImageEditorWidget(QWidget):
         layer = self.active
         if not layer or layer.kind != "image" or layer.pixels is None:
             return
-        lp = layer.canvas_to_layer(pt.x(), pt.y())
+        local_pt = self._doc_to_local(pt)
+        lp = layer.canvas_to_layer(local_pt.x(), local_pt.y())
         if lp is None:
             return
         lx, ly = int(round(lp[0])), int(round(lp[1]))
@@ -6670,7 +6807,7 @@ class ImageEditorWidget(QWidget):
         if not mask_layer.any():
             return
         # 层空间 → 画布空间
-        h, w = self.project.h, self.project.w
+        w, h = self._ctx_size()
         tmp = np.zeros((layer.h, layer.w, 4), np.uint8)
         tmp[mask_layer] = 255
         q = qimage_from_numpy(tmp)

@@ -14,9 +14,24 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QLabel, QLineEdit,
     QProgressBar, QFileDialog, QApplication,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings
+from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSettings, QStandardPaths
 
 from core.edit_engine import EditTimeline
+
+
+def _default_export_directory(preferred: str = "") -> str:
+    """返回首次导出的可见默认目录；后续优先使用已记忆目录。"""
+    candidates = [
+        preferred,
+        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.MoviesLocation),
+        QStandardPaths.writableLocation(QStandardPaths.StandardLocation.DocumentsLocation),
+        os.getcwd(),
+    ]
+    for candidate in candidates:
+        path = os.path.abspath(os.path.expanduser(candidate)) if candidate else ""
+        if path and os.path.isdir(path):
+            return path
+    return os.getcwd()
 
 
 # ═══════════════════════════════════════════════
@@ -28,12 +43,14 @@ class ExportDialog(QDialog):
     _SETTINGS_ORG = "CreativeEnginePro"
     _SETTINGS_APP = "EditorExport"
 
-    def __init__(self, parent=None, canvas_size=None, default_name=""):
+    def __init__(self, parent=None, canvas_size=None, default_name="",
+                 default_directory=""):
         """canvas_size: (w, h) 画布像素尺寸，用于预选分辨率
-           default_name: 默认文件名（不含扩展名）"""
+           default_name: 默认文件名（不含扩展名）
+           default_directory: 尚无历史记录时使用的导出目录"""
         super().__init__(parent)
         self.setWindowTitle("导出视频")
-        self.setFixedWidth(420)
+        self.setFixedWidth(560)
         self.setStyleSheet("""
             QDialog { background:#1e1e1e; color:#ccc; }
             QLabel { color:#ccc; font-size:12px; }
@@ -46,6 +63,7 @@ class ExportDialog(QDialog):
         """)
         self._canvas_size = canvas_size
         self._default_name = default_name
+        self._default_directory = default_directory
         self._build()
 
     def _settings(self):
@@ -57,7 +75,7 @@ class ExportDialog(QDialog):
         return re.sub(r'[<>:"/\\|?*]', '_', name.strip() or "output")
 
     def _restore_settings(self):
-        """恢复上次确认导出时使用的参数和目录。"""
+        """恢复上次确认导出时使用的参数、目录和文件名。"""
         settings = self._settings()
 
         resolution = str(settings.value("resolution", "") or "")
@@ -83,8 +101,14 @@ class ExportDialog(QDialog):
             self.quality_combo.setCurrentIndex(quality_idx)
 
         last_dir = str(settings.value("last_directory", "") or "")
-        name = self._safe_output_name(self._default_name or "output") + ".mp4"
-        self.path_edit.setText(os.path.join(last_dir, name) if last_dir else name)
+        if not last_dir:
+            last_dir = _default_export_directory(self._default_directory)
+        last_name = os.path.basename(str(settings.value("last_filename", "") or ""))
+        name = last_name or (self._safe_output_name(self._default_name or "output") + ".mp4")
+        if not name.lower().endswith(".mp4"):
+            name += ".mp4"
+        self.name_edit.setText(name)
+        self.directory_edit.setText(last_dir)
 
     def _save_settings(self, path: str):
         """仅在用户确认开始导出后保存，取消弹窗不会覆盖上次设置。"""
@@ -94,6 +118,7 @@ class ExportDialog(QDialog):
         settings.setValue("quality_index", self.quality_combo.currentIndex())
         if path:
             settings.setValue("last_directory", os.path.dirname(os.path.abspath(path)))
+            settings.setValue("last_filename", os.path.basename(path))
         settings.sync()
 
     def _build(self):
@@ -133,19 +158,29 @@ class ExportDialog(QDialog):
 
         lay.addLayout(form)
 
-        # 输出路径
-        path_row = QHBoxLayout()
-        self.path_edit = QLineEdit()
-        self.path_edit.setPlaceholderText("输入文件名或点击浏览选择路径…")
-        btn_browse = QPushButton("浏览")
-        btn_browse.setStyleSheet("QPushButton{background:#2a2a2a;color:#ccc;border:1px solid #444;"
-                                  "border-radius:3px;} QPushButton:hover{background:#3a3a3a;}")
-        btn_browse.clicked.connect(self._browse)
-        path_row.addWidget(self.path_edit, 1)
-        path_row.addWidget(btn_browse)
-        lay.addLayout(path_row)
+        # 文件名与导出目录分开显示：不点“选择目录”即可按当前默认地址直接导出。
+        output_form = QFormLayout()
+        output_form.setSpacing(10)
+        output_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("输入导出文件名")
+        output_form.addRow("文件名:", self.name_edit)
 
-        # 控件全部创建后恢复上次参数；文件名仍使用当前工程名。
+        directory_row = QHBoxLayout()
+        self.directory_edit = QLineEdit()
+        self.directory_edit.setPlaceholderText("导出文件夹地址")
+        self._btn_browse = QPushButton("选择目录")
+        self._btn_browse.setAutoDefault(False)
+        self._btn_browse.setDefault(False)
+        self._btn_browse.setStyleSheet("QPushButton{background:#2a2a2a;color:#ccc;border:1px solid #444;"
+                                        "border-radius:3px;} QPushButton:hover{background:#3a3a3a;}")
+        self._btn_browse.clicked.connect(self._browse)
+        directory_row.addWidget(self.directory_edit, 1)
+        directory_row.addWidget(self._btn_browse)
+        output_form.addRow("导出地址:", directory_row)
+        lay.addLayout(output_form)
+
+        # 控件全部创建后恢复上次确认导出时的目录和文件名。
         self._restore_settings()
 
         # 进度条
@@ -173,8 +208,11 @@ class ExportDialog(QDialog):
             "QPushButton{background:#2a5fa8;color:#fff;border:none;font-weight:bold;}"
             "QPushButton:hover{background:#3d8ef8;}"
             "QPushButton:disabled{background:#333;color:#666;}")
+        self._btn_export.setAutoDefault(True)
+        self._btn_export.setDefault(True)
         self._btn_export.clicked.connect(self.accept)
         btn_cancel = QPushButton("取消")
+        btn_cancel.setAutoDefault(False)
         btn_cancel.setStyleSheet(
             "QPushButton{background:#2a2a2a;color:#aaa;border:1px solid #444;}"
             "QPushButton:hover{background:#3a3a3a;color:#fff;}")
@@ -183,14 +221,33 @@ class ExportDialog(QDialog):
         btn_row.addWidget(self._btn_export)
         lay.addLayout(btn_row)
 
+    def keyPressEvent(self, event):
+        """Enter 始终确认导出，不把焦点按钮误触发成目录选择。"""
+        if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            self.accept()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _browse(self):
-        current = self.path_edit.text().strip()
-        # 确保默认扩展名为 .mp4
-        if current and not current.lower().endswith(".mp4"):
-            current += ".mp4"
-        p, _ = QFileDialog.getSaveFileName(self, "保存视频", current or "output.mp4", "视频文件 (*.mp4)")
-        if p:
-            self.path_edit.setText(p)
+        current = self.directory_edit.text().strip()
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择视频导出目录", current or _default_export_directory())
+        if directory:
+            self.directory_edit.setText(directory)
+
+    def _output_path(self) -> str:
+        directory = self.directory_edit.text().strip()
+        if not directory:
+            directory = _default_export_directory(self._default_directory)
+        directory = os.path.abspath(os.path.expanduser(directory))
+        name = os.path.basename(self.name_edit.text().strip())
+        name = self._safe_output_name(name or self._default_name or "output")
+        if not name.lower().endswith(".mp4"):
+            name += ".mp4"
+        self.directory_edit.setText(directory)
+        self.name_edit.setText(name)
+        return os.path.join(directory, name)
 
     def get_settings(self):
         text = self.res_combo.currentText().replace("×", "x")
@@ -199,10 +256,7 @@ class ExportDialog(QDialog):
         fps = int(self.fps_combo.currentText())
         crf_map = {0: 18, 1: 23, 2: 28}
         crf = crf_map.get(self.quality_combo.currentIndex(), 18)
-        path = self.path_edit.text().strip()
-        # 确保有 .mp4 扩展名
-        if path and not path.lower().endswith(".mp4"):
-            path += ".mp4"
+        path = self._output_path()
         self._save_settings(path)
         return {"resolution": (W, H), "fps": fps, "crf": crf, "path": path}
 
@@ -220,11 +274,15 @@ class ExportDialog(QDialog):
 
 class AudioExportDialog(QDialog):
     """音频导出设置弹窗"""
+    _SETTINGS_ORG = "CreativeEnginePro"
+    _SETTINGS_APP = "EditorAudioExport"
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, default_name="", default_directory=""):
         super().__init__(parent)
+        self._default_name = default_name
+        self._default_directory = default_directory
         self.setWindowTitle("导出音频")
-        self.setFixedWidth(380)
+        self.setFixedWidth(520)
         self.setStyleSheet("""
             QDialog { background:#1e1e1e; color:#ccc; }
             QLabel { color:#ccc; font-size:12px; }
@@ -236,6 +294,52 @@ class AudioExportDialog(QDialog):
             QPushButton { border-radius:4px; padding:6px 16px; font-size:12px; }
         """)
         self._build()
+
+    def _settings(self):
+        return QSettings(self._SETTINGS_ORG, self._SETTINGS_APP)
+
+    def _restore_settings(self):
+        """恢复上次确认导出时的目录、文件名和音频参数。"""
+        settings = self._settings()
+
+        fmt = str(settings.value("format", "MP3") or "MP3").upper()
+        idx = self._fmt_combo.findText(fmt)
+        if idx >= 0:
+            self._fmt_combo.setCurrentIndex(idx)
+
+        for key, combo in (
+                ("sample_rate", self._sr_combo),
+                ("bitrate", self._br_combo),
+                ("channels", self._ch_combo)):
+            value = str(settings.value(key, "") or "")
+            idx = combo.findText(value)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+
+        ext = self._fmt_combo.currentText().lower()
+        last_dir = str(settings.value("last_directory", "") or "")
+        if not last_dir:
+            last_dir = _default_export_directory(self._default_directory)
+        last_name = os.path.basename(str(settings.value("last_filename", "") or ""))
+        if not last_name:
+            stem = ExportDialog._safe_output_name(self._default_name or "output")
+            last_name = f"{stem}.{ext}"
+        else:
+            last_name = os.path.splitext(last_name)[0] + f".{ext}"
+        self.name_edit.setText(last_name)
+        self.directory_edit.setText(last_dir)
+
+    def _save_settings(self, path: str):
+        """仅在用户确认开始导出后保存，取消不会覆盖上次设置。"""
+        settings = self._settings()
+        settings.setValue("format", self._fmt_combo.currentText())
+        settings.setValue("sample_rate", self._sr_combo.currentText())
+        settings.setValue("bitrate", self._br_combo.currentText())
+        settings.setValue("channels", self._ch_combo.currentText())
+        if path:
+            settings.setValue("last_directory", os.path.dirname(os.path.abspath(path)))
+            settings.setValue("last_filename", os.path.basename(path))
+        settings.sync()
 
     def _build(self):
         lay = QVBoxLayout(self)
@@ -265,19 +369,30 @@ class AudioExportDialog(QDialog):
 
         lay.addLayout(form)
 
-        # 输出路径
-        path_row = QHBoxLayout()
-        self._path_edit = QLineEdit()
-        self._path_edit.setPlaceholderText("点击选择输出路径…")
-        self._path_edit.setReadOnly(True)
-        btn_browse = QPushButton("浏览")
-        btn_browse.setStyleSheet(
+        # 文件名与导出目录分开显示。
+        output_form = QFormLayout()
+        output_form.setSpacing(10)
+        output_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+        self.name_edit = QLineEdit()
+        self.name_edit.setPlaceholderText("输入导出文件名")
+        output_form.addRow("文件名:", self.name_edit)
+
+        directory_row = QHBoxLayout()
+        self.directory_edit = QLineEdit()
+        self.directory_edit.setPlaceholderText("导出文件夹地址")
+        self._btn_browse = QPushButton("选择目录")
+        self._btn_browse.setAutoDefault(False)
+        self._btn_browse.setDefault(False)
+        self._btn_browse.setStyleSheet(
             "QPushButton{background:#2a2a2a;color:#ccc;border:1px solid #444;"
             "border-radius:3px;} QPushButton:hover{background:#3a3a3a;}")
-        btn_browse.clicked.connect(self._browse)
-        path_row.addWidget(self._path_edit, 1)
-        path_row.addWidget(btn_browse)
-        lay.addLayout(path_row)
+        self._btn_browse.clicked.connect(self._browse)
+        directory_row.addWidget(self.directory_edit, 1)
+        directory_row.addWidget(self._btn_browse)
+        output_form.addRow("导出地址:", directory_row)
+        lay.addLayout(output_form)
+
+        self._restore_settings()
 
         # 按钮
         btn_row = QHBoxLayout()
@@ -287,8 +402,11 @@ class AudioExportDialog(QDialog):
             "QPushButton{background:#2a5fa8;color:#fff;border:none;font-weight:bold;}"
             "QPushButton:hover{background:#3d8ef8;}"
             "QPushButton:disabled{background:#333;color:#666;}")
+        self._btn_export.setAutoDefault(True)
+        self._btn_export.setDefault(True)
         self._btn_export.clicked.connect(self.accept)
         btn_cancel = QPushButton("取消")
+        btn_cancel.setAutoDefault(False)
         btn_cancel.setStyleSheet(
             "QPushButton{background:#2a2a2a;color:#aaa;border:1px solid #444;}"
             "QPushButton:hover{background:#3a3a3a;color:#fff;}")
@@ -297,25 +415,50 @@ class AudioExportDialog(QDialog):
         btn_row.addWidget(self._btn_export)
         lay.addLayout(btn_row)
 
+    def keyPressEvent(self, event):
+        """Enter 始终确认导出，不把焦点按钮误触发成目录选择。"""
+        if event.key() in (Qt.Key.Key_Enter, Qt.Key.Key_Return):
+            self.accept()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
     def _on_fmt_changed(self, fmt: str):
         """WAV 不需要比特率，灰掉比特率下拉"""
         self._br_combo.setEnabled(fmt == "MP3")
+        if hasattr(self, "name_edit"):
+            name = self.name_edit.text().strip()
+            if name:
+                self.name_edit.setText(os.path.splitext(name)[0] + f".{fmt.lower()}")
 
     def _browse(self):
-        fmt = self._fmt_combo.currentText().lower()
-        p, _ = QFileDialog.getSaveFileName(
-            self, "保存音频", f"output.{fmt}",
-            f"{fmt.upper()} (*.{fmt})")
-        if p:
-            self._path_edit.setText(p)
+        current = self.directory_edit.text().strip()
+        directory = QFileDialog.getExistingDirectory(
+            self, "选择音频导出目录", current or _default_export_directory())
+        if directory:
+            self.directory_edit.setText(directory)
+
+    def _output_path(self, fmt: str) -> str:
+        directory = self.directory_edit.text().strip()
+        if not directory:
+            directory = _default_export_directory(self._default_directory)
+        directory = os.path.abspath(os.path.expanduser(directory))
+        name = os.path.basename(self.name_edit.text().strip())
+        name = ExportDialog._safe_output_name(name or self._default_name or "output")
+        name = os.path.splitext(name)[0] + f".{fmt}"
+        self.directory_edit.setText(directory)
+        self.name_edit.setText(name)
+        return os.path.join(directory, name)
 
     def get_settings(self):
         fmt = self._fmt_combo.currentText().lower()
         sr = int(self._sr_combo.currentText().split()[0])
         br = self._br_combo.currentText().split()[0] + "k"
         channels = 2 if self._ch_combo.currentText() == "立体声" else 1
+        path = self._output_path(fmt)
+        self._save_settings(path)
         return {
-            "path": self._path_edit.text(),
+            "path": path,
             "format": fmt,
             "sample_rate": sr,
             "bitrate": br,

@@ -181,16 +181,28 @@ def _execute_task(task_id: str, worker_id: str) -> None:
                 role = str(reference.get("role") or "reference")
                 typed_references.append({"path": str(resolve_object(asset.object_key)), "role": "character" if role == "subject" else role, "label": str(reference.get("title") or asset.name)})
         paths = [item["path"] for item in typed_references]
-        if operation == "image_edit" and paths:
-            hydrated_inputs.update({"image": paths[0], "images": paths, "reference_assets": typed_references})
-        elif operation == "image_to_video" and paths:
-            first = next((item for item in typed_references if item["role"] == "first_frame"), typed_references[0])
-            last = next((item for item in typed_references if item["role"] == "last_frame"), None)
+        visual_references = [item for item in typed_references
+                             if item["role"] not in {"mask", "reference_audio"}]
+        visual_paths = [item["path"] for item in visual_references]
+        if operation == "image_edit" and visual_paths:
+            hydrated_inputs.update({"image": visual_paths[0], "images": visual_paths,
+                                    "reference_assets": visual_references})
+            mask = next((item for item in typed_references if item["role"] == "mask"), None)
+            if mask:
+                hydrated_inputs["mask"] = mask["path"]
+        elif operation == "image_to_video" and visual_paths:
+            first = next((item for item in visual_references if item["role"] == "first_frame"), visual_references[0])
+            last = next((item for item in visual_references if item["role"] == "last_frame"), None)
             hydrated_inputs["image"] = first["path"]
             if last and last["path"] != first["path"]: hydrated_inputs["last_frame"] = last["path"]
-            hydrated_inputs["reference_assets"] = typed_references
-        elif operation == "text_to_video" and paths:
-            hydrated_inputs["reference_assets"] = typed_references[:50]
+            hydrated_inputs["reference_assets"] = visual_references
+        elif operation == "text_to_video" and visual_paths:
+            hydrated_inputs["reference_assets"] = visual_references[:50]
+        elif operation == "clone_voice" and paths:
+            reference_audio = next((
+                item for item in typed_references
+                if item["role"] == "reference_audio"), typed_references[0])
+            hydrated_inputs["reference_audio"] = reference_audio["path"]
         elif operation == "text_to_speech":
             hydrated_inputs["text"] = hydrated_inputs.pop("prompt", "")
     if operation in {"extract_video_frames", "continue_video"}:

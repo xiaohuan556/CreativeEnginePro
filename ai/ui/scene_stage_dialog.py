@@ -18,6 +18,7 @@ from ai.scene_stage import (
     active_camera, append_stage_capture, normalize_scene_stage,
     project_world_point,
 )
+from utils.app_paths import output_root
 
 
 BG = "#101217"
@@ -312,7 +313,7 @@ class SceneStageDialog(QDialog):
     def __init__(self, stage, *, output_dir="", parent=None):
         super().__init__(parent)
         self.stage = normalize_scene_stage(stage)
-        self.output_dir = str(output_dir or Path.cwd() / "work_output" / "scene_stage")
+        self.output_dir = str(output_dir or output_root() / "scene_stage")
         self.capture_path = ""
         self._syncing = False
         self.setWindowTitle("3D 导演台 · 人物站位与机位")

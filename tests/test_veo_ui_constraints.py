@@ -66,8 +66,26 @@ class VeoUiConstraintTests(unittest.TestCase):
         ratios = [dialog._ratio.itemText(i) for i in range(dialog._ratio.count())]
         durations = [dialog._duration.itemText(i)
                      for i in range(dialog._duration.count())]
+        resolutions = [dialog._resolution.itemText(i)
+                       for i in range(dialog._resolution.count())]
         self.assertEqual(["16:9", "9:16"], ratios)
         self.assertEqual(["4", "6", "8"], durations)
+        self.assertEqual(["720p", "1080p"], resolutions)
+        dialog.deleteLater()
+
+    def test_dialog_text_to_video_defaults_to_selectable_seedance_25(self):
+        with patch("ai.ui.video_gen_dialog.get_ai_manager", return_value=_Manager()):
+            dialog = VideoGenDialog()
+        dialog._provider.setCurrentIndex(dialog._provider.findData("seedance"))
+        self.app.processEvents()
+        endpoint = "doubao-seedance-2-5-260628"
+        self.assertGreaterEqual(dialog._model.findData(endpoint), 0)
+        self.assertEqual(endpoint, dialog._model.currentData())
+        dialog._model.setCurrentIndex(dialog._model.findData(endpoint))
+        self.app.processEvents()
+        self.assertEqual(endpoint, dialog._model.currentData())
+        self.assertIn("30", [dialog._duration.itemText(i)
+                             for i in range(dialog._duration.count())])
         dialog.deleteLater()
 
 

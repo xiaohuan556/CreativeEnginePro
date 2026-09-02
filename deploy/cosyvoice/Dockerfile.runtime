@@ -1,0 +1,8 @@
+FROM cosyvoice:v1.0
+
+# Deepspeed is a training dependency. Importing it in the official CUDA
+# runtime-only base image probes for nvcc/CUDA_HOME and prevents Transformers
+# (and therefore CosyVoice) from starting. Zero-shot inference does not use it.
+RUN pip3 uninstall -y deepspeed
+
+EXPOSE 50000

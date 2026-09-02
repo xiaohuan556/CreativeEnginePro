@@ -15,6 +15,31 @@ from .slideshow_handler import SlideshowHandler
 from .image_editor import ImageEditorHandler
 from .widgets import CheckMarkBox
 
+
+# 应用级悬浮提示主题。必须拼入 UltimateEngine 的最终样式表；main.py 在创建
+# QApplication 后设置的早期样式会被 init_style() 覆盖。
+GLOBAL_TOOLTIP_STYLE = """
+    QToolTip {
+        color: #ffffff;
+        background-color: #242424;
+        border: 1px solid #5a5a5a;
+        border-radius: 3px;
+        padding: 4px 7px;
+        font-size: 12px;
+        opacity: 255;
+    }
+"""
+
+
+def _apply_global_tooltip_palette(app):
+    """为未完全遵循样式表的系统提示框补充白字调色板。"""
+    if app is None:
+        return
+    palette = app.palette()
+    palette.setColor(QPalette.ColorRole.ToolTipText, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ToolTipBase, QColor("#242424"))
+    app.setPalette(palette)
+
 # ═══════════════ 侧边栏折叠分组 ═══════════════
 class SidebarGroup(QFrame):
     """可折叠的侧边栏分组"""
@@ -257,6 +282,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.config = {
             'out_dir': '',
             'tail_path': '',
+            'watermark_path': '',
             'rename': '',
             'is_single': False
         }
@@ -531,7 +557,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             QMessageBox QPushButton:pressed {
                 background: #2d7ee8;
             }
-        """)
+        """ + GLOBAL_TOOLTIP_STYLE)
         # 同时把同一套暗色主题应用到整个应用程序（QApplication），
         # 否则顶层弹窗（QMessageBox / QDialog）不会继承本窗口的样式表，
         # 在系统深色主题下会变成「黑底黑字」看不清。Qt 中控件的样式表不会
@@ -539,6 +565,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         _app = QApplication.instance()
         if _app is not None:
             _app.setStyleSheet(self.styleSheet())
+            _apply_global_tooltip_palette(_app)
 
     def keyPressEvent(self, event):
         # 视频处理模块(tab 0)快捷键
@@ -667,7 +694,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                     '<font color="#3da8f5">小欢</font>'
                     '<font color="#cccccc">ovo</font>'
                     '</span>')
-        logo.setStyleSheet("padding: 20px 10px; background: transparent;")
+        logo.setStyleSheet("padding:20px 10px;background:transparent;")
         side_lay.addWidget(logo)
 
         self.nav_btns = []
@@ -1099,29 +1126,46 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         vgl.addWidget(QLabel("替换尾页:"), 1, 0)
         vgl.addWidget(self.btn_browse_tail, 1, 1, 1, 3) # 从1行1列开始,占据1行3列
 
-        # 4. 扒取/下载后的尾页自动化预设（尾页页是唯一设置来源）
+        # 4. 透明 MOV 动态水印（整画布叠加，导出时循环）
+        self.global_watermark_path = ""
+        self.btn_browse_watermark = QPushButton("点击选择透明 MOV 水印")
+        self.btn_browse_watermark.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_browse_watermark.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_browse_watermark.setStyleSheet(self.btn_browse_tail.styleSheet())
+        self.btn_browse_watermark.setToolTip(
+            "选择带 Alpha 通道的 MOV，导出时缩放到整个画布并循环叠加")
+        self.btn_browse_watermark.clicked.connect(self.on_select_global_watermark)
+        self.btn_clear_watermark = QPushButton("清除")
+        self.btn_clear_watermark.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_clear_watermark.setEnabled(False)
+        self.btn_clear_watermark.clicked.connect(self.clear_global_watermark)
+        vgl.addWidget(QLabel("透明水印:"), 2, 0)
+        vgl.addWidget(self.btn_browse_watermark, 2, 1, 1, 2)
+        vgl.addWidget(self.btn_clear_watermark, 2, 3)
+
+        # 5. 扒取/下载后的尾页自动化预设（尾页页是唯一设置来源）
         self.tail_auto_mode = QComboBox()
         self.tail_auto_mode.addItem("直接追加尾页", "append")
         self.tail_auto_mode.addItem("智能识别旧尾页并替换", "smart_replace")
-        vgl.addWidget(QLabel("自动模式:"), 2, 0)
-        vgl.addWidget(self.tail_auto_mode, 2, 1)
+        vgl.addWidget(QLabel("自动模式:"), 3, 0)
+        vgl.addWidget(self.tail_auto_mode, 3, 1)
 
         self.tail_auto_export = CheckMarkBox("整批下载完成后自动处理并导出")
         self.tail_auto_export.setChecked(True)
-        vgl.addWidget(self.tail_auto_export, 2, 2, 1, 2)
+        vgl.addWidget(self.tail_auto_export, 3, 2, 1, 2)
 
         self.tail_auto_output = QLineEdit()
         self.tail_auto_output.setPlaceholderText("选择自动导出目录…")
         self.tail_auto_output.editingFinished.connect(self._save_tail_automation_preset)
         self.btn_tail_auto_output = QPushButton("选择目录")
         self.btn_tail_auto_output.clicked.connect(self._select_tail_auto_output)
-        vgl.addWidget(QLabel("自动输出:"), 3, 0)
-        vgl.addWidget(self.tail_auto_output, 3, 1, 1, 2)
-        vgl.addWidget(self.btn_tail_auto_output, 3, 3)
+        vgl.addWidget(QLabel("自动输出:"), 4, 0)
+        vgl.addWidget(self.tail_auto_output, 4, 1, 1, 2)
+        vgl.addWidget(self.btn_tail_auto_output, 4, 3)
 
-        preset_hint = QLabel("以上参数同时供「扒取 → 下载后自动加尾页」调用")
+        preset_hint = QLabel("尾页和透明水印也会用于「扒取 → 自动处理导出」")
         preset_hint.setStyleSheet("color:#777;font-size:10px;")
-        vgl.addWidget(preset_hint, 4, 1, 1, 3)
+        vgl.addWidget(preset_hint, 5, 1, 1, 3)
 
         vg.setLayout(vgl)
         rl.addWidget(vg)
@@ -1383,6 +1427,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             "ratio_mode": self.v_ratio.currentText() if hasattr(self, 'v_ratio') else "默认",
             "rename": self.v_base_name.text().strip(),
             "tail_path": getattr(self, 'global_tail_path', None),
+            "watermark_path": getattr(self, 'global_watermark_path', None),
             "out_dir": out_dir,
             "is_single": is_single
         }
@@ -1772,6 +1817,40 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             self.btn_browse_tail.setToolTip(file_path)
             self._save_tail_automation_preset()
 
+    def on_select_global_watermark(self):
+        """选择带 Alpha 通道的 MOV 动态水印。"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "选择透明 MOV 水印", "", "透明 MOV 视频 (*.mov *.MOV)"
+        )
+        if not file_path:
+            return
+        try:
+            from utils.alpha_video import probe_has_alpha
+            has_alpha = probe_has_alpha(file_path)
+        except Exception:
+            has_alpha = False
+        if not has_alpha:
+            QMessageBox.warning(
+                self, "水印没有透明通道",
+                "这个 MOV 没有检测到 Alpha 透明通道，已取消添加。\n\n"
+                "请选择 ProRes 4444、Animation 或 PNG codec 等带 Alpha 的 MOV。")
+            return
+        self.global_watermark_path = file_path
+        self.btn_browse_watermark.setText(
+            f"已选透明水印: {os.path.basename(file_path)}")
+        self.btn_browse_watermark.setToolTip(file_path)
+        self.btn_clear_watermark.setEnabled(True)
+        self._save_tail_automation_preset()
+
+    def clear_global_watermark(self):
+        """清除动态水印，之后导出不再叠加。"""
+        self.global_watermark_path = ""
+        self.btn_browse_watermark.setText("点击选择透明 MOV 水印")
+        self.btn_browse_watermark.setToolTip(
+            "选择带 Alpha 通道的 MOV，导出时缩放到整个画布并循环叠加")
+        self.btn_clear_watermark.setEnabled(False)
+        self._save_tail_automation_preset()
+
     @staticmethod
     def _tail_setting_bool(value, default=False):
         if value is None:
@@ -1786,7 +1865,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         # 从旧版扒取页内嵌预设迁移一次，避免升级后用户设置丢失。
         if not s.contains("tail_path"):
             old = QSettings("CreativeEnginePro", "ScrapeAutomation")
-            for key in ("tail_mode", "tail_path", "ratio", "rename",
+            for key in ("tail_mode", "tail_path", "watermark_path", "ratio", "rename",
                         "output_dir", "auto_export"):
                 if old.contains(key):
                     s.setValue(key, old.value(key))
@@ -1800,6 +1879,13 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             self.global_tail_path = tail_path
             self.btn_browse_tail.setText(f"已选: {os.path.basename(tail_path)}")
             self.btn_browse_tail.setToolTip(tail_path)
+        watermark_path = str(s.value("watermark_path", ""))
+        if watermark_path and os.path.isfile(watermark_path):
+            self.global_watermark_path = watermark_path
+            self.btn_browse_watermark.setText(
+                f"已选透明水印: {os.path.basename(watermark_path)}")
+            self.btn_browse_watermark.setToolTip(watermark_path)
+            self.btn_clear_watermark.setEnabled(True)
         mode = str(s.value("tail_mode", "append"))
         idx = self.tail_auto_mode.findData(mode)
         self.tail_auto_mode.setCurrentIndex(max(0, idx))
@@ -1813,6 +1899,8 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         s = QSettings("CreativeEnginePro", "TailAutomation")
         s.setValue("tail_mode", self.tail_auto_mode.currentData())
         s.setValue("tail_path", getattr(self, "global_tail_path", ""))
+        s.setValue(
+            "watermark_path", getattr(self, "global_watermark_path", ""))
         s.setValue("ratio", self.v_ratio.currentText())
         s.setValue("rename", self.v_base_name.text().strip())
         s.setValue("output_dir", self.tail_auto_output.text().strip())
@@ -1832,6 +1920,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             "destination": "tail",
             "tail_mode": self.tail_auto_mode.currentData(),
             "tail_path": getattr(self, "global_tail_path", ""),
+            "watermark_path": getattr(self, "global_watermark_path", ""),
             "ratio": self.v_ratio.currentText(),
             "rename": self.v_base_name.text().strip(),
             "output_dir": self.tail_auto_output.text().strip(),
@@ -1977,6 +2066,17 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.global_tail_path = tail_path
         self.btn_browse_tail.setText(f"已选: {os.path.basename(tail_path)}")
         self.btn_browse_tail.setToolTip(tail_path)
+        watermark_path = preset.get("watermark_path", "")
+        if watermark_path and os.path.isfile(watermark_path):
+            self.global_watermark_path = watermark_path
+            self.btn_browse_watermark.setText(
+                f"已选透明水印: {os.path.basename(watermark_path)}")
+            self.btn_browse_watermark.setToolTip(watermark_path)
+            self.btn_clear_watermark.setEnabled(True)
+        else:
+            self.global_watermark_path = ""
+            self.btn_browse_watermark.setText("点击选择透明 MOV 水印")
+            self.btn_clear_watermark.setEnabled(False)
         ratio = preset.get("ratio", "")
         ratio_idx = self.v_ratio.findText(ratio)
         if ratio_idx >= 0:

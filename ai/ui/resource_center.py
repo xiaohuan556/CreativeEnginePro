@@ -1777,7 +1777,8 @@ class AssetStudioDialog(QDialog):
                 from config import OUTPUT_DIR
                 folder = Path(OUTPUT_DIR) / "ai_images"
             except Exception:
-                folder = Path(__file__).parents[2] / "work_temp" / "ai_assets"
+                from utils.app_paths import work_root
+                folder = work_root() / "ai_assets"
             folder.mkdir(parents=True, exist_ok=True)
             path = folder / f"resource_{uuid.uuid4().hex[:10]}.png"
             path.write_bytes(bytes(value))

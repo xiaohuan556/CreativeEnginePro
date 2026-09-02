@@ -753,6 +753,80 @@ class EditTimeline(QObject):
             self.changed.emit()
             return n - 1
 
+    def paste_clips(self, items: list, timeline_start: float) -> list:
+        """把跨时间线剪贴板片段粘贴到 ``timeline_start``。
+
+        ``items`` 每项包含 ``clip/kind/track_idx/offset``。优先使用来源对应轨道；
+        目标时间有冲突时向上寻找空闲同类轨，全部冲突则新建轨道。整个粘贴只
+        保存一个撤销快照并只发射一次 changed，视频、音频、字幕规则保持一致。
+        返回 ``[(new_clip, kind, target_track_idx), ...]``。
+        """
+        valid = [item for item in (items or [])
+                 if item.get("kind") in ("video", "audio", "subtitle")
+                 and item.get("clip") is not None]
+        if not valid:
+            return []
+
+        anchor = max(0.0, float(timeline_start))
+        self._save_history()
+        results = []
+
+        # 同一来源轨上的多选片段保持在同一目标轨，并保留相对时间间距。
+        groups = {}
+        for item in valid:
+            key = (item["kind"], max(0, int(item.get("track_idx", 0))))
+            groups.setdefault(key, []).append(item)
+
+        for (kind, source_track_idx), group in groups.items():
+            if kind == "video":
+                tracks, infos = self.video_tracks, self.video_track_info
+            elif kind == "audio":
+                tracks, infos = self.audio_tracks, self.audio_track_info
+            else:
+                tracks, infos = self.subtitle_tracks, self.subtitle_track_info
+
+            clones = []
+            intervals = []
+            for item in sorted(group, key=lambda x: float(x.get("offset", 0.0))):
+                clone = copy.deepcopy(item["clip"])
+                clone.id = str(uuid.uuid4())[:8]
+                new_start = anchor + float(item.get("offset", 0.0))
+                duration = max(0.0, float(getattr(clone, "duration", 0.0)))
+                clone.timeline_start = new_start
+                if kind == "subtitle":
+                    clone.timeline_end = new_start + duration
+                clones.append(clone)
+                intervals.append((new_start, new_start + duration))
+
+            preferred = min(source_track_idx, max(0, len(tracks) - 1))
+            chosen = -1
+            for idx in range(preferred, len(tracks)):
+                conflict = any(
+                    existing.timeline_start < end
+                    and existing.timeline_end > start
+                    for start, end in intervals
+                    for existing in tracks[idx]
+                )
+                if not conflict:
+                    chosen = idx
+                    break
+
+            if chosen < 0:
+                chosen = len(tracks)
+                tracks.append([])
+                if kind == "video":
+                    infos.append(TrackInfo("主轨道" if chosen == 0 else f"视频{chosen}"))
+                elif kind == "audio":
+                    infos.append(TrackInfo(f"音频{chosen + 1}"))
+                else:
+                    infos.append(TrackInfo(f"字幕{chosen + 1}"))
+
+            tracks[chosen].extend(clones)
+            results.extend((clone, kind, chosen) for clone in clones)
+
+        self.changed.emit()
+        return results
+
     def close_main_track_gaps(self, save_history: bool = True):
         """手动压实主视频轨空隙（仅 auto_align=ON 时生效）。
         将主轨所有片段左移到首尾相接，首个片段从0秒开始。
@@ -2284,7 +2358,13 @@ class FFmpegDirectExportWorker(QThread):
 
     def _export_via_compositor(self, ff, input_files, audio_clips, total_dur):
         """背景轨含转场时，视频经 compositor 逐帧渲染（与预览同源，15 种转场像素级一致），
-        原始 RGBA 帧通过 stdin 喂给 ffmpeg；音频仍走 filter_complex（含转场交叉淡入淡出）。
+        原始 RGBA 帧通过 stdin 喂给 ffmpeg。画面先独立编码成无声临时视频，随后
+        再用 filter_complex 混音并以 stream-copy 封装最终文件。
+
+        复杂字幕（例如 ASR 逐词动画）会走本路径。旧实现让同一个 FFmpeg 进程一边
+        从 stdin 吞逐帧画面、一边从所有素材文件取音频；部分 Windows/长素材组合下
+        音频输入会被提前结束，FFmpeg 仍返回 0，最终得到静音视频。两阶段封装隔离了
+        两类输入，且最终显式校验音轨，避免“导出成功但没声音”。
         字幕由 compositor 在帧内烧录，无需单独 drawtext。"""
         import sys
 
@@ -2320,31 +2400,24 @@ class FFmpegDirectExportWorker(QThread):
             self.finished.emit(False, f"渲染器初始化失败：{e}")
             return
 
-        # 音频仍走 filter_complex（file 输入索引 0..n-1，与下方输入顺序一致）
+        # 音频在第二阶段走 filter_complex（file 输入索引仍为 0..n-1）
         a_parts, a_label = self._build_audio_graph(audio_clips, total_dur)
 
-        # 输入：文件（音频源）在前，原始视频管道（stdin）作为最后一个输入
-        input_args = []
-        for path in input_files:
-            ext = os.path.splitext(path)[1].lower()
-            if ext in _IMG_EXTS:
-                input_args.extend(["-loop", "1"])
-            input_args.extend(["-i", path])
-        pipe_idx = len(input_files)  # 视频管道对应的输入索引
+        import tempfile
+        output_dir = os.path.dirname(os.path.abspath(self.output)) or None
+        temp_fd, temp_video = tempfile.mkstemp(
+            prefix="ce_render_", suffix=".mp4", dir=output_dir)
+        os.close(temp_fd)
 
-        cmd = [ff, "-y"] + input_args + [
+        # 第一阶段只负责编码画面。没有素材文件输入与 raw stdin 争用。
+        cmd = [ff, "-y",
             "-f", "rawvideo", "-pix_fmt", "rgba",
             "-s", f"{self.W}x{self.H}", "-r", str(self.fps), "-i", "-",
-            "-map", f"{pipe_idx}:v",
+            "-map", "0:v:0", "-an",
         ]
-        if a_label:
-            cmd += ["-filter_complex", ";".join(a_parts),
-                    "-map", f"[{a_label}]", "-c:a", "aac", "-b:a", "192k"]
-        else:
-            cmd += ["-an"]
         cmd += ["-c:v", "libx264", "-preset", "fast",
                 "-crf", str(self.crf), "-pix_fmt", "yuv420p",
-                "-r", str(self.fps), self.output]
+                "-r", str(self.fps), temp_video]
 
         self._check_cancel()
         self.progress.emit(15, "开始渲染导出…")
@@ -2361,6 +2434,7 @@ class FFmpegDirectExportWorker(QThread):
                 cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
                 text=False, creationflags=creationflags,
             )
+            self._proc = proc
             import threading as _threading
             _stderr_chunks = []
             _stderr_done = _threading.Event()
@@ -2377,6 +2451,10 @@ class FFmpegDirectExportWorker(QThread):
             _stderr_thread = _threading.Thread(target=_drain_stderr, daemon=True)
             _stderr_thread.start()
         except Exception as e:
+            try:
+                os.remove(temp_video)
+            except OSError:
+                pass
             self.finished.emit(False, f"无法启动 FFmpeg：{e}")
             return
 
@@ -2429,7 +2507,20 @@ class FFmpegDirectExportWorker(QThread):
                 pass
             try:
                 proc.terminate()
+                proc.wait(timeout=2)
             except Exception:
+                pass
+            try:
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.close()
+                _stderr_done.wait(timeout=1.0)
+                proc.stderr.close()
+            except Exception:
+                pass
+            self._proc = None
+            try:
+                os.remove(temp_video)
+            except OSError:
                 pass
             self.finished.emit(False, f"渲染失败：{e}\n{tb}{extra}")
             return
@@ -2438,6 +2529,11 @@ class FFmpegDirectExportWorker(QThread):
             proc.wait(timeout=600)
         except subprocess.TimeoutExpired:
             proc.kill()
+            self._proc = None
+            try:
+                os.remove(temp_video)
+            except OSError:
+                pass
             self.finished.emit(False, "导出超时（超过10分钟）")
             return
         finally:
@@ -2446,14 +2542,106 @@ class FFmpegDirectExportWorker(QThread):
                 comp.close()
             except Exception:
                 pass
+            try:
+                _stderr_done.wait(timeout=1.0)
+                proc.stderr.close()
+            except Exception:
+                pass
 
-        if proc.returncode == 0:
-            self.progress.emit(100, "导出完成 ✓")
-            self.finished.emit(True, self.output)
-        elif self._cancelled:
-            self.finished.emit(False, "用户取消")
+        self._proc = None
+
+        if proc.returncode != 0:
+            try:
+                stderr_text = b"".join(_stderr_chunks).decode(
+                    "utf-8", "replace").strip()[-1000:]
+            except Exception:
+                stderr_text = ""
+            try:
+                os.remove(temp_video)
+            except OSError:
+                pass
+            if self._cancelled:
+                self.finished.emit(False, "用户取消")
+            else:
+                extra = f"\n{stderr_text}" if stderr_text else ""
+                self.finished.emit(False, f"画面渲染失败{extra}")
+            return
+
+        # 第二阶段：把已编码画面与时间线混音结果封装。视频 stream-copy，
+        # 不会二次压缩；音频单独处理使复杂字幕路径与普通字幕路径同样可靠。
+        if self._cancelled:
+            try:
+                os.remove(temp_video)
+            except OSError:
+                pass
+            raise RuntimeError("用户取消")
+        self.progress.emit(96, "封装音频…")
+        if a_label:
+            input_args = []
+            for path in input_files:
+                ext = os.path.splitext(path)[1].lower()
+                if ext in _IMG_EXTS:
+                    input_args.extend(["-loop", "1"])
+                input_args.extend(["-i", path])
+            video_idx = len(input_files)
+            mux_cmd = [ff, "-y"] + input_args + [
+                "-i", temp_video,
+                "-filter_complex", ";".join(a_parts),
+                "-map", f"{video_idx}:v:0", "-map", f"[{a_label}]",
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", self.output,
+            ]
         else:
-            self.finished.emit(False, "导出失败，请检查素材文件")
+            mux_cmd = [
+                ff, "-y", "-i", temp_video,
+                "-map", "0:v:0", "-c:v", "copy", "-an",
+                "-movflags", "+faststart", self.output,
+            ]
+
+        try:
+            mux_proc = subprocess.Popen(
+                mux_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                text=False, creationflags=creationflags,
+            )
+            self._proc = mux_proc
+            _mux_out, mux_err = mux_proc.communicate(timeout=600)
+        except subprocess.TimeoutExpired:
+            mux_proc.kill()
+            mux_err = "音频封装超时".encode("utf-8")
+        except Exception as e:
+            mux_err = str(e).encode("utf-8", "replace")
+            mux_proc = None
+        finally:
+            self._proc = None
+            try:
+                if mux_proc is not None and mux_proc.stderr is not None:
+                    mux_proc.stderr.close()
+            except Exception:
+                pass
+            try:
+                os.remove(temp_video)
+            except OSError:
+                pass
+
+        if mux_proc is None or mux_proc.returncode != 0:
+            err = (mux_err or b"").decode("utf-8", "replace").strip()[-1500:]
+            self.finished.emit(False, f"音频封装失败\n{err}")
+            return
+
+        if a_label:
+            try:
+                from utils import alpha_video as _alpha_video
+                # 用户经常覆盖同一路径；清掉旧导出结果的探测缓存再验新文件。
+                _alpha_video._audio_cache.pop(self.output, None)
+                has_output_audio = _alpha_video.probe_has_audio(self.output)
+            except Exception:
+                has_output_audio = True  # 校验工具不可用时，以 FFmpeg 成功为准
+            if not has_output_audio:
+                self.finished.emit(False, "导出文件缺少音轨，请检查源素材音频")
+                return
+
+        self.progress.emit(100, "导出完成 ✓")
+        self.finished.emit(True, self.output)
 
     def _do_export(self):
         import sys

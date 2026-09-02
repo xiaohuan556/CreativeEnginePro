@@ -20,12 +20,17 @@ def _fix_onnxruntime_path():
             break
     for d in found:
         try:
-            os.add_dll_directory(d)
+            handles = list(getattr(sys, "_cep_dll_directory_handles", []))
+            handles.append(os.add_dll_directory(d))
+            sys._cep_dll_directory_handles = handles
         except Exception:
             pass
         p = os.environ.get("PATH", "")
         if d not in p.split(";"):
-            os.environ["PATH"] = d + ";" + p
+            # Qt must keep precedence in the main desktop process.  The DLL
+            # directory cookie above is enough for Python extension loading;
+            # PATH remains a fallback for native child processes.
+            os.environ["PATH"] = p + (";" if p else "") + d
 
 
 _fix_onnxruntime_path()

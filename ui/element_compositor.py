@@ -181,7 +181,8 @@ def _output_folder(subfolder="ai_images") -> Path:
         from config import OUTPUT_DIR
         folder = Path(OUTPUT_DIR) / subfolder
     except Exception:
-        folder = Path(__file__).parent.parent / "work_temp" / subfolder
+        from utils.app_paths import work_root
+        folder = work_root() / subfolder
     folder.mkdir(parents=True, exist_ok=True)
     return folder
 

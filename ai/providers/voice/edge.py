@@ -96,8 +96,8 @@ class FishAudioProvider(VoiceProvider):
             output_path = request.params.get("output_path",
                 str(Path(__import__("tempfile").gettempdir()) / f"tts_{handle.id}.mp3"))
 
-            from core.tts_fish import FishAudioEngine
-            engine = FishAudioEngine(api_key=self.api_key)
+            from core.tts_fish import FishTTSEngine
+            engine = FishTTSEngine(api_key=self.api_key)
             result_path, _ = synthesize_with_real_pauses(
                 source_text, Path(output_path),
                 lambda phrase, target: engine.synthesize_segment(
@@ -115,13 +115,49 @@ class FishAudioProvider(VoiceProvider):
         return handle
 
 
+class CosyVoiceProvider(VoiceProvider):
+    """Self-hosted official CosyVoice FastAPI zero-shot voice cloning."""
+    name = "cosyvoice"
+    capabilities = ["text_to_speech", "clone_voice"]
+    requires_auth = False
+
+    def __init__(self, base_url: str):
+        self.base_url = base_url.rstrip("/")
+        super().__init__()
+
+    def execute(self, request: TaskRequest) -> TaskHandle:
+        handle = TaskHandle(id=f"cosyvoice_{request.to_cache_key()[:8]}", provider_name=self.name,
+                            operation=request.operation, status=TaskStatus.RUNNING)
+        try:
+            from core.tts_cosyvoice import CosyVoiceEngine
+            source_text = str(request.inputs.get("text") or "")
+            reference_audio = str(request.inputs.get("reference_audio") or "")
+            reference_text = str(request.params.get("reference_transcript") or "")
+            output_path = Path(request.params.get("output_path") or
+                               (Path(__import__("tempfile").gettempdir()) / f"tts_{handle.id}.wav"))
+            result = CosyVoiceEngine(self.base_url).synthesize(
+                source_text, reference_audio, reference_text, output_path,
+                float(request.params.get("speed") or 1.0))
+            handle.status = TaskStatus.DONE
+            handle.progress = 1.0
+            handle.result = TaskResult(success=True, data=str(result))
+        except Exception as error:
+            handle.status = TaskStatus.FAILED
+            handle.result = TaskResult(success=False, error=str(error))
+        handle.finished_at = __import__("time").time()
+        return handle
+
+
 class FactoryTTSProvider(VoiceProvider):
     """把剪辑工作台已有的 TTS 引擎暴露给画布 TaskManager。"""
     capabilities = ["text_to_speech"]
+    # Credentials are owned by the existing TTS factory/configuration layer.
+    # This adapter must not reject construction before that layer is invoked.
+    requires_auth = False
 
     def __init__(self, engine_name: str):
-        super().__init__()
         self.name = engine_name
+        super().__init__()
 
     def execute(self, request: TaskRequest) -> TaskHandle:
         handle = TaskHandle(id=f"{self.name}_{request.to_cache_key()[:8]}",
@@ -173,6 +209,7 @@ class WhisperProvider(VoiceProvider):
     """
     name = "whisper"
     capabilities = ["speech_to_text"]
+    requires_auth = False
 
     def execute(self, request: TaskRequest) -> TaskHandle:
         h = TaskHandle(id=f"whisper_{request.to_cache_key()[:8]}",
@@ -180,10 +217,13 @@ class WhisperProvider(VoiceProvider):
                        status=TaskStatus.RUNNING)
         try:
             audio_path = request.inputs.get("audio", "")
-            language = request.params.get("language", "zh")
-            from core.transcriber import Transcriber
-            t = Transcriber()
-            text = t.transcribe(audio_path, language=language)
+            language = str(request.params.get("language") or "")
+            model_size = str(request.params.get("model_size") or "base")
+            from core.whisper_runner import run_whisper_asr
+            entries = run_whisper_asr(str(audio_path), model_size=model_size, language=language)
+            text = " ".join(str(item.get("text") or "").strip() for item in entries).strip()
+            if not text:
+                raise RuntimeError("Whisper 没有识别到清晰语音")
             h.status = TaskStatus.DONE
             h.progress = 1.0
             h.result = TaskResult(success=True, data=text)

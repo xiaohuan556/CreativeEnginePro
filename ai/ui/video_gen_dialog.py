@@ -2,7 +2,7 @@
 AI 视频生成对话框 —— 从时间线视频片段右键菜单打开。
 
 支持：
-- Seedance 2.0 / Veo 3.1（ModelHub）
+- Seedance 2.0 / Seedance 2.5 / Veo 3.1
 - 文生视频 / 图生视频（参考图来自本地文件）
 - 时长 / 比例 / 是否生成音频
 - 后台生成 + 进度轮询 + 结果预览
@@ -26,15 +26,18 @@ from PyQt6.QtWidgets import (
 
 from ai import TaskRequest, ProviderDomain
 from ai.service import get_ai_manager
+from ai.providers.video.seedance_models import (
+    SEEDANCE_25_MODEL, SEEDANCE_MODEL_PROFILES, seedance_model_profile,
+)
 
 
 PROVIDER_LABELS_VIDEO = {
-    "seedance": "Seedance 2.0（豆包）",
+    "seedance": "Seedance（豆包共享 API）",
     "veo": "Veo 3.1（ModelHub / OpenAI）",
 }
 
 RATIO_OPTIONS = ["adaptive", "16:9", "9:16", "1:1"]
-DURATION_OPTIONS = [3, 4, 5, 6, 8, 10]
+DURATION_OPTIONS = [4, 5, 6, 8, 10, 12, 15]
 VEO_RATIO_OPTIONS = ["16:9", "9:16"]
 VEO_DURATION_OPTIONS = [4, 6, 8]
 
@@ -91,6 +94,20 @@ class VideoGenDialog(QDialog):
             root.addWidget(self._notice)
             root.addStretch(1)
             return
+
+        hmodel = QHBoxLayout()
+        hmodel.addWidget(QLabel("模型"))
+        self._model = QComboBox()
+        for profile in SEEDANCE_MODEL_PROFILES:
+            self._model.addItem(
+                f"{profile['label']} · 最长 {profile['max_duration']} 秒",
+                profile["id"])
+        # New text-to-video work defaults to 2.5; 2.0 remains explicitly
+        # selectable for older endpoints and compatible saved workflows.
+        self._model.setCurrentIndex(max(0, self._model.findData(SEEDANCE_25_MODEL)))
+        self._model.currentIndexChanged.connect(self._on_model_changed)
+        hmodel.addWidget(self._model, 1)
+        root.addLayout(hmodel)
 
         # 模式
         mode_row = QHBoxLayout()
@@ -150,10 +167,21 @@ class VideoGenDialog(QDialog):
         h1.addWidget(self._ratio, 1)
         root.addLayout(h1)
 
+        hresolution = QHBoxLayout()
+        hresolution.addWidget(QLabel("清晰度"))
+        self._resolution = QComboBox()
+        hresolution.addWidget(self._resolution, 1)
+        root.addLayout(hresolution)
+
         # 音频
         self._audio = QCheckBox("生成配音 / 音效（原生音画）")
         self._audio.setChecked(True)
         root.addWidget(self._audio)
+        self._audio_prompt = QLineEdit()
+        self._audio_prompt.setPlaceholderText(
+            "声音怎么安排，例如：雨声、对白、动作声与画面同步")
+        self._audio.toggled.connect(self._audio_prompt.setEnabled)
+        root.addWidget(self._audio_prompt)
 
         # 生成
         self._gen_btn = QPushButton("✨ 生成视频")
@@ -221,7 +249,10 @@ class VideoGenDialog(QDialog):
     def _on_provider_changed(self, _):
         provider = self._provider.currentData() or ""
         ratios = VEO_RATIO_OPTIONS if provider == "veo" else RATIO_OPTIONS
-        durations = VEO_DURATION_OPTIONS if provider == "veo" else DURATION_OPTIONS
+        self._model.setVisible(provider == "seedance")
+        durations = (VEO_DURATION_OPTIONS if provider == "veo" else
+                     list(seedance_model_profile(self._model.currentData()).get(
+                         "durations") or DURATION_OPTIONS))
         old_ratio = self._ratio.currentText()
         old_duration = int(self._duration.currentText() or 8)
 
@@ -240,6 +271,22 @@ class VideoGenDialog(QDialog):
         self._duration.blockSignals(False)
         self._ratio.setToolTip(
             "Veo 3.1 仅支持 16:9 和 9:16" if provider == "veo" else "")
+        self._refresh_resolutions(provider)
+
+    def _on_model_changed(self, _index):
+        if (self._provider.currentData() or "") == "seedance":
+            self._on_provider_changed(self._provider.currentText())
+
+    def _refresh_resolutions(self, provider: str):
+        old_value = self._resolution.currentText()
+        values = (["720p", "1080p"] if provider == "veo" else
+                  list(seedance_model_profile(self._model.currentData()).get(
+                      "resolutions") or ["720p"]))
+        self._resolution.blockSignals(True)
+        self._resolution.clear()
+        self._resolution.addItems(values)
+        self._resolution.setCurrentText(old_value if old_value in values else "720p")
+        self._resolution.blockSignals(False)
 
     def _on_mode_changed(self, _):
         self._ref_box.setVisible(self._rb_image.isChecked())
@@ -283,14 +330,19 @@ class VideoGenDialog(QDialog):
         duration = int(self._duration.currentText())
         ratio = self._ratio.currentText()
         gen_audio = self._audio.isChecked()
+        audio_prompt = self._audio_prompt.text().strip()
+        if gen_audio and audio_prompt:
+            prompt = f"{prompt}\n声音计划：{audio_prompt}".strip()
 
         params: dict = {"duration": duration, "generate_audio": gen_audio}
         if prov == "seedance":
             params["ratio"] = ratio
             params["watermark"] = False
+            params["model"] = str(self._model.currentData() or SEEDANCE_25_MODEL)
+            params["resolution"] = self._resolution.currentText() or "720p"
         else:  # veo
             params["aspect_ratio"] = "16:9" if ratio == "adaptive" else ratio
-            params["resolution"] = "720p"
+            params["resolution"] = self._resolution.currentText() or "720p"
 
         inputs: dict = {"prompt": prompt}
         if is_img and self._ref_path:
@@ -339,8 +391,8 @@ class VideoGenDialog(QDialog):
         else:
             err = h.result.error if h.result else "未知错误"
             if "not authorized for this api key" in err.lower():
-                err = ("当前 ModelHub API Key 没有 Seedance 2.0 权限；请在 API Key "
-                       "管理中把 doubao-seedance-2.0 加入模型范围")
+                err = ("当前 API Key 没有所选 Seedance 模型权限；请在方舟模型列表中"
+                       "确认对应端点已开放")
             self._result.setText("❌ 生成失败")
             self._set_status(f"失败：{err}")
 

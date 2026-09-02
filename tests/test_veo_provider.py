@@ -8,7 +8,12 @@ from unittest.mock import patch
 
 from ai.providers.ark_http import ArkHTTPError, _http_error_message
 from ai.providers.base import TaskRequest
-from ai.providers.video.veo import VeoProvider, _seedance_generate_audio
+from ai.providers.video.veo import (
+    SeedanceProvider, VeoProvider, _seedance_generate_audio,
+)
+from ai.providers.video.seedance_models import (
+    SEEDANCE_20_MODEL, SEEDANCE_25_MODEL, seedance_model_profile,
+)
 
 
 OPERATION = (
@@ -87,6 +92,24 @@ class VeoProviderTests(unittest.TestCase):
         self.assertTrue(_seedance_generate_audio({}))
         self.assertTrue(_seedance_generate_audio({"generate_audio": True}))
         self.assertFalse(_seedance_generate_audio({"generate_audio": False}))
+
+    def test_seedance_25_profile_exposes_30_second_limit(self):
+        old = seedance_model_profile(SEEDANCE_20_MODEL)
+        new = seedance_model_profile(SEEDANCE_25_MODEL)
+        self.assertEqual(15, old["max_duration"])
+        self.assertEqual(30, new["max_duration"])
+        self.assertEqual(30, new["reference_images"])
+
+    def test_seedance_20_rejects_30_seconds_before_paid_submit(self):
+        provider = SeedanceProvider(api_key="ark-test", model=SEEDANCE_20_MODEL)
+        request = TaskRequest(
+            operation="text_to_video", inputs={"prompt": "测试"},
+            params={"model": SEEDANCE_20_MODEL, "duration": 30, "resolution": "720p"})
+        with patch("ai.providers.video.veo.ark_post") as mock_post:
+            handle = provider.execute(request)
+        self.assertFalse(handle.is_success)
+        self.assertIn("仅支持 4–15 秒", handle.result.error)
+        mock_post.assert_not_called()
 
     def test_transient_poll_failures_do_not_duplicate_submit(self):
         patches = self._patches([

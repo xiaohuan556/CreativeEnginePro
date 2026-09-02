@@ -33,13 +33,12 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from utils.app_paths import install_root, user_data_root
 
 # ── 项目根 & .env 路径 ──
-if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-    PROJECT_ROOT = Path(sys.executable).parent
-else:
-    PROJECT_ROOT = Path(__file__).parent
+PROJECT_ROOT = user_data_root()
 ENV_PATH = PROJECT_ROOT / ".env"
+LEGACY_ENV_PATH = install_root() / ".env"
 
 
 @dataclass
@@ -249,13 +248,18 @@ def all_entries():
 def read_env() -> dict:
     """读取 .env 为 {KEY: VALUE} 字典。"""
     d = {}
-    if ENV_PATH.exists():
-        for line in ENV_PATH.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, _, v = line.partition("=")
-            d[k.strip()] = v.strip().strip('"').strip("'")
+    # Read the legacy portable config first, then let LocalAppData override it.
+    paths = [LEGACY_ENV_PATH]
+    if ENV_PATH != LEGACY_ENV_PATH:
+        paths.append(ENV_PATH)
+    for path in paths:
+        if path.exists():
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, _, v = line.partition("=")
+                d[k.strip()] = v.strip().strip('"').strip("'")
     return d
 
 

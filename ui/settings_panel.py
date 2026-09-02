@@ -244,14 +244,12 @@ class SettingsPanel(QWidget):
             "关于与路径", "查看配置位置，明确哪些设置应在哪个工作台完成。")
         about = _card("CreativeEnginePro", "面向批量内容生产的剪辑、AI 生成和自动化工作台")
         form = about.layout()
-        form.addWidget(_path_line("项目目录", Path.cwd()))
-        try:
-            from api_config import ENV_PATH
-            env_path = ENV_PATH
-        except Exception:
-            env_path = Path.cwd() / ".env"
+        from api_config import ENV_PATH
+        from utils.app_paths import install_root, work_root
+        form.addWidget(_path_line("安装目录", install_root()))
+        env_path = ENV_PATH
         form.addWidget(_path_line("环境配置", env_path))
-        form.addWidget(_path_line("缓存目录", Path.cwd() / "work_temp"))
+        form.addWidget(_path_line("缓存目录", work_root()))
         layout.addWidget(about)
 
         scope = _card("设置归属", "功能参数就近管理，减少重复和冲突")

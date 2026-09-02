@@ -3,7 +3,7 @@ media_library.py — 素材库面板（剪映风格卡片网格）
 - 每个素材一张卡片：圆角 16:9 预览框 + 底色，大小统一
 - 默认一行三个，固定间距，窗口缩放自适应（2~5 列）
 - 右上角：素材时长（秒）
-- 左上角：轨道状态角标（✓ 已添加 / 未添加）
+- 左上角：仅当素材正在时间线中时显示状态角标
 - 底部：素材名（过长自动省略）
 - 支持：拖拽加入时间线、双击预览、右键加入/移除、从文件管理器拖入导入
 """
@@ -12,14 +12,16 @@ import os
 import re
 import sys
 import logging
+import subprocess
 from typing import Optional, Callable
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel, QFileDialog,
-    QAbstractItemView, QSizePolicy, QMenu, QApplication, QFrame,
+    QAbstractItemView, QSizePolicy, QMenu, QApplication, QFrame, QMessageBox,
     QGridLayout, QScrollArea,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QMimeData, QPoint, QUrl, QThread
-from PyQt6.QtGui import QIcon, QPixmap, QColor, QDrag, QImage, QFontMetrics, QPainter, QFont
+from PyQt6.QtGui import (QIcon, QPixmap, QColor, QDrag, QImage, QFontMetrics,
+                         QPainter, QFont, QDesktopServices)
 
 from core.edit_engine import EditTimeline, VideoClip, AudioClip
 import cv2
@@ -56,6 +58,11 @@ def _get_media_type(path: str) -> str:
     if ext in IMAGE_EXTS:
         return "image"
     return "unknown"
+
+
+def _is_supported_media(path: str) -> bool:
+    """素材库只接受视频、音频和图片扩展名。"""
+    return _get_media_type(path) in ("video", "audio", "image")
 
 
 def _make_thumbnail(path: str, media_type: str, size=None) -> QPixmap:
@@ -248,10 +255,13 @@ class _MediaCard(QFrame):
         pg.addWidget(self._thumb_label, 0, 0, 1, 3)
 
         # 左上角：轨道状态角标
-        self._status_badge = QLabel("未添加")
+        self._status_badge = QLabel("✓ 时间线中")
         self._status_badge.setStyleSheet(
-            "QLabel{ background:rgba(40,44,52,0.85); color:#9aa3b2;"
-            " border-radius:4px; padding:1px 5px; font-size:10px; font-weight:500; }")
+            "QLabel{ background:rgba(76,175,80,0.92); color:#fff;"
+            " border-radius:4px; padding:1px 5px; font-size:10px; font-weight:600; }")
+        # 出现在素材库本身就表示“已导入”。未放入时间线时不再显示容易误解的
+        # “未添加”角标，只有实际被时间线使用时才展示状态。
+        self._status_badge.setVisible(False)
         pg.addWidget(self._status_badge, 0, 0,
                      alignment=Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
 
@@ -294,15 +304,10 @@ class _MediaCard(QFrame):
             return
         self._on_track = on_track
         if on_track:
-            self._status_badge.setText("✓ 已添加")
-            self._status_badge.setStyleSheet(
-                "QLabel{ background:rgba(76,175,80,0.92); color:#fff;"
-                " border-radius:4px; padding:1px 5px; font-size:10px; font-weight:600; }")
+            self._status_badge.setText("✓ 时间线中")
+            self._status_badge.setVisible(True)
         else:
-            self._status_badge.setText("未添加")
-            self._status_badge.setStyleSheet(
-                "QLabel{ background:rgba(40,44,52,0.85); color:#9aa3b2;"
-                " border-radius:4px; padding:1px 5px; font-size:10px; font-weight:500; }")
+            self._status_badge.setVisible(False)
 
     def _scale_thumb(self):
         if self._orig_pix is None or self._orig_pix.isNull():
@@ -360,10 +365,18 @@ class _MediaCard(QFrame):
             QMenu::item:selected { background:#3d8ef8; color:#fff; }
         """)
         act_add = menu.addAction("加入时间线")
+        menu.addSeparator()
+        act_reveal = menu.addAction("📂 在文件夹中显示")
+        act_copy_dir = menu.addAction("复制文件目录地址")
+        menu.addSeparator()
         act_del = menu.addAction("从素材库移除")
         act = menu.exec(self.mapToGlobal(e.pos()))
         if act == act_add and self._cb.get("add"):
             self._cb["add"](self._media.path, self._media.media_type, self._media.duration)
+        elif act == act_reveal and self._cb.get("reveal"):
+            self._cb["reveal"](self._media.path)
+        elif act == act_copy_dir and self._cb.get("copy_dir"):
+            self._cb["copy_dir"](self._media.path)
         elif act == act_del and self._cb.get("remove"):
             self._cb["remove"](self._media.path)
 
@@ -471,20 +484,34 @@ class MediaLibrary(QWidget):
 
     # ─── 拖入导入（从文件管理器）───
     def dragEnterEvent(self, e):
-        if e.mimeData().hasUrls():
+        supported = any(
+            url.isLocalFile()
+            and os.path.isfile(url.toLocalFile())
+            and _is_supported_media(url.toLocalFile())
+            for url in e.mimeData().urls()
+        ) if e.mimeData().hasUrls() else False
+        if supported:
             e.acceptProposedAction()
         else:
             e.ignore()
 
     def dragMoveEvent(self, e):
-        if e.mimeData().hasUrls():
+        supported = any(
+            url.isLocalFile()
+            and os.path.isfile(url.toLocalFile())
+            and _is_supported_media(url.toLocalFile())
+            for url in e.mimeData().urls()
+        ) if e.mimeData().hasUrls() else False
+        if supported:
             e.acceptProposedAction()
         else:
             e.ignore()
 
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls()
-                 if u.isLocalFile() and os.path.isfile(u.toLocalFile())]
+                 if (u.isLocalFile()
+                     and os.path.isfile(u.toLocalFile())
+                     and _is_supported_media(u.toLocalFile()))]
         for p in paths:
             self._add_item(p)
         if paths:
@@ -503,8 +530,9 @@ class MediaLibrary(QWidget):
         for f in files:
             self._add_item(f)
 
-    def add_file(self, path: str):
-        self._add_item(path)
+    def add_file(self, path: str) -> bool:
+        """加入单个素材；非视频/音频/图片返回 False 且不进入素材库。"""
+        return self._add_item(path)
 
     def _norm_key(self, path: str) -> str:
         """归一化路径去重键：绝对路径 + Windows 大小写不敏感"""
@@ -513,12 +541,13 @@ class MediaLibrary(QWidget):
             return os.path.normcase(p)
         return p
 
-    def _add_item(self, path: str):
-        if not os.path.exists(path):
-            return
+    def _add_item(self, path: str) -> bool:
+        if not os.path.isfile(path) or not _is_supported_media(path):
+            logging.info("素材库已忽略不支持的文件类型: %s", path)
+            return False
         key = self._norm_key(path)
         if key in self._item_map:
-            return
+            return False
 
         media = MediaItem(path)
         self._items.append(media)
@@ -529,15 +558,45 @@ class MediaLibrary(QWidget):
             "remove": self._remove_media,
             "preview": lambda p, t: self.play_preview_requested.emit(p, t),
             "select": self._on_select,
+            "reveal": self._reveal_media,
+            "copy_dir": self._copy_media_directory,
         }
         card = _MediaCard(media, cb)
         self._cards.append(card)
         self._card_map[key] = card
         self._reflow()
         self._start_thumb_worker(media, key)
+        return True
 
     def _on_select(self, path: str):
         self.last_selected_path = path
+
+    def _reveal_media(self, path: str) -> bool:
+        """在系统文件管理器中定位素材；文件丢失时给出明确提示。"""
+        full_path = os.path.abspath(os.path.expanduser(path or ""))
+        if not path or not os.path.isfile(full_path):
+            QMessageBox.warning(self, "素材不存在", f"找不到素材文件：\n{full_path or path}")
+            return False
+        try:
+            if sys.platform == "win32":
+                # 参数列表调用避免路径中的空格、& 等字符被 shell 解释。
+                subprocess.Popen(["explorer.exe", "/select,", os.path.normpath(full_path)])
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", "-R", full_path])
+            else:
+                folder = os.path.dirname(full_path)
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(folder)):
+                    raise OSError(f"无法打开目录：{folder}")
+            return True
+        except Exception as exc:
+            QMessageBox.warning(self, "打开失败", f"无法打开素材所在目录：\n{exc}")
+            return False
+
+    def _copy_media_directory(self, path: str) -> str:
+        """复制素材所在目录的绝对地址，返回该地址便于测试和复用。"""
+        folder = os.path.dirname(os.path.abspath(os.path.expanduser(path or "")))
+        QApplication.clipboard().setText(folder)
+        return folder
 
     def _remove_media(self, path: str):
         key = self._norm_key(path)

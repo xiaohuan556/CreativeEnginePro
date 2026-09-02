@@ -170,7 +170,13 @@ def login(payload: LoginRequest, request: Request, response: Response, db: Sessi
     record_audit(db, request, "auth.login", user, "user", user.id)
     db.commit()
     response.set_cookie(config.session_cookie, session_token, max_age=config.session_days * 86400, httponly=True, secure=config.public_origin.startswith("https://"), samesite="strict", path="/")
-    return {"user": public_user(user, db.get(UsageLimit, user.id)), "csrf_token": csrf_token}
+    return {
+        "user": public_user(user, db.get(UsageLimit, user.id)),
+        "csrf_token": csrf_token,
+        # Desktop releases use server time as the authoritative date-lock
+        # source, so changing the Windows clock cannot extend an expired build.
+        "server_time": utcnow().isoformat(),
+    }
 
 
 @app.post("/api/auth/logout")
@@ -187,7 +193,10 @@ def logout(request: Request, response: Response, user: User = Depends(require_cs
 
 @app.get("/api/auth/me")
 def me(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
-    return {"user": public_user(user, db.get(UsageLimit, user.id))}
+    return {
+        "user": public_user(user, db.get(UsageLimit, user.id)),
+        "server_time": utcnow().isoformat(),
+    }
 
 
 @app.get("/api/auth/csrf")
@@ -616,8 +625,9 @@ def create_task(payload: TaskCreate, request: Request, user: User = Depends(requ
     if existing:
         return {"task": {"id": existing.id, "status": existing.status, "progress": existing.progress}, "deduplicated": True}
     require_project_write(db, payload.project_id, user)
-    validate_task_request(db, payload.project_id, payload.kind, payload.provider, payload.input)
     resolved_model = resolve_provider_model(payload.provider, payload.model)
+    validate_task_request(db, payload.project_id, payload.kind, payload.provider,
+                          payload.input, resolved_model)
     credits = estimate_task_credits(payload.kind, payload.provider, payload.estimated_credits)
     enforce_task_policy(db, user, payload.provider, resolved_model, credits)
     task = GenerationTask(project_id=payload.project_id, node_id=payload.node_id, owner_id=user.id, kind=payload.kind, provider=payload.provider, model=resolved_model, estimated_credits=credits, idempotency_key=idem, input_json=json.dumps(payload.input, ensure_ascii=False, separators=(",", ":")))

@@ -53,6 +53,15 @@ def _frame_at(path: str, t: float):
         return None
 
 
+def _fit_thumbnail(px: QPixmap, width: int, height: int) -> QPixmap:
+    """缩略图只做等比例缩放，不把竖屏帧强行拉宽。"""
+    return px.scaled(
+        max(1, int(width)), max(1, int(height)),
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
 class _ThumbnailStrip(QWidget):
     """简单缩略图条：显示视频缩略图、可选范围、当前播放头"""
     seek_requested = pyqtSignal(float)
@@ -98,7 +107,15 @@ class _ThumbnailStrip(QWidget):
         for i, px in enumerate(self._thumbs):
             x = int(i * thumb_w)
             tw = int((i + 1) * thumb_w) - x
-            painter.drawPixmap(x, 0, tw, h, px.scaled(tw, h, Qt.AspectRatioMode.KeepAspectRatioByExpanding, Qt.TransformationMode.SmoothTransformation))
+            # 每个时间单元内居中显示完整帧。不使用带目标宽高的
+            # drawPixmap 重载，否则它会再次把已等比缩放的图片拉伸。
+            painter.fillRect(x, 0, tw, h, QColor("#090909"))
+            fitted = _fit_thumbnail(px, tw, h)
+            draw_x = x + (tw - fitted.width()) // 2
+            draw_y = (h - fitted.height()) // 2
+            painter.drawPixmap(draw_x, draw_y, fitted)
+            if i:
+                painter.fillRect(x, 0, 1, h, QColor("#242424"))
 
         # 可选范围高亮
         if self._duration > 0 and self._range_end > self._range_start:

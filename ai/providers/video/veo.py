@@ -34,6 +34,16 @@ def _seedance_generate_audio(params: dict | None) -> bool:
     return bool((params or {}).get("generate_audio", True))
 
 
+def _is_seedance_video_edit_param_error(message: str) -> bool:
+    """Recognize Ark's sync or async video-edit parameter classification."""
+    text = str(message or "").lower()
+    return (
+        "identified your task as video editing" in text
+        or ("ratio" in text and "adaptive" in text
+            and "duration" in text and "-1" in text)
+    )
+
+
 class VideoProvider(AIProvider):
     """视频生成 / 编辑 Provider 基类。"""
     domain = ProviderDomain.VIDEO
@@ -603,7 +613,7 @@ def _seedance_compat_prompt(prompt: str) -> str:
 
 
 class SeedanceProvider(VideoProvider):
-    """字节跳动 Seedance 2.0 视频生成（方舟 / ModelHub 自动选路）。
+    """字节跳动 Seedance 2.x 视频生成（方舟 / ModelHub 自动选路）。
 
     接口：
       创建任务  POST {base}/contents/generations/tasks
@@ -615,7 +625,7 @@ class SeedanceProvider(VideoProvider):
     轮询期间会检查 handle._cancel_token 以支持取消。
     """
     name = "seedance"
-    capabilities = ["text_to_video", "image_to_video"]
+    capabilities = ["text_to_video", "image_to_video", "video_edit"]
 
     # 轮询参数
     POLL_INTERVAL = 5          # 秒
@@ -664,6 +674,15 @@ class SeedanceProvider(VideoProvider):
             # 这里不能回退为 PNG data URI，否则会重新触发服务端的误导性 400。
             raise ArkHTTPError(f"Seedance 参考图预处理失败: {exc}") from exc
 
+    @staticmethod
+    def _remote_media_url(value, label: str) -> str:
+        url = str(value or "").strip()
+        if url.startswith(("http://", "https://", "data:")):
+            return url
+        raise ArkHTTPError(
+            f"Seedance {label}必须是服务端可访问的远程 URL；"
+            "当前本地文件不能直接作为视频编辑或续长素材")
+
     def _creds(self):
         from api_config import get as _ac_get
         entry = _ac_get("seedance")
@@ -694,6 +713,16 @@ class SeedanceProvider(VideoProvider):
             if not model:
                 raise ArkHTTPError("未配置 Seedance 端点/模型 ID（api_config seedance.default_model）")
 
+            from .seedance_models import seedance_model_profile
+            model_profile = seedance_model_profile(model)
+            duration = int(round(float(request.params.get("duration", 5))))
+            min_duration = int(model_profile["min_duration"])
+            max_duration = int(model_profile["max_duration"])
+            if duration != -1 and (duration < min_duration or duration > max_duration):
+                raise ArkHTTPError(
+                    f"{model_profile['label']} 仅支持 {min_duration}–{max_duration} 秒；"
+                    f"当前请求为 {duration} 秒，请在节点参数中调整")
+
             prompt = (request.inputs.get("prompt") or "").strip()
             if not prompt:
                 raise ArkHTTPError("缺少 prompt")
@@ -701,10 +730,29 @@ class SeedanceProvider(VideoProvider):
             typed_refs = normalize_reference_assets(
                 request.inputs.get("reference_assets"),
                 request.inputs.get("style_images") or [])
+            video_refs = [item for item in typed_refs
+                          if item.get("role") == "reference_video"]
+            audio_refs = [item for item in typed_refs
+                          if item.get("role") == "reference_audio"]
+            image_refs = [item for item in typed_refs
+                          if item not in video_refs and item not in audio_refs]
+            reference_limit = int(model_profile["reference_images"])
+            video_limit = int(model_profile.get("reference_videos") or 0)
+            audio_limit = int(model_profile.get("reference_audios") or 0)
+            if len(image_refs) > reference_limit:
+                raise ArkHTTPError(
+                    f"{model_profile['label']} 当前单次最多接收 {reference_limit} 张参考图；"
+                    f"当前为 {len(image_refs)} 张，系统不会静默丢图")
+            if video_limit and len(video_refs) > video_limit:
+                raise ArkHTTPError(
+                    f"{model_profile['label']} 当前单次最多接收 {video_limit} 段参考视频")
+            if audio_limit and len(audio_refs) > audio_limit:
+                raise ArkHTTPError(
+                    f"{model_profile['label']} 当前单次最多接收 {audio_limit} 段参考音频")
             prompt = append_manifest(prompt, typed_refs)
 
             # 组装 content（数组）
-            # Seedance 2.0 三种图片场景互斥：
+            # Seedance 2.x 三种图片场景互斥：
             #   1. 图生视频-首帧：1 张 image_url，role="first_frame" 或不填
             #   2. 图生视频-首尾帧：2 张 image_url，role="first_frame" + "last_frame"
             #   3. 多模态参考：1~9 张 image_url，role="reference_image"
@@ -713,8 +761,8 @@ class SeedanceProvider(VideoProvider):
             ref = request.inputs.get("image")
             last_frame = request.inputs.get("last_frame")
             style_images: list = (
-                [item["path"] for item in typed_refs]
-                if typed_refs else list(request.inputs.get("style_images") or []))
+                [item["path"] for item in image_refs]
+                if image_refs else list(request.inputs.get("style_images") or []))
 
             if ref and last_frame:
                 # ── 首尾帧模式 ──
@@ -735,8 +783,8 @@ class SeedanceProvider(VideoProvider):
                      "role": "first_frame"},
                     {"type": "text", "text": prompt},
                 ]
-            elif style_images:
-                # ── 纯多模态参考（无首帧指定）──
+            elif style_images or video_refs or audio_refs:
+                # ── Seedance 2.5 多模态参考（无首帧指定）──
                 content = []
                 for img in style_images:
                     content.append({
@@ -744,12 +792,26 @@ class SeedanceProvider(VideoProvider):
                         "image_url": {"url": self._ref_data_url(img)},
                         "role": "reference_image",
                     })
+                for item in video_refs:
+                    content.append({
+                        "type": "video_url",
+                        "video_url": {"url": self._remote_media_url(
+                            item.get("path"), "参考视频")},
+                        "role": "reference_video",
+                    })
+                for item in audio_refs:
+                    content.append({
+                        "type": "audio_url",
+                        "audio_url": {"url": self._remote_media_url(
+                            item.get("path"), "参考音频")},
+                        "role": "reference_audio",
+                    })
                 content.append({"type": "text", "text": prompt})
             else:
                 # 文生视频
                 content = [{"type": "text", "text": prompt}]
 
-            # Seedance 2.0 supports native audio for text, first-frame,
+            # Seedance 2.x supports native audio for text, first-frame,
             # first/last-frame and multimodal-reference requests.  A former
             # compatibility workaround disabled audio whenever an image was
             # present, silently turning every image-guided production clip
@@ -760,9 +822,17 @@ class SeedanceProvider(VideoProvider):
                 "content": content,
                 "generate_audio": generate_audio,
                 "ratio": request.params.get("ratio", "adaptive"),
-                "duration": int(request.params.get("duration", 5)),
+                "duration": duration,
                 "watermark": bool(request.params.get("watermark", False)),
             }
+            resolution = str(request.params.get("resolution") or "").strip()
+            if resolution:
+                supported = list(model_profile.get("resolutions") or [])
+                if resolution not in supported:
+                    raise ArkHTTPError(
+                        f"{model_profile['label']} 不支持 {resolution}；"
+                        f"可选：{'、'.join(supported)}")
+                payload["resolution"] = resolution
 
             # 调试日志：把 payload 结构写到文件（截断 base64，避免日志膨胀）
             try:
@@ -776,6 +846,7 @@ class SeedanceProvider(VideoProvider):
             _submit_attempts = 0
             _max_attempts = 3
             _prompt_compat_applied = False
+            _video_edit_params_compat_applied = False
             while submit is None and _submit_attempts < _max_attempts:
                 _submit_attempts += 1
                 try:
@@ -783,6 +854,17 @@ class SeedanceProvider(VideoProvider):
                         f"{base}/contents/generations/tasks", api_key, payload, timeout=60)
                 except ArkHTTPError as e:
                     err_msg = str(e).lower()
+                    if (video_refs and _is_seedance_video_edit_param_error(err_msg)
+                            and not _video_edit_params_compat_applied):
+                        payload["ratio"] = "adaptive"
+                        payload["duration"] = -1
+                        _video_edit_params_compat_applied = True
+                        try:
+                            _log_seedance_payload(
+                                payload, op_name="submit_video_edit_compat")
+                        except Exception:
+                            pass
+                        continue
                     # 方舟会把部分“参考图 + 人物称谓”提示词审核误报为图片
                     # base64 无效。同图只改为“画面主体”即可成功，因此在确认
                     # 图片已经过本地严格编码后，做一次语义等价的兼容重试。
@@ -879,6 +961,7 @@ class SeedanceProvider(VideoProvider):
                                       "ratio": status.get("ratio"),
                                       "duration": status.get("duration"),
                                       "task_id": task_id,
+                                      "video_url": video_url,
                                       "prompt_compat": _prompt_compat_applied},
                     )
                     h.status = TaskStatus.DONE
@@ -887,6 +970,29 @@ class SeedanceProvider(VideoProvider):
                 elif st == "failed":
                     err = status.get("error") or status.get("content") or {}
                     msg = err.get("message", "") if isinstance(err, dict) else str(err)
+                    if (video_refs and _is_seedance_video_edit_param_error(msg)
+                            and not _video_edit_params_compat_applied):
+                        payload["ratio"] = "adaptive"
+                        payload["duration"] = -1
+                        _video_edit_params_compat_applied = True
+                        try:
+                            _log_seedance_payload(
+                                payload, op_name="poll_video_edit_compat")
+                        except Exception:
+                            pass
+                        replacement = ark_post(
+                            f"{base}/contents/generations/tasks", api_key,
+                            payload, timeout=60)
+                        task_id = str(replacement.get("id") or "")
+                        if not task_id:
+                            raise ArkHTTPError(
+                                "Seedance 视频编辑兼容重试未返回任务 ID: "
+                                f"{str(replacement)[:300]}")
+                        query_url = f"{base}/contents/generations/tasks/{task_id}"
+                        deadline = time.time() + self.POLL_TIMEOUT
+                        _poll_errors = 0
+                        h.progress = 0.05
+                        continue
                     raise ArkHTTPError(f"Seedance 任务失败: {_friendly_ark_message(msg)}")
                 else:
                     # queued / running / processing → 持续推进进度

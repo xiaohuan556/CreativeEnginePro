@@ -15,6 +15,11 @@ const geistMono = Geist_Mono({
 export const metadata: Metadata = {
   title: "AI 无限画布",
   description: "面向团队的 AI 影视制片工作流：剧本、分镜、图片、视频、声音与审片都在同一张画布完成。",
+  icons: {
+    icon: "/icon.png",
+    shortcut: "/icon.png",
+    apple: "/icon.png",
+  },
 };
 
 export default function RootLayout({

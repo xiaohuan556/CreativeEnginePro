@@ -159,6 +159,13 @@ class ClipPropertiesPanel(QWidget):
     property_changed = pyqtSignal()  # 任何属性变更后发出
     seek_requested = pyqtSignal(float)  # 请求跳转到指定时间（秒）
 
+    _TAB_PROPERTY = 0
+    _TAB_MASK = 1
+    _TAB_CHROMA = 2
+    _TAB_SPEED = 3
+    _TAB_TRANSITION = 4
+    _TAB_DUBBING = 5
+
     def __init__(self, timeline: EditTimeline, parent=None, add_audio_cb=None,
                  get_subtitles_cb=None):
         super().__init__(parent)
@@ -239,7 +246,7 @@ class ClipPropertiesPanel(QWidget):
 
         scroll.setWidget(self._content)
 
-        # ── 双 Tab：属性 / 配音 ──
+        # ── 顶部一级标签：属性 / 蒙版 / 抠像 / 变速 / 转场 / 配音 ──
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet("""
             QTabWidget::pane { border:none; }
@@ -258,10 +265,48 @@ class ClipPropertiesPanel(QWidget):
         pp.addWidget(self._sync_bar)
         pp.addWidget(scroll, 1)
         self._tabs.addTab(props_page, "属性")
+
+        self._category_layouts = {"property": self._content_layout}
+        self._category_scrolls = {"property": self._scroll}
+
+        def _add_category_page(key: str, title: str):
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            page_layout.setSpacing(0)
+
+            category_scroll = QScrollArea()
+            category_scroll.setWidgetResizable(True)
+            category_scroll.setStyleSheet("QScrollArea { border:none; }")
+            category_scroll.setHorizontalScrollBarPolicy(
+                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            category_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+            content = QWidget()
+            content.setStyleSheet("background:#1e1e1e;")
+            content_layout = QVBoxLayout(content)
+            content_layout.setContentsMargins(8, 8, 8, 8)
+            content_layout.setSpacing(8)
+            category_scroll.setWidget(content)
+            page_layout.addWidget(category_scroll, 1)
+
+            self._category_layouts[key] = content_layout
+            self._category_scrolls[key] = category_scroll
+            self._tabs.addTab(page, title)
+
+        _add_category_page("mask", "蒙版")
+        _add_category_page("chroma", "抠像")
+        _add_category_page("speed", "变速")
+        _add_category_page("transition", "转场")
+
         self.dubbing_panel = DubbingPanel(add_audio_cb=add_audio_cb,
                                            get_subtitles_cb=get_subtitles_cb)
         self._tabs.addTab(self.dubbing_panel, "配音")
-        self._tabs.setTabVisible(1, False)  # 默认隐藏，仅选中字幕 clip 时显示
+        self._tabs.tabBar().setExpanding(False)
+        self._tabs.tabBar().setUsesScrollButtons(True)
+        for index in range(self._TAB_MASK, self._TAB_TRANSITION + 1):
+            self._tabs.setTabVisible(index, False)
+        self._tabs.setTabVisible(self._TAB_DUBBING, False)  # 仅选中字幕 clip 时显示
         root.addWidget(self._tabs, 1)
 
     def eventFilter(self, obj, event):
@@ -321,20 +366,20 @@ class ClipPropertiesPanel(QWidget):
         self._clip = None
         self._track = ""
         self._sync_bar.setVisible(False)
-        self._tabs.setTabVisible(1, False)
-        self._tabs.setCurrentIndex(0)
+        self._tabs.setTabVisible(self._TAB_DUBBING, False)
+        self._tabs.setCurrentIndex(self._TAB_PROPERTY)
         self._rebuild_ui()
 
     def _update_dubbing_tab(self, clip, track: str):
         """配音 tab 仅在选中字幕 clip 时出现，并预填字幕文本。"""
         is_sub = (track == "subtitle")
-        self._tabs.setTabVisible(1, is_sub)
+        self._tabs.setTabVisible(self._TAB_DUBBING, is_sub)
         if is_sub:
-            self._tabs.setCurrentIndex(1)
+            self._tabs.setCurrentIndex(self._TAB_DUBBING)
             if self.dubbing_panel is not None:
                 self.dubbing_panel.set_subtitle(clip)
         else:
-            self._tabs.setCurrentIndex(0)
+            self._tabs.setCurrentIndex(self._TAB_PROPERTY)
 
     @staticmethod
     def _get_video_duration(path: str) -> float:
@@ -353,31 +398,35 @@ class ClipPropertiesPanel(QWidget):
 
     # ─── 重建 UI ───
     def _rebuild_ui(self):
+        is_video = self._track == "video" and self._clip is not None
+        for index in range(self._TAB_MASK, self._TAB_TRANSITION + 1):
+            self._tabs.setTabVisible(index, is_video)
+
         # 字幕同步条：仅选中字幕时显示
         self._sync_bar.setVisible(self._track == "subtitle")
 
         # 清空关键帧按钮收集（_make_kf_btn 在下方的构建中重新填充）
         self._kf_buttons.clear()
 
-        # 保存滚动位置（重建后恢复，避免"吸附顶部"）
-        vsb = self._scroll.verticalScrollBar()
-        saved_pos = vsb.value()
+        # 保存各标签滚动位置（重建后恢复，避免"吸附顶部"）
+        saved_positions = {
+            key: scroll.verticalScrollBar().value()
+            for key, scroll in self._category_scrolls.items()
+        }
 
-        # 清空内容区（先断开所有信号避免 deleteLater 异步销毁时意外触发）
+        # 清空所有标签内容（先阻断信号，避免 deleteLater 异步销毁时意外触发）
         from PyQt6.QtCore import QObject
-        while self._content_layout.count():
-            item = self._content_layout.takeAt(0)
-            w = item.widget()
-            if w is not None:
-                try:
-                    QObject.blockSignals(w, True)
-                except Exception:
-                    pass
-                # 无需手动 w.disconnect()：deleteLater() 销毁时 Qt 会自动清理全部连接，
-                # 且上面已 blockSignals(w, True) 阻断销毁窗口内的信号发射；
-                # 对即将销毁的控件做通配 disconnect 反而会触发
-                # "QObject::disconnect: wildcard call disconnects from destroyed signal" 告警。
-                w.deleteLater()
+        for layout in self._category_layouts.values():
+            while layout.count():
+                item = layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    try:
+                        QObject.blockSignals(w, True)
+                    except Exception:
+                        pass
+                    # 无需手动 w.disconnect()：deleteLater() 销毁时 Qt 会自动清理全部连接。
+                    w.deleteLater()
 
         clip = self._clip
         if clip is None:
@@ -387,7 +436,7 @@ class ClipPropertiesPanel(QWidget):
             self._content_layout.addWidget(lbl)
             self._content_layout.addStretch()
             self._title.setText("属性")
-            vsb.setValue(0)
+            self._scroll.verticalScrollBar().setValue(0)
             return
 
         if self._track == "video":
@@ -400,12 +449,17 @@ class ClipPropertiesPanel(QWidget):
             self._title.setText("字幕属性")
             self._build_subtitle_props(clip)
 
-        self._content_layout.addStretch()
+        for layout in self._category_layouts.values():
+            layout.addStretch()
 
-        # 恢复滚动位置（用 singleShot 等布局计算完成后再设，避免设了又被 Qt 归零）
-        if saved_pos > 0:
-            from PyQt6.QtCore import QTimer as _Qt
-            _Qt.singleShot(0, lambda: vsb.setValue(min(saved_pos, vsb.maximum())))
+        # 恢复各标签滚动位置（等布局计算完成后再设）
+        from PyQt6.QtCore import QTimer as _Qt
+        for key, saved_pos in saved_positions.items():
+            if saved_pos <= 0:
+                continue
+            bar = self._category_scrolls[key].verticalScrollBar()
+            _Qt.singleShot(
+                0, lambda b=bar, pos=saved_pos: b.setValue(min(pos, b.maximum())))
 
     # ─── 视频属性 ───
     def _build_video_props(self, clip: VideoClip):
@@ -562,7 +616,7 @@ class ClipPropertiesPanel(QWidget):
         mask_reset.clicked.connect(lambda: self._reset_video_mask(clip))
         mask_bottom.addWidget(mask_reset)
         mask_layout.addLayout(mask_bottom)
-        self._content_layout.addWidget(grp_mask)
+        self._category_layouts["mask"].addWidget(grp_mask)
 
         # 绿幕抠像（Chroma Key）
         grp_ck = self._make_group("绿幕抠像")
@@ -621,7 +675,7 @@ class ClipPropertiesPanel(QWidget):
             lambda v: self._set(clip, "chroma_key_spill", v / 100))
         form_ck.addRow(self._lbl("溢色:"), ck_sp_row)
 
-        self._content_layout.addWidget(grp_ck)
+        self._category_layouts["chroma"].addWidget(grp_ck)
 
         # 速度 & 音量
         grp = self._make_group("速度 & 音量")
@@ -654,7 +708,7 @@ class ClipPropertiesPanel(QWidget):
 
         form.addRow(self._lbl("速度:"), sp_row)
         form.addRow(self._lbl("音量:"), self._row(vol_slider, self._vol_label))
-        self._content_layout.addWidget(grp)
+        self._category_layouts["speed"].addWidget(grp)
 
         # 转场（淡出到下一段，仅背景轨生效）
         grp_tr = self._make_group("转场（到下一段）")
@@ -732,7 +786,7 @@ class ClipPropertiesPanel(QWidget):
             self._undo_set(clip, "out_transition", {**base, "type": _c.currentData()})
         tr_combo.currentIndexChanged.connect(_on_tr_type)
 
-        self._content_layout.addWidget(grp_tr)
+        self._category_layouts["transition"].addWidget(grp_tr)
 
     def _edit_transition_duration(self, clip, edit, slider):
         """转场时长编辑框（支持小数秒，范围 0.10s ~ 2.00s）"""

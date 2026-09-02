@@ -1378,8 +1378,10 @@ class ProductionAssetPipelineTest(unittest.TestCase):
 
         submitted = []
         providers = {
-            "image_to_video": [SimpleNamespace(name="seedance")],
-            "text_to_video": [SimpleNamespace(name="seedance")],
+            "image_to_video": [SimpleNamespace(name="seedance"),
+                               SimpleNamespace(name="veo")],
+            "text_to_video": [SimpleNamespace(name="seedance"),
+                              SimpleNamespace(name="veo")],
             "image_edit": [SimpleNamespace(name="gptimage")],
             "text_to_image": [SimpleNamespace(name="gptimage")],
         }
@@ -1409,7 +1411,12 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             last_id = panel.create_custom_node(
                 "image_node", QPointF(0, 600), {"path": str(paths[2])})
             video_id = panel.create_custom_node(
-                "video_node", QPointF(500, 300), {"content": "人物向前走"})
+                "video_node", QPointF(500, 300), {
+                    "content":"人物向前走", "provider_name":"seedance",
+                    "model":"doubao-seedance-2-5-260628", "duration":20,
+                    "resolution":"480p", "generate_audio":True,
+                    "audio_prompt":"雨声和脚步声同步，人物对白清晰",
+                })
 
             panel.set_image_reference_role(panel._nodes[character_id], "character")
             panel.connect_workflow_nodes(panel._nodes[character_id], panel._nodes[video_id])
@@ -1434,9 +1441,40 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             self.assertEqual("character", request.inputs["reference_assets"][0]["role"])
             self.assertIn("用户创意与动态意图", request.inputs["prompt"])
             self.assertIn("镜头缓慢环绕，雨势逐渐增强", request.inputs["prompt"])
+            self.assertIn("声音计划：雨声和脚步声同步，人物对白清晰",
+                          request.inputs["prompt"])
+            self.assertEqual(20, request.params["duration"])
+            self.assertEqual("480p", request.params["resolution"])
+            self.assertTrue(request.params["generate_audio"])
+            self.assertEqual("doubao-seedance-2-5-260628",
+                             request.params["model"])
             self.assertEqual(
                 "镜头缓慢环绕，雨势逐渐增强",
                 request.metadata["creative_prompt"])
+
+            empty_video_id = panel.create_custom_node(
+                "video_node", QPointF(700, 600), {
+                    "content":"让画面动起来", "provider_name":"seedance",
+                    "editor_action":"图生视频",
+                })
+            submitted_before = len(submitted)
+            panel.submit_standalone_generation(
+                panel._nodes[empty_video_id], "让画面动起来", "图生视频")
+            self.assertEqual(submitted_before, len(submitted))
+
+            veo_video_id = panel.create_custom_node(
+                "video_node", QPointF(850, 600), {
+                    "content":"雨夜固定镜头", "provider_name":"veo",
+                    "model":"doubao-seedance-2-0-260128",
+                    "first_frame":str(paths[1]), "editor_action":"图生视频",
+                    "duration":8, "resolution":"1080p",
+                })
+            panel.submit_standalone_generation(
+                panel._nodes[veo_video_id], "雨夜固定镜头", "图生视频")
+            veo_provider, veo_request = submitted[-1]
+            self.assertEqual("veo", veo_provider)
+            self.assertNotIn("seedance", veo_request.params["model"].lower())
+            self.assertEqual("1080p", veo_request.params["resolution"])
 
             edit_id = panel.create_custom_node(
                 "image_node", QPointF(900, 300), {"path": str(paths[1]), "ratio": "16:9"})

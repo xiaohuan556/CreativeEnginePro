@@ -3,7 +3,7 @@
 
 # ── GUI 框架 ──
 PyQt6>=6.5.0
-PyQt6-multimedia>=6.5.0
+# QtMultimedia / QtMultimediaWidgets are included in the PyQt6 distribution.
 
 # ── TTS 语音引擎 ──
 edge-tts>=6.1.0
@@ -25,6 +25,7 @@ numpy>=1.24.0
 
 # ── 视频处理 ──
 moviepy>=1.0.3
+yt-dlp>=2025.1.15
 # opencv-contrib-python 是 opencv-python 的超集，提供 FaceDetectorYN（人脸修复检测所需）
 opencv-contrib-python>=4.8.0
 

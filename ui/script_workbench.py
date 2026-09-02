@@ -27,9 +27,10 @@ from ai.storyboard import (
 from ai import TaskRequest, ProviderDomain
 from ai.service import get_ai_manager
 from ai.assets import approved_asset_path, asset_is_approved
+from utils.app_paths import work_root
 
 # 标签存储
-_TAGS_FILE = Path(__file__).parent.parent / "work_temp" / "_script_tags.json"
+_TAGS_FILE = work_root() / "_script_tags.json"
 
 def _load_tags() -> list:
     if _TAGS_FILE.exists():
@@ -5442,7 +5443,7 @@ class ScriptWorkbench(QWidget):
             from config import OUTPUT_DIR
             folder = Path(OUTPUT_DIR) / "ai_audio"
         except Exception:
-            folder = Path(__file__).parent.parent / "work_temp" / "ai_audio"
+            folder = work_root() / "ai_audio"
         folder.mkdir(parents=True, exist_ok=True)
         output_path = folder / (
             f"dialogue_{shot_id}_{__import__('uuid').uuid4().hex[:8]}.mp3")
@@ -6003,7 +6004,7 @@ class ScriptWorkbench(QWidget):
                 from config import OUTPUT_DIR
                 folder = Path(OUTPUT_DIR) / ("ai_images" if kind == "image" else "ai_videos")
             except Exception:
-                folder = Path(__file__).parent.parent / "work_temp" / "ai_assets"
+                folder = work_root() / "ai_assets"
             folder.mkdir(parents=True, exist_ok=True)
             suffix = ".png" if kind == "image" else ".mp4"
             path = folder / f"storyboard_{__import__('uuid').uuid4().hex[:10]}{suffix}"
