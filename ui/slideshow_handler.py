@@ -2484,7 +2484,13 @@ class AIStylePlugin:
             req = TaskRequest(
                 operation="image_edit",
                 inputs=inputs,
-                params={"size": size, "quality": quality, "n": 1, "strength": strength},
+                params={
+                    "size": size,
+                    "ratio": ctx.get("aspect", "original"),
+                    "quality": quality,
+                    "n": 1,
+                    "strength": strength,
+                },
             )
             handle = provider.execute(req)
             if not handle.is_success or handle.result is None:

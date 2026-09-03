@@ -7,7 +7,7 @@ downloader.py — 内置下载引擎
 """
 from __future__ import annotations
 
-import os, re, json, sys, time, threading, subprocess, logging
+import os, re, json, sys, time, threading, subprocess, logging, urllib.parse
 from dataclasses import dataclass, field
 from typing import Optional, Callable
 
@@ -136,7 +136,11 @@ def _find_ytdlp() -> Optional[str]:
     # 3. Python module 自身能跑
     try:
         from yt_dlp import YoutubeDL  # noqa
-        # 用 python -m yt_dlp 也能跑
+        # 冻结版的 sys.executable 是桌面 EXE；通过 main.py 的早期 worker
+        # 入口运行内置模块，不能把它误当 python.exe 再次启动登录界面。
+        if getattr(sys, "frozen", False):
+            return sys.executable + "@@@--ytdlp-worker"
+        # 源码运行时仍使用当前 Python 模块。
         return sys.executable + "@@@-m@@@yt_dlp"
     except ImportError:
         pass
@@ -171,6 +175,8 @@ def ytdlp_update() -> tuple[bool, str]:
     """
     if not ytdlp_available():
         return False, "yt-dlp 未安装"
+    if getattr(sys, "frozen", False):
+        return False, "正式版已内置 yt-dlp，请安装新版 CreativeEnginePro 完成更新"
     try:
         python = sys.executable
         cmd = [python, "-m", "pip", "install", "--upgrade",
@@ -192,10 +198,10 @@ def _ytdlp_cmd() -> list[str]:
     if _ytdlp_path is None:
         _ytdlp_path = _find_ytdlp()
     if _ytdlp_path:
-        # 自定义占位符：exe@@@-m@@@yt_dlp
+        # 自定义占位符同时支持源码的 python@@@-m@@@yt_dlp 与
+        # 正式版的 CreativeEnginePro.exe@@@--ytdlp-worker。
         if "@@@" in _ytdlp_path:
-            parts = _ytdlp_path.split("@@@")
-            return [parts[0], parts[1], parts[2]]
+            return _ytdlp_path.split("@@@")
         return [_ytdlp_path]
     return ["yt-dlp"]
 
@@ -423,6 +429,225 @@ def _yt_tiktok_args(browser: str = "", cookies_file: str = "") -> list[str]:
     return args
 
 
+_TIKTOK_VIDEO_ID_RE = re.compile(
+    r"(?:/video/|/share/video/|item_ids?=)(\d{12,24})", re.IGNORECASE)
+_TIKTOK_PROFILE_RE = re.compile(
+    r"https?://(?:www\.)?tiktok\.com/@([^/?#]+)(?:[/?#]|$)", re.IGNORECASE)
+_TIKTOK_PLAYER_API = "https://www.tiktok.com/player/api/v1/items"
+_TIKTOK_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36")
+
+
+def _tiktok_get(url: str, *, params: dict | None = None, timeout: int = 30,
+                impersonate: str = "chrome"):
+    """Use browser TLS impersonation when available, with requests fallback."""
+    headers = {"User-Agent": _TIKTOK_USER_AGENT, "Referer": "https://www.tiktok.com/"}
+    try:
+        from curl_cffi import requests as curl_requests
+        return curl_requests.get(
+            url, params=params, headers=headers, impersonate=impersonate,
+            allow_redirects=True, timeout=timeout)
+    except ImportError:
+        import requests as plain_requests
+        return plain_requests.get(
+            url, params=params, headers=headers, allow_redirects=True,
+            timeout=timeout)
+
+
+def _tiktok_video_id(url: str, timeout: int = 20) -> str:
+    match = _TIKTOK_VIDEO_ID_RE.search(str(url or ""))
+    if match:
+        return match.group(1)
+    # vm.tiktok.com / vt.tiktok.com short links reveal the id after redirect.
+    response = _tiktok_get(url, timeout=timeout)
+    match = _TIKTOK_VIDEO_ID_RE.search(str(getattr(response, "url", "") or ""))
+    return match.group(1) if match else ""
+
+
+def _tiktok_player_info_from_payload(video_id: str, payload: dict) -> dict:
+    item = next((value for value in payload.get("items", [])
+                 if isinstance(value, dict) and
+                 str(value.get("id_str") or value.get("id") or "") == video_id), None)
+    if item is None:
+        result = next((value for value in payload.get("results", [])
+                       if isinstance(value, dict)), {})
+        code = str(result.get("code") or payload.get("status_msg") or "")
+        if code == "nil_core_data":
+            raise RuntimeError(
+                "TikTok 视频不可用：可能已删除、设为私密，或作者关闭了嵌入播放")
+        raise RuntimeError(f"TikTok 官方播放器未返回视频数据{f'（{code}）' if code else ''}")
+
+    video = dict(item.get("video_info") or {})
+    meta = dict(video.get("meta") or {})
+    candidates: list[dict] = []
+    for profile in video.get("profiles", []) or []:
+        if not isinstance(profile, dict):
+            continue
+        address = dict(profile.get("play_addr") or {})
+        urls = [str(value) for value in address.get("url_list", []) if value]
+        if urls:
+            candidates.append({
+                "url": urls[0],
+                "width": int(address.get("width") or meta.get("width") or 0),
+                "height": int(address.get("height") or meta.get("height") or 0),
+                "filesize": int(address.get("data_size") or 0),
+                "bitrate": int(profile.get("bitrate") or meta.get("bitrate") or 0),
+            })
+    root_urls = [str(value) for value in video.get("url_list", []) if value]
+    if root_urls:
+        candidates.append({
+            "url": root_urls[0],
+            "width": int(meta.get("width") or 0),
+            "height": int(meta.get("height") or 0),
+            "filesize": 0,
+            "bitrate": int(meta.get("bitrate") or 0),
+        })
+    if not candidates:
+        raise RuntimeError("TikTok 返回的是图文或无可播放视频，当前下载器未找到视频流")
+    best = max(candidates, key=lambda value: (
+        value["width"] * value["height"], value["bitrate"], value["filesize"]))
+    author = dict(item.get("author_info") or {})
+    cover = dict(video.get("cover") or {})
+    thumbnails = [str(value) for value in cover.get("url_list", []) if value]
+    description = str(item.get("desc") or "").strip()
+    author_name = str(author.get("nickname") or author.get("unique_id") or "TikTok")
+    title = description or f"{author_name}_{video_id}"
+    return {
+        "id": video_id,
+        "title": title,
+        "author": author_name,
+        "direct_url": best["url"],
+        "thumbnail": thumbnails[0] if thumbnails else "",
+        "duration": float(meta.get("duration") or 0) / 1000.0,
+        "width": best["width"], "height": best["height"],
+        "filesize": best["filesize"],
+        "webpage_url": f"https://www.tiktok.com/@{author.get('unique_id') or '_'}/video/{video_id}",
+    }
+
+
+def tiktok_player_info(url: str, timeout: int = 30) -> dict:
+    """Resolve a public TikTok video through its official player endpoint.
+
+    Current TikTok webpage challenges can reject yt-dlp before extraction even
+    when fresh browser cookies are present.  The official embeddable player API
+    is a narrower, read-only fallback and returns short-lived playback URLs.
+    """
+    video_id = _tiktok_video_id(url, timeout=min(timeout, 20))
+    if not video_id:
+        raise RuntimeError("未能从 TikTok 链接识别视频 ID，请粘贴单条视频链接")
+    response = _tiktok_get(
+        _TIKTOK_PLAYER_API,
+        params={"item_ids": video_id, "language": "zh-Hans"},
+        timeout=timeout)
+    if int(getattr(response, "status_code", 0) or 0) != 200:
+        raise RuntimeError(f"TikTok 官方播放器返回 HTTP {response.status_code}")
+    try:
+        payload = response.json()
+    except Exception as error:
+        raise RuntimeError("TikTok 官方播放器返回了无效数据") from error
+    return _tiktok_player_info_from_payload(video_id, payload)
+
+
+def _tiktok_profile_items_from_html(
+        profile_url: str, webpage: str, max_count: int = 50
+        ) -> list[tuple[str, str, float]]:
+    """Parse TikTok's official embedded creator page without detail requests.
+
+    yt-dlp currently sees this same ``videoList`` but then opens each video's
+    challenged webpage only to discover secUid.  The scrape UI needs neither
+    secUid nor a playback URL at this stage, so use the canonical ids directly.
+    """
+    profile_match = _TIKTOK_PROFILE_RE.search(str(profile_url or ""))
+    if not profile_match or _TIKTOK_VIDEO_ID_RE.search(str(profile_url or "")):
+        raise RuntimeError("TikTok 扒取请输入账号主页链接，例如 https://www.tiktok.com/@用户名")
+    username = urllib.parse.unquote(profile_match.group(1)).strip()
+    marker = webpage.find("__FRONTITY_CONNECT_STATE__")
+    if marker < 0:
+        raise RuntimeError("TikTok 没有返回主页作品数据，账号可能私密或关闭了主页嵌入")
+    content_start = webpage.find(">", marker)
+    content_end = webpage.find("</script>", content_start)
+    if content_start < 0 or content_end < 0:
+        raise RuntimeError("TikTok 主页作品数据格式异常")
+    try:
+        state = json.loads(webpage[content_start + 1:content_end])
+    except (TypeError, ValueError) as error:
+        raise RuntimeError("TikTok 主页作品数据无法解析") from error
+    data = ((state.get("source") or {}).get("data") or {})
+    entry = next((value for key, value in data.items()
+                  if str(key).split("?", 1)[0].rstrip("/").casefold() ==
+                  f"/embed/@{username}".casefold() and isinstance(value, dict)), {})
+    user = dict(entry.get("userInfo") or {})
+    if bool(user.get("privateAccount")):
+        raise RuntimeError("该 TikTok 账号是私密账号，无法扒取公开作品")
+    videos = [value for value in entry.get("videoList", [])
+              if isinstance(value, dict) and value.get("id") and
+              not bool(value.get("privateItem"))]
+    results: list[tuple[str, str, float]] = []
+    unique_id = str(user.get("uniqueId") or username)
+    for value in videos[:max(1, int(max_count))]:
+        video_id = str(value.get("id") or "")
+        title = str(value.get("desc") or "").strip() or f"TikTok_{video_id}"
+        duration = float(value.get("duration") or 0)
+        if duration > 1000:
+            duration /= 1000.0
+        results.append((
+            title,
+            f"https://www.tiktok.com/@{unique_id}/video/{video_id}",
+            duration,
+        ))
+    if not results:
+        raise RuntimeError("该 TikTok 主页没有返回可公开扒取的视频")
+    return results
+
+
+def tiktok_scrape_fallback(
+        url: str, max_count: int = 50, timeout: int = 30
+        ) -> list[tuple[str, str, float]]:
+    """Read a public creator homepage's official embedded video list."""
+    match = _TIKTOK_PROFILE_RE.search(str(url or ""))
+    if not match or _TIKTOK_VIDEO_ID_RE.search(str(url or "")):
+        raise RuntimeError("TikTok 扒取请输入账号主页链接，例如 https://www.tiktok.com/@用户名")
+    username = urllib.parse.unquote(match.group(1)).strip()
+    last_error = ""
+    for language in ("zh-Hans", "en-US"):
+        embed_url = (
+            f"https://www.tiktok.com/embed/@{urllib.parse.quote(username, safe='._-')}"
+            f"?lang={language}")
+        try:
+            response = _tiktok_get(
+                embed_url, timeout=timeout, impersonate="firefox")
+            if int(getattr(response, "status_code", 0) or 0) != 200:
+                last_error = f"HTTP {response.status_code}"
+                continue
+            return _tiktok_profile_items_from_html(url, response.text, max_count)
+        except Exception as error:
+            last_error = str(error)
+    raise RuntimeError(last_error or "TikTok 主页暂时无法读取")
+
+
+def _tiktok_direct_command(cmd: list[str], original_url: str, direct_url: str) -> list[str]:
+    """Build a generic-media retry without browser-cookie extraction."""
+    result: list[str] = []
+    skip_next = False
+    for value in cmd:
+        if skip_next:
+            skip_next = False
+            continue
+        if value in {"--cookies-from-browser", "--cookies"}:
+            skip_next = True
+            continue
+        if value == original_url:
+            continue
+        result.append(value)
+    result += [
+        "--referer", f"https://www.tiktok.com/player/v1/{_tiktok_video_id(original_url)}",
+        "--add-header", f"User-Agent:{_TIKTOK_USER_AGENT}",
+        direct_url,
+    ]
+    return result
+
+
 def _is_douyin(url: str) -> bool:
     return "douyin.com" in url or "iesdouyin.com" in url or "v.douyin.com" in url
 
@@ -488,6 +713,21 @@ def probe_url(url: str, timeout: int = 30) -> dict:
                 if "ERROR:" in line:
                     err_text = line
                     break
+            if _is_tiktok(url):
+                try:
+                    info = tiktok_player_info(url, timeout=timeout)
+                    resolution = (f"{info['width']}x{info['height']}"
+                                  if info["width"] and info["height"] else "")
+                    return {
+                        "title": info["title"],
+                        "formats": [FormatInfo(
+                            format_id="best", ext="mp4", resolution=resolution,
+                            note="TikTok 官方播放器", filesize=info["filesize"],
+                            vcodec="h264", acodec="aac")],
+                        "thumbnail": info["thumbnail"],
+                    }
+                except Exception as fallback_error:
+                    err_text = str(fallback_error) or err_text
             return {"_error": err_text[:300] if err_text else "yt-dlp 退出码 %d" % r.returncode}
         data = json.loads(r.stdout.decode("utf-8", errors="replace"))
         title = data.get("title", "")
@@ -664,7 +904,9 @@ class DownloadWorker(QThread):
                         continue
                     retry_cmd.append(c)
                 self.progress_signal.emit(tid, 0.0, "", "重试(无cookies)", "", "")
-                return self._execute_ytdlp(retry_cmd, tid)
+                output_path, error_lines, proc = self._execute_ytdlp(retry_cmd, tid)
+                cmd = retry_cmd
+                low_err = " ".join(error_lines).lower()
 
             # ── 2) YouTube bot 检测 → cookies 可能过期，降级无 cookies 重试一次 ──
             if (_is_youtube(task.url)
@@ -688,6 +930,18 @@ class DownloadWorker(QThread):
                 self.progress_signal.emit(
                     tid, 0.0, "", "Cookie过期,降级重试", "", "")
                 return self._execute_ytdlp(retry_cmd, tid)
+
+            # ── 3) TikTok web challenge → official player API/direct stream ──
+            if _is_tiktok(task.url) and proc.returncode != 0:
+                try:
+                    info = tiktok_player_info(task.url, timeout=30)
+                    retry_cmd = _tiktok_direct_command(
+                        cmd, task.url, str(info["direct_url"]))
+                    self.progress_signal.emit(
+                        tid, 0.0, "", "TikTok官方播放器备用解析", "", "")
+                    return self._execute_ytdlp(retry_cmd, tid)
+                except Exception as error:
+                    error_lines.insert(0, f"ERROR: {error}")
 
         return output_path, error_lines, proc
 

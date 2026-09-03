@@ -18,7 +18,7 @@ def _provider_domain(capabilities: list[str]) -> ProviderDomain:
     values = set(capabilities)
     if values & {"text_to_image", "image_edit", "inpaint"}:
         return ProviderDomain.IMAGE
-    if values & {"text_to_video", "image_to_video", "continue_video"}:
+    if values & {"text_to_video", "image_to_video", "continue_video", "video_edit"}:
         return ProviderDomain.VIDEO
     if values & {"text_to_speech", "clone_voice"}:
         return ProviderDomain.VOICE

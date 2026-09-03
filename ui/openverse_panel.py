@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
 from core.downloader import DOWNLOAD_DIR
 from core.openverse_api import (
     download_audio,
+    fallback_audio_search_links,
     format_duration,
     prepare_search_query,
     search_audio,
@@ -94,7 +95,18 @@ class _SearchWorker(QThread):
                 "category_relaxed": category_relaxed,
             })
         except Exception as exc:
-            self.failed.emit(str(exc))
+            original_query, category, _license_filter, _page, _page_size = self.args
+            fallback = fallback_audio_search_links(original_query, category)
+            if fallback:
+                self.succeeded.emit(fallback, len(fallback), {
+                    "original_query": original_query,
+                    "search_query": original_query,
+                    "translated": False,
+                    "category_relaxed": False,
+                    "fallback_error": str(exc),
+                })
+            else:
+                self.failed.emit(str(exc))
 
 
 class _EmojiCheckButton(QPushButton):
@@ -187,6 +199,11 @@ class _ResultCard(QFrame):
         self.download_btn.setStyleSheet(PRIMARY_STYLE)
         self.download_btn.clicked.connect(lambda: self.download_requested.emit(self.item, self))
         actions.addWidget(self.download_btn, 1)
+        if item.get("source_only"):
+            self.preview_btn.hide()
+            self.download_btn.hide()
+            source_btn.setText("打开搜索")
+            actions.addStretch(1)
         layout.addLayout(actions)
 
     def set_previewing(self, active: bool):
@@ -422,6 +439,11 @@ class OpenversePanel(QWidget):
             self.empty_label.setText("没有找到符合当前许可证条件的音频\n请更换关键词或筛选条件")
             self.empty_label.show()
         self.more_btn.setVisible(bool(results) and self._shown < self._total)
+        if info.get("fallback_error"):
+            self.status_label.setText(
+                "Openverse 当前连接失败，已显示备用素材站搜索入口。\n"
+                f"原因：{info.get('fallback_error')}")
+            return
         notes = []
         if info.get("translated"):
             notes.append(f"中文已转换为：{info.get('search_query', '')}")

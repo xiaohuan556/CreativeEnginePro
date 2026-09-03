@@ -5,6 +5,7 @@ param(
     [string]$Version = "1.0.0",
     [DateTimeOffset]$ExpiresAfter = "2026-12-02T00:00:00+08:00",
     [string]$DistPath = "",
+    [switch]$AllowInsecureLan,
     [switch]$SkipTests
 )
 
@@ -17,8 +18,18 @@ $DistPath = [IO.Path]::GetFullPath($DistPath)
 
 $uri = [Uri]$AuthBaseUrl
 $isLoopback = $uri.Host -in @("127.0.0.1", "localhost", "::1")
-if ($uri.Scheme -ne "https" -and -not $isLoopback) {
+$parsedAddress = $null
+$isPrivateIpv4 = [Net.IPAddress]::TryParse($uri.Host, [ref]$parsedAddress) -and
+    $parsedAddress.AddressFamily -eq [Net.Sockets.AddressFamily]::InterNetwork -and
+    (($parsedAddress.GetAddressBytes()[0] -eq 10) -or
+     ($parsedAddress.GetAddressBytes()[0] -eq 172 -and $parsedAddress.GetAddressBytes()[1] -ge 16 -and $parsedAddress.GetAddressBytes()[1] -le 31) -or
+     ($parsedAddress.GetAddressBytes()[0] -eq 192 -and $parsedAddress.GetAddressBytes()[1] -eq 168))
+$allowedLanHttp = $AllowInsecureLan -and $uri.Scheme -eq "http" -and $isPrivateIpv4
+if ($uri.Scheme -ne "https" -and -not $isLoopback -and -not $allowedLanHttp) {
     throw "The production authentication server must use HTTPS."
+}
+if ($allowedLanHttp) {
+    Write-Warning "Building for trusted LAN only. Account traffic is not encrypted and must not be exposed to the Internet."
 }
 
 if (-not $PythonExe) {
@@ -43,6 +54,7 @@ $manifest = [ordered]@{
     require_login = $true
     auth_base_url = $AuthBaseUrl.TrimEnd("/")
     session_check_minutes = 10
+    allow_insecure_lan = [bool]$allowedLanHttp
 }
 $manifestJson = $manifest | ConvertTo-Json
 [IO.File]::WriteAllText($manifestPath, $manifestJson, (New-Object Text.UTF8Encoding($false)))
@@ -71,6 +83,43 @@ finally {
 $exe = Join-Path $DistPath "CreativeEnginePro.exe"
 if (-not (Test-Path -LiteralPath $exe)) { throw "Build completed without expected EXE: $exe" }
 
+function Invoke-CapturedProcess {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][string[]]$Arguments,
+        [int]$TimeoutMilliseconds = 60000
+    )
+
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    # Windows PowerShell 5.1 lacks ProcessStartInfo.ArgumentList.  The worker
+    # smoke arguments are fixed switches, but quote them correctly regardless.
+    $startInfo.Arguments = (($Arguments | ForEach-Object {
+        '"' + $_.Replace('"', '\"') + '"'
+    }) -join ' ')
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) { throw "Failed to start frozen worker smoke test." }
+    $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+    $stderrTask = $process.StandardError.ReadToEndAsync()
+    if (-not $process.WaitForExit($TimeoutMilliseconds)) {
+        & taskkill.exe /PID $process.Id /T /F 2>$null | Out-Null
+        throw "Frozen worker smoke test timed out."
+    }
+    # Complete asynchronous pipe drains before reading results and ExitCode.
+    $process.WaitForExit()
+    return [PSCustomObject]@{
+        ExitCode = $process.ExitCode
+        Stdout = $stdoutTask.Result
+        Stderr = $stderrTask.Result
+    }
+}
+
 # Launch the actual frozen EXE and construct the complete main window.  Merely
 # observing a live process is insufficient because a PyInstaller exception
 # dialog also leaves the process alive.
@@ -83,7 +132,9 @@ $env:CEP_BUNDLE_SMOKE_MARKER = $smokeMarker
 try {
     $smokeProcess = Start-Process -FilePath $exe -ArgumentList "--bundle-smoke" -PassThru -WindowStyle Hidden
     if (-not $smokeProcess.WaitForExit(180000)) {
-        Stop-Process -Id $smokeProcess.Id -Force -ErrorAction SilentlyContinue
+        # One-file PyInstaller launches a child process. Kill the tree while
+        # the parent still exists so a failed probe cannot leave a hidden EXE.
+        & taskkill.exe /PID $smokeProcess.Id /T /F 2>$null | Out-Null
         throw "Frozen EXE smoke test timed out before the main window was constructed."
     }
     if ($smokeProcess.ExitCode -ne 0 -or -not (Test-Path -LiteralPath $smokeMarker)) {
@@ -97,6 +148,35 @@ finally {
     else { $env:QT_QPA_PLATFORM = $previousQtPlatform }
     if ($null -eq $previousSmokeMarker) { Remove-Item Env:CEP_BUNDLE_SMOKE_MARKER -ErrorAction SilentlyContinue }
     else { $env:CEP_BUNDLE_SMOKE_MARKER = $previousSmokeMarker }
+}
+
+# Verify that the frozen executable can dispatch its bundled yt-dlp without
+# falling through to the normal desktop login flow.  This is a separate smoke
+# test because sys.executable points back to CreativeEnginePro.exe in one-file
+# builds.
+$ytdlpStdout = Join-Path $releaseDir "ytdlp-worker-smoke.stdout.txt"
+$ytdlpStderr = Join-Path $releaseDir "ytdlp-worker-smoke.stderr.txt"
+Remove-Item -LiteralPath $ytdlpStdout,$ytdlpStderr -Force -ErrorAction SilentlyContinue
+$ytdlpProcess = Invoke-CapturedProcess -FilePath $exe -Arguments @("--ytdlp-worker", "--version")
+[IO.File]::WriteAllText($ytdlpStdout, $ytdlpProcess.Stdout, (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($ytdlpStderr, $ytdlpProcess.Stderr, (New-Object Text.UTF8Encoding($false)))
+$ytdlpVersion = $ytdlpProcess.Stdout.Trim()
+if ($ytdlpProcess.ExitCode -ne 0 -or -not $ytdlpVersion) {
+    throw "Frozen yt-dlp worker smoke test failed (exit code $($ytdlpProcess.ExitCode)): $($ytdlpProcess.Stderr)"
+}
+
+# TikTok's current web challenge requires curl_cffi-based browser TLS
+# impersonation.  A build can import yt-dlp successfully while silently
+# omitting curl_cffi's native DLL, so assert the capability on the final EXE.
+$impersonateStdout = Join-Path $releaseDir "ytdlp-impersonate-smoke.stdout.txt"
+$impersonateStderr = Join-Path $releaseDir "ytdlp-impersonate-smoke.stderr.txt"
+Remove-Item -LiteralPath $impersonateStdout,$impersonateStderr -Force -ErrorAction SilentlyContinue
+$impersonateProcess = Invoke-CapturedProcess -FilePath $exe -Arguments @("--ytdlp-worker", "--list-impersonate-targets")
+[IO.File]::WriteAllText($impersonateStdout, $impersonateProcess.Stdout, (New-Object Text.UTF8Encoding($false)))
+[IO.File]::WriteAllText($impersonateStderr, $impersonateProcess.Stderr, (New-Object Text.UTF8Encoding($false)))
+$impersonateOutput = $impersonateProcess.Stdout
+if ($impersonateProcess.ExitCode -ne 0 -or $impersonateOutput -notmatch "curl_cffi") {
+    throw "Frozen TikTok TLS component smoke test failed (exit code $($impersonateProcess.ExitCode)): $($impersonateProcess.Stderr)"
 }
 
 # On Windows, antivirus/indexing and the one-file finalizer can keep the large

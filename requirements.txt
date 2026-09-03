@@ -25,7 +25,9 @@ numpy>=1.24.0
 
 # ── 视频处理 ──
 moviepy>=1.0.3
-yt-dlp>=2025.1.15
+# TikTok 2026 网页挑战需要 curl_cffi 的浏览器 TLS 伪装；default 额外项
+# 同时补齐 yt-dlp 的常用加密、压缩与元数据依赖。
+yt-dlp[default,curl-cffi]>=2026.8.19
 # opencv-contrib-python 是 opencv-python 的超集，提供 FaceDetectorYN（人脸修复检测所需）
 opencv-contrib-python>=4.8.0
 

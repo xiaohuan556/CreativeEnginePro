@@ -63,7 +63,22 @@ def compile_request(operation: str, hydrated_inputs: dict[str, Any], raw_params:
             prompt = f"{prompt}\n\n{style_prompt}".strip()
         inputs["prompt"] = prompt
         ratio = str(source.get("ratio") or source.get("production_ratio") or "1:1")
-        return inputs, {"size": IMAGE_SIZES.get(ratio, "2048x2048"), "n": max(1, min(4, int(source.get("candidate_count") or 1))), "quality": "high", "watermark": False, **({"model": model} if model else {})}
+        # Desktop callers already resolve provider-specific sizes (including
+        # slideshow "original" -> auto/2K).  Keep that authoritative value;
+        # rebuilding only from ratio here used to turn every omitted/"original"
+        # ratio into a square image.  Preserve other generation constraints such
+        # as slideshow strength and batch metadata as well.
+        params = dict(source)
+        params.update({
+            "size": str(source.get("size") or IMAGE_SIZES.get(ratio, "2048x2048")),
+            "ratio": ratio,
+            "n": max(1, min(4, int(source.get("n") or source.get("candidate_count") or 1))),
+            "quality": str(source.get("quality") or "high"),
+            "watermark": bool(source.get("watermark", False)),
+        })
+        if model:
+            params["model"] = model
+        return inputs, params
     if operation in {"text_to_video", "image_to_video"}:
         if source.get("multi_image_director") or source.get("timeline_images"):
             prompt = _director_prompt(prompt, [item for item in source.get("timeline_images", []) if isinstance(item, dict)])

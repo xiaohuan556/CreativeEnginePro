@@ -1482,8 +1482,21 @@ class ProductionAssetPipelineTest(unittest.TestCase):
                 panel._nodes[edit_id], "扩展为更宽的街道环境", "智能扩图")
             edit_request = submitted[-1][1]
             self.assertEqual("image_edit", edit_request.operation)
+            self.assertEqual("16:9", edit_request.params["ratio"])
+            self.assertEqual("1792x1024", edit_request.params["size"])
             self.assertEqual("composition", edit_request.inputs["reference_assets"][0]["role"])
             self.assertIn(str(paths[1]), panel._custom_record(edit_id)["candidates"])
+
+            portrait_id = panel.create_custom_node(
+                "image_node", QPointF(900, 500), {
+                    "content":"一只小狗", "ratio":"9:16",
+                    "provider_name":"gptimage", "editor_action":"文生图"})
+            panel.submit_standalone_generation(
+                panel._nodes[portrait_id], "一只小狗", "文生图")
+            portrait_request = submitted[-1][1]
+            self.assertEqual("text_to_image", portrait_request.operation)
+            self.assertEqual("9:16", portrait_request.params["ratio"])
+            self.assertEqual("1024x1792", portrait_request.params["size"])
 
     def test_character_regeneration_upgrades_legacy_three_view_to_four_nodes(self):
         folder = Path(tempfile.mkdtemp())
@@ -1804,7 +1817,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             provider_name, request = submitted[-1]
             self.assertEqual("gptimage", provider_name)
             self.assertEqual(3, request.params["n"])
-            self.assertEqual("1152x2048", request.params["size"])
+            self.assertEqual("1024x1792", request.params["size"])
             self.assertNotIn("mask", request.inputs)
             self.assertEqual("recompose", start_generator["spatial_qc_mode"])
             panel._poll_standalone_tasks()
@@ -2027,8 +2040,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             shot_count = len(board["shots"])
             shot_node = panel._nodes[f"shot:{board['shots'][0]['id']}"]
             panel.scene.clearSelection(); shot_node.setSelected(True)
-            with patch.object(QMessageBox, "question",
-                              return_value=QMessageBox.StandardButton.Yes):
+            with patch.object(panel, "_confirm_canvas_node_deletion", return_value=True):
                 panel.delete_canvas_selection()
             self.assertEqual(shot_count - 1, len(board["shots"]))
 
@@ -3521,9 +3533,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             {"score":68}, {"items":[{"shot_id":"s2"}]})
         panel.refresh()
         panel.scene.clearSelection(); panel._nodes[qc_id].setSelected(True)
-        with patch.object(
-                QMessageBox, "question",
-                return_value=QMessageBox.StandardButton.Yes):
+        with patch.object(panel, "_confirm_canvas_node_deletion", return_value=True):
             panel.delete_canvas_selection()
 
         source = panel._custom_record(source_id)

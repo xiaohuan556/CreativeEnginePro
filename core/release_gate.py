@@ -1,10 +1,16 @@
 """Formal-release policy and remote desktop authentication client."""
 from __future__ import annotations
 
+import ctypes
+import hashlib
 import json
+import ipaddress
 import mimetypes
+import os
 import threading
+import time
 import urllib.parse
+from ctypes import wintypes
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,7 +18,7 @@ from typing import Any
 
 import requests
 
-from utils.app_paths import is_frozen, resource_root
+from utils.app_paths import is_frozen, resource_root, user_file
 
 
 class ReleaseGateError(RuntimeError):
@@ -25,6 +31,45 @@ class AuthenticationError(ReleaseGateError):
 
 class AuthenticationUnavailable(ReleaseGateError):
     pass
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_ubyte))]
+
+
+def _protect_user_data(value: bytes) -> bytes:
+    """Encrypt bytes for the current Windows account with DPAPI."""
+    if os.name != "nt":
+        raise OSError("本机登录记忆仅支持 Windows")
+    buffer = ctypes.create_string_buffer(value)
+    source = _DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    protected = _DataBlob()
+    if not ctypes.windll.crypt32.CryptProtectData(
+            ctypes.byref(source), "CreativeEnginePro session", None, None, None,
+            0, ctypes.byref(protected)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(protected.pbData, protected.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(protected.pbData)
+
+
+def _unprotect_user_data(value: bytes) -> bytes:
+    """Decrypt DPAPI bytes for the current Windows account."""
+    if os.name != "nt":
+        raise OSError("本机登录记忆仅支持 Windows")
+    buffer = ctypes.create_string_buffer(value)
+    source = _DataBlob(len(value), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte)))
+    clear = _DataBlob()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(source), None, None, None, None, 0,
+            ctypes.byref(clear)):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(clear.pbData, clear.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(clear.pbData)
 
 
 def _parse_datetime(value: str) -> datetime:
@@ -42,6 +87,7 @@ class ReleasePolicy:
     require_login: bool
     auth_base_url: str
     session_check_minutes: int = 10
+    allow_insecure_lan: bool = False
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "ReleasePolicy":
@@ -58,6 +104,7 @@ class ReleasePolicy:
                 require_login=bool(payload.get("require_login", True)),
                 auth_base_url=str(payload.get("auth_base_url") or "").strip().rstrip("/"),
                 session_check_minutes=max(1, int(payload.get("session_check_minutes", 10))),
+                allow_insecure_lan=bool(payload.get("allow_insecure_lan", False)),
             )
         except Exception as error:
             if is_frozen():
@@ -73,7 +120,23 @@ class ReleasePolicy:
         if self.auth_base_url:
             parsed = urllib.parse.urlparse(self.auth_base_url)
             localhost = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
-            if parsed.scheme != "https" and not localhost:
+            private_lan = False
+            if parsed.hostname:
+                try:
+                    address = ipaddress.ip_address(parsed.hostname)
+                    octets = address.packed
+                    private_lan = (
+                        address.version == 4 and (
+                            octets[0] == 10 or
+                            (octets[0] == 172 and 16 <= octets[1] <= 31) or
+                            (octets[0] == 192 and octets[1] == 168)
+                        )
+                    )
+                except ValueError:
+                    private_lan = False
+            allowed_lan_http = (
+                self.allow_insecure_lan and parsed.scheme == "http" and private_lan)
+            if parsed.scheme != "https" and not localhost and not allowed_lan_http:
                 raise ReleaseGateError("正式版登录服务器必须使用 HTTPS")
 
     def is_expired(self, now: datetime | None = None) -> bool:
@@ -109,6 +172,88 @@ class DesktopAuthClient:
         self.csrf_token = ""
         self.user: dict[str, Any] = {}
         self._desktop_project_id = ""
+
+    @property
+    def session_store_path(self) -> Path:
+        server_key = hashlib.sha256(
+            self.base_url.casefold().encode("utf-8")).hexdigest()[:16]
+        return user_file("auth", f"desktop_session_{server_key}.bin")
+
+    def forget_saved_session(self) -> None:
+        """Remove the remembered session without affecting other app data."""
+        try:
+            self.session_store_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def save_session(self) -> bool:
+        """Persist only the server session cookie, encrypted for this user/PC.
+
+        Passwords are deliberately never stored.  The server can revoke this
+        cookie at any time (password change, disable, role change or logout).
+        """
+        cookies = []
+        for cookie in self.session.cookies:
+            if not cookie.value:
+                continue
+            cookies.append({
+                "name": cookie.name, "value": cookie.value,
+                "domain": cookie.domain or "",
+                "path": cookie.path or "/",
+                "expires": cookie.expires,
+                "secure": bool(cookie.secure),
+            })
+        if not any(value["name"] == "cep_session" for value in cookies):
+            return False
+        payload = json.dumps({
+            "version": 1, "base_url": self.base_url, "cookies": cookies,
+        }, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        try:
+            target = self.session_store_path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_suffix(".tmp")
+            temporary.write_bytes(_protect_user_data(payload))
+            temporary.replace(target)
+            return True
+        except (OSError, ValueError):
+            return False
+
+    def restore_saved_session(self) -> bool:
+        """Restore a remembered, unexpired cookie for this server."""
+        target = self.session_store_path
+        if not target.is_file():
+            return False
+        try:
+            payload = json.loads(_unprotect_user_data(target.read_bytes()).decode("utf-8"))
+            if (payload.get("version") != 1 or
+                    str(payload.get("base_url") or "").rstrip("/") != self.base_url):
+                raise ValueError("登录会话不属于当前授权服务器")
+            cookies = list(payload.get("cookies") or [])
+            now = time.time()
+            if not cookies or any(
+                    value.get("expires") is not None and
+                    float(value["expires"]) <= now for value in cookies):
+                raise ValueError("登录会话已过期")
+            restored = requests.cookies.RequestsCookieJar()
+            for value in cookies:
+                restored.set_cookie(requests.cookies.create_cookie(
+                    name=str(value.get("name") or ""),
+                    value=str(value.get("value") or ""),
+                    domain=str(value.get("domain") or ""),
+                    path=str(value.get("path") or "/"),
+                    expires=(int(value["expires"])
+                             if value.get("expires") is not None else None),
+                    secure=bool(value.get("secure", False)),
+                ))
+            if not restored.get_dict().get("cep_session"):
+                raise ValueError("登录会话缺少授权令牌")
+            self.session.cookies.clear()
+            self.session.cookies.update(restored)
+            self.csrf_token = ""
+            return True
+        except Exception:
+            self.forget_saved_session()
+            return False
 
     @staticmethod
     def _response_error(response: requests.Response) -> str:

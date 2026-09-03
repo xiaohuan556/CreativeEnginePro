@@ -198,6 +198,8 @@ def _execute_task(task_id: str, worker_id: str) -> None:
             hydrated_inputs["reference_assets"] = visual_references
         elif operation == "text_to_video" and visual_paths:
             hydrated_inputs["reference_assets"] = visual_references[:50]
+        elif operation == "video_edit" and visual_paths:
+            hydrated_inputs["reference_assets"] = visual_references[:50]
         elif operation == "clone_voice" and paths:
             reference_audio = next((
                 item for item in typed_references

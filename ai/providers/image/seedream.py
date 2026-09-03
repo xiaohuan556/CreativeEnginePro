@@ -318,7 +318,10 @@ class GPTImageProvider(ImageProvider):
                             "model": model,
                             "prompt": prompt,
                             "n": "1",
-                            "size": request.params.get("size", "1024x1024") if request.params.get("size", "1024x1024") not in ("auto", "") else "1024x1024",
+                            # GPT Image accepts ``auto`` for edits and uses the
+                            # reference orientation.  Forcing auto to 1024x1024
+                            # made slideshow's “原图比例” silently become square.
+                            "size": request.params.get("size", "auto") or "auto",
                             "response_format": "b64_json",
                         },
                         files=files,

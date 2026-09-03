@@ -161,6 +161,9 @@ def _request(url: str, timeout: int = 25):
         raise OpenverseError(f"Openverse 返回 HTTP {exc.code}：{detail}") from exc
     except urllib.error.URLError as exc:
         raise OpenverseError(f"无法连接 Openverse：{exc.reason}") from exc
+    except TimeoutError as exc:
+        raise OpenverseError(
+            "Openverse 连接超时；当前网络可能无法直连该服务，请检查代理或网络") from exc
     except Exception as exc:
         raise OpenverseError(f"Openverse 请求失败：{exc}") from exc
 
@@ -235,6 +238,56 @@ def search_audio(
         if item["audio_url"]:
             results.append(item)
     return results, int(payload.get("result_count") or len(results))
+
+
+def fallback_audio_search_links(query: str, category: str = "") -> list[dict]:
+    """Return safe browser-search entries when Openverse is unreachable.
+
+    These are deliberately source-only entries: CreativeEnginePro must not
+    claim a license or download a file until the source page has shown the
+    actual terms for that item.
+    """
+    query = str(query or "").strip()
+    encoded = urllib.parse.quote(query)
+    sound_effect = category == "sound_effect"
+    rows = [
+        (
+            "Pixabay 音效搜索" if sound_effect else "Pixabay 音乐搜索",
+            (f"https://pixabay.com/sound-effects/search/{encoded}/" if sound_effect
+             else f"https://pixabay.com/music/search/{encoded}/"),
+            "Pixabay",
+        ),
+        (
+            "Mixkit 免费音效" if sound_effect else "Mixkit 免费音乐",
+            ("https://mixkit.co/free-sound-effects/" if sound_effect
+             else "https://mixkit.co/free-stock-music/"),
+            "Mixkit",
+        ),
+        (
+            "Freesound 音效搜索",
+            f"https://freesound.org/search/?q={urllib.parse.quote_plus(query)}",
+            "Freesound",
+        ),
+    ]
+    if not sound_effect:
+        rows.extend([
+            ("Uppbeat 音乐库", "https://uppbeat.io/browse/music", "Uppbeat"),
+            ("YouTube 音频库", "https://www.youtube.com/audiolibrary/music",
+             "YouTube Audio Library"),
+        ])
+    return [{
+        "id": f"fallback-{index}",
+        "title": title,
+        "creator": source,
+        "duration": 0,
+        "audio_url": "",
+        "landing_url": url,
+        "license": "",
+        "license_label": "请在来源页核验每条素材的授权条件",
+        "license_url": "",
+        "source": source,
+        "source_only": True,
+    } for index, (title, url, source) in enumerate(rows, 1)]
 
 
 def format_duration(seconds: float) -> str:

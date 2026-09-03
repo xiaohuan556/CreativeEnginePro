@@ -10,6 +10,32 @@ from datetime import datetime
 os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "threads;1")
 
 # ─────────────────────────────────────────────────────────────────────────────
+# EXE 内 yt-dlp 命令行 worker 模式
+# ─────────────────────────────────────────────────────────────────────────────
+# 冻结后的 sys.executable 指向 CreativeEnginePro.exe，而不是 python.exe。
+# 下载器若继续执行 ``sys.executable -m yt_dlp``，就会再次启动完整桌面应用并
+# 弹出登录框。这个入口必须位于任何 PyQt / 登录逻辑之前，让同一个 EXE 只运行
+# 内置 yt-dlp 的 CLI，然后把 stdout / 退出码原样交还下载线程。
+if "--ytdlp-worker" in sys.argv:
+    try:
+        # ``console=False`` 的冻结程序没有 Python CRT stdout/stderr，但下载器
+        # 通过 PIPE 启动时仍会传入有效 Win32 标准句柄。先恢复文本流，否则
+        # yt-dlp 的版本、进度和错误会全部丢失，桌面下载线程也无法判断状态。
+        from core.worker_stdio import restore_frozen_worker_stdio
+        restore_frozen_worker_stdio()
+        from yt_dlp import main as _ytdlp_main
+        _i = sys.argv.index("--ytdlp-worker")
+        _worker_args = sys.argv[_i + 1:]
+        _result = _ytdlp_main(_worker_args)
+        sys.exit(int(_result or 0))
+    except SystemExit:
+        raise
+    except Exception as _e:
+        if sys.stderr is not None:
+            print("YTDLP_ERR: " + str(_e), file=sys.stderr, flush=True)
+        sys.exit(1)
+
+# ─────────────────────────────────────────────────────────────────────────────
 # EXE 内 Real-ESRGAN 子进程 worker 模式
 # ─────────────────────────────────────────────────────────────────────────────
 # 必须在 import PyQt6 / cv2 之前执行！本进程已加载 PyQt6/cv2 后，onnxruntime 的

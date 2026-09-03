@@ -13,10 +13,13 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, QSize, QTimer, QMimeData, pyqtSignal, QThread
+from PyQt6.QtCore import (
+    Qt, QRectF, QPoint, QPointF, QSize, QTimer, QMimeData, QUrl,
+    pyqtSignal, QThread, QSettings,
+)
 from PyQt6.QtGui import (
     QColor, QBrush, QDrag, QFont, QPainter, QPainterPath, QPainterPathStroker,
-    QPen, QPixmap, QImageReader, QKeySequence, QShortcut, QCursor,
+    QPen, QPixmap, QImage, QImageReader, QKeySequence, QShortcut, QCursor,
     QIcon, QLinearGradient,
 )
 from PyQt6.QtWidgets import (
@@ -449,6 +452,23 @@ IMAGE_EDIT_DEFAULTS = {
     "移除背景": "只保留画面主体，完整保留发丝、半透明边缘、服装和物体细节，移除背景并输出透明背景 PNG",
 }
 
+# These operations already own a complete instruction contract in their
+# dedicated controls.  The large node editor is therefore optional (and is
+# hidden in the UI) instead of becoming a second, contradictory prompt box.
+INTERNAL_PROMPT_ACTIONS = {
+    "批量换风格": "风格提示词已由“风格探索器”生成，这里无需重复填写。",
+    "批量风格转换": "风格提示词已由“风格探索器”生成，这里无需重复填写。",
+    "图片高清": "高清修复规则已内置，这里无需填写提示词。",
+    "智能扩图": "扩图规则和目标比例已由节点参数确定，这里无需填写提示词。",
+    "移除背景": "抠图与透明背景规则已内置，这里无需填写提示词。",
+    "视频风格迁移": "风格迁移规则在专用设置中填写，这里无需重复填写。",
+    "生成风格迁移视频": "风格迁移规则在专用设置中填写，这里无需重复填写。",
+    "按时间戳修改": "修改提示词、时间范围和画面选区都在“时间与画面选区”中填写。",
+    "提取首中尾帧": "这是本地抽帧操作，不需要提示词。",
+    "基于尾帧续拍": "续拍会自动继承尾帧、动作和镜头上下文，不强制填写提示词。",
+    "基于完整视频续长": "续长会自动继承完整视频内容，补充提示词不是必填项。",
+}
+
 
 class _InspectorPreviewLabel(QLabel):
     doubleClicked = pyqtSignal()
@@ -551,65 +571,204 @@ class _CanvasCheckBox(QCheckBox):
         painter.drawLine(middle, last)
 
 
+class _CanvasComboBox(QComboBox):
+    """Proxy-safe combo using a real top-level menu for item selection."""
+
+    def _popup_host(self):
+        try:
+            return self.window()
+        except RuntimeError:
+            return None
+
+    def showPopup(self):
+        current_menu = getattr(self, "_canvas_popup_menu", None)
+        if current_menu is not None and current_menu.isVisible():
+            return
+        host = self._popup_host()
+        if host is not None:
+            host.setProperty("canvasComboPopupOpen", True)
+        menu = QMenu(self)
+        menu.setMinimumWidth(max(self.width(), 150))
+        menu.setStyleSheet(
+            "QMenu{background:#202127;color:#e7e7ec;border:1px solid #454752;"
+            "padding:5px;}QMenu::item{padding:8px 24px 8px 12px;border-radius:5px;}"
+            "QMenu::item:selected{background:#315b8f;color:white;}"
+            "QMenu::indicator:checked{background:#79aef2;border-radius:3px;}")
+        for index in range(self.count()):
+            action = menu.addAction(self.itemIcon(index), self.itemText(index))
+            action.setData(index)
+            action.setCheckable(True)
+            action.setChecked(index == self.currentIndex())
+            model_index = self.model().index(index, self.modelColumn(), self.rootModelIndex())
+            action.setEnabled(bool(
+                self.model().flags(model_index) & Qt.ItemFlag.ItemIsEnabled))
+        menu.triggered.connect(self._select_popup_action)
+        menu.aboutToHide.connect(self._popup_menu_hidden)
+        self._canvas_popup_menu = menu
+        menu.popup(self.mapToGlobal(QPoint(0, self.height())))
+
+    def _select_popup_action(self, action):
+        try:
+            index = int(action.data())
+        except (TypeError, ValueError):
+            return
+        if 0 <= index < self.count():
+            self.setCurrentIndex(index)
+
+    def hidePopup(self):
+        menu = getattr(self, "_canvas_popup_menu", None)
+        if menu is not None and menu.isVisible():
+            menu.close()
+            return
+        self._popup_menu_hidden()
+
+    def _popup_menu_hidden(self):
+        host = self._popup_host()
+        if host is not None:
+            host.setProperty("canvasComboPopupOpen", False)
+        QTimer.singleShot(0, self._restore_focus_after_popup)
+
+    def _restore_focus_after_popup(self):
+        try:
+            if self.isVisible():
+                self.setFocus(Qt.FocusReason.PopupFocusReason)
+        except RuntimeError:
+            pass
+
+
 class _VideoRegionLabel(QLabel):
-    """Small frame surface used to draw a normalized video edit region."""
+    """Aspect-correct preview with a drawable and movable normalized region."""
     regionChanged = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._origin = None
-        self._region = {"x":0.2, "y":0.2, "width":0.35, "height":0.35}
+        self._drag_mode = ""
+        self._drag_offset = (0.0, 0.0)
+        self._source_pixmap = QPixmap()
+        self._region = None
         self.setMinimumSize(520, 292)
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setScaledContents(True)
+        self.setScaledContents(False)
+        self.setCursor(Qt.CursorShape.CrossCursor)
         self.setStyleSheet("background:#101116;border:1px solid #3b3d48;border-radius:9px;")
 
+    def setPixmap(self, pixmap):
+        self._source_pixmap = QPixmap(pixmap) if pixmap is not None else QPixmap()
+        super().setPixmap(QPixmap())
+        self.update()
+
+    def _content_rect(self):
+        area = QRectF(self.contentsRect())
+        if self._source_pixmap.isNull():
+            return area
+        size = self._source_pixmap.size()
+        scale = min(area.width() / max(1, size.width()),
+                    area.height() / max(1, size.height()))
+        width, height = size.width() * scale, size.height() * scale
+        return QRectF(area.x() + (area.width() - width) / 2,
+                      area.y() + (area.height() - height) / 2,
+                      width, height)
+
     def set_region(self, value):
-        if isinstance(value, dict):
+        if (isinstance(value, dict) and
+                float(value.get("width") or 0) > 0 and
+                float(value.get("height") or 0) > 0):
+            width = max(0.01, min(1.0, float(value["width"])))
+            height = max(0.01, min(1.0, float(value["height"])))
             self._region = {
-                key:max(0.0, min(1.0, float(value.get(key, default))))
-                for key, default in (("x", 0.2), ("y", 0.2),
-                                     ("width", 0.35), ("height", 0.35))}
+                "x":max(0.0, min(1.0 - width, float(value.get("x", 0.2)))),
+                "y":max(0.0, min(1.0 - height, float(value.get("y", 0.2)))),
+                "width":width, "height":height,
+            }
+        else:
+            self._region = None
         self.update()
 
     def region(self):
-        return dict(self._region)
+        return dict(self._region) if self._region else {}
 
     def _point(self, event):
-        return (max(0.0, min(1.0, event.position().x() / max(1, self.width()))),
-                max(0.0, min(1.0, event.position().y() / max(1, self.height()))))
+        rect = self._content_rect()
+        return (max(0.0, min(1.0, (event.position().x() - rect.x()) /
+                                  max(1.0, rect.width()))),
+                max(0.0, min(1.0, (event.position().y() - rect.y()) /
+                                  max(1.0, rect.height()))))
+
+    def _inside_region(self, point):
+        if not self._region:
+            return False
+        x, y = point
+        value = self._region
+        return (value["x"] <= x <= value["x"] + value["width"] and
+                value["y"] <= y <= value["y"] + value["height"])
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
-            self._origin = self._point(event)
-            self._region = {"x":self._origin[0], "y":self._origin[1],
-                            "width":0.01, "height":0.01}
+            point = self._point(event)
+            if self._inside_region(point):
+                self._drag_mode = "move"
+                self._drag_offset = (
+                    point[0] - self._region["x"],
+                    point[1] - self._region["y"])
+                self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            else:
+                self._drag_mode = "draw"
+                self._origin = point
+                self._region = {"x":point[0], "y":point[1],
+                                "width":0.0, "height":0.0}
             self.update(); event.accept(); return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
-        if self._origin is None:
+        if not self._drag_mode:
             super().mouseMoveEvent(event); return
         x, y = self._point(event)
-        ox, oy = self._origin
-        self._region = {"x":min(ox, x), "y":min(oy, y),
-                        "width":max(0.01, abs(x - ox)),
-                        "height":max(0.01, abs(y - oy))}
+        if self._drag_mode == "move":
+            width, height = self._region["width"], self._region["height"]
+            self._region["x"] = max(
+                0.0, min(1.0 - width, x - self._drag_offset[0]))
+            self._region["y"] = max(
+                0.0, min(1.0 - height, y - self._drag_offset[1]))
+        else:
+            ox, oy = self._origin
+            self._region = {"x":min(ox, x), "y":min(oy, y),
+                            "width":abs(x - ox), "height":abs(y - oy)}
         self.update(); event.accept()
 
     def mouseReleaseEvent(self, event):
-        if self._origin is not None and event.button() == Qt.MouseButton.LeftButton:
+        if self._drag_mode and event.button() == Qt.MouseButton.LeftButton:
             self.mouseMoveEvent(event)
+            if (not self._region or self._region.get("width", 0) < 0.015 or
+                    self._region.get("height", 0) < 0.015):
+                # A click is not a selection.  It also gives the user a quick
+                # way to clear an old box: click once outside it.
+                self._region = None
             self._origin = None
+            self._drag_mode = ""
+            self.setCursor(Qt.CursorShape.CrossCursor)
             self.regionChanged.emit(self.region())
             event.accept(); return
         super().mouseReleaseEvent(event)
 
     def paintEvent(self, event):
         super().paintEvent(event)
+        content_rect = self._content_rect()
+        if not self._source_pixmap.isNull():
+            preview_painter = QPainter(self)
+            preview_painter.setRenderHint(
+                QPainter.RenderHint.SmoothPixmapTransform, True)
+            preview_painter.drawPixmap(
+                content_rect, self._source_pixmap,
+                QRectF(self._source_pixmap.rect()))
+            preview_painter.end()
+        if not self._region:
+            return
         value = self._region
-        rect = QRectF(value["x"] * self.width(), value["y"] * self.height(),
-                      value["width"] * self.width(), value["height"] * self.height())
+        rect = QRectF(content_rect.x() + value["x"] * content_rect.width(),
+                      content_rect.y() + value["y"] * content_rect.height(),
+                      value["width"] * content_rect.width(),
+                      value["height"] * content_rect.height())
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.fillRect(rect, QColor(82, 150, 255, 42))
@@ -619,6 +778,211 @@ class _VideoRegionLabel(QLabel):
         painter.drawText(rect.adjusted(7, 5, -7, -5),
                          Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop,
                          "编辑这里")
+
+
+class _VideoTimeRange(QWidget):
+    """Two-handle timeline whose selected clip can also be dragged as a block."""
+    rangeChanged = pyqtSignal(float, float)
+
+    def __init__(self, duration=10.0, parent=None):
+        super().__init__(parent)
+        self._duration = max(0.1, float(duration or 10.0))
+        self._max_span = min(30.0, self._duration)
+        self._start = 0.0
+        self._end = min(self._duration, 4.0)
+        self._drag_mode = ""
+        self._press_time = 0.0
+        self._press_range = (self._start, self._end)
+        self._playhead = None
+        self.setMinimumHeight(78)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("拖动蓝色片段可整体移动；拖动左右手柄可调整开始和结束")
+
+    def set_range(self, start, end, emit=False):
+        minimum = min(0.1, self._duration)
+        start = max(0.0, min(self._duration - minimum, float(start)))
+        end = max(start + minimum, min(self._duration, float(end)))
+        if end - start > self._max_span:
+            end = min(self._duration, start + self._max_span)
+        changed = abs(start - self._start) > 0.0001 or abs(end - self._end) > 0.0001
+        self._start, self._end = start, end
+        self.update()
+        if emit and changed:
+            self.rangeChanged.emit(self._start, self._end)
+
+    def range(self):
+        return self._start, self._end
+
+    def set_playhead(self, seconds=None):
+        if seconds is None:
+            self._playhead = None
+        else:
+            self._playhead = max(0.0, min(self._duration, float(seconds)))
+        self.update()
+
+    def _track_rect(self):
+        return QRectF(20, 20, max(20, self.width() - 40), 34)
+
+    def _x_for_time(self, value):
+        track = self._track_rect()
+        return track.x() + track.width() * float(value) / self._duration
+
+    def _time_for_x(self, value):
+        track = self._track_rect()
+        ratio = (float(value) - track.x()) / max(1.0, track.width())
+        return max(0.0, min(self._duration, ratio * self._duration))
+
+    def mousePressEvent(self, event):
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
+        point_x = float(event.position().x())
+        start_x, end_x = self._x_for_time(self._start), self._x_for_time(self._end)
+        handle_radius = 14.0
+        if abs(point_x - start_x) <= handle_radius:
+            self._drag_mode = "start"
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif abs(point_x - end_x) <= handle_radius:
+            self._drag_mode = "end"
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif start_x < point_x < end_x:
+            self._drag_mode = "move"
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        else:
+            center = self._time_for_x(point_x)
+            length = self._end - self._start
+            new_start = max(
+                0.0, min(self._duration - length, center - length / 2))
+            self.set_range(new_start, new_start + length, emit=True)
+            self._drag_mode = "move"
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+        self._press_time = self._time_for_x(point_x)
+        self._press_range = (self._start, self._end)
+        event.accept()
+
+    def mouseMoveEvent(self, event):
+        if not self._drag_mode:
+            super().mouseMoveEvent(event)
+            return
+        value = self._time_for_x(event.position().x())
+        minimum = min(0.1, self._duration)
+        if self._drag_mode == "start":
+            self.set_range(
+                max(self._end - self._max_span,
+                    min(value, self._end - minimum)),
+                self._end, emit=True)
+        elif self._drag_mode == "end":
+            self.set_range(
+                self._start,
+                min(self._start + self._max_span,
+                    max(value, self._start + minimum)), emit=True)
+        else:
+            old_start, old_end = self._press_range
+            length = old_end - old_start
+            new_start = old_start + value - self._press_time
+            new_start = max(0.0, min(self._duration - length, new_start))
+            self.set_range(new_start, new_start + length, emit=True)
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_mode:
+            self._drag_mode = ""
+            self.setCursor(Qt.CursorShape.PointingHandCursor)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        track = self._track_rect()
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#252832"))
+        painter.drawRoundedRect(track, 8, 8)
+        # Subtle divisions make the strip read as a timeline rather than a slider.
+        painter.setPen(QPen(QColor("#3b4050"), 1))
+        for index in range(1, 10):
+            x = track.x() + track.width() * index / 10
+            painter.drawLine(QPointF(x, track.y() + 5),
+                             QPointF(x, track.bottom() - 5))
+        start_x, end_x = self._x_for_time(self._start), self._x_for_time(self._end)
+        selected = QRectF(start_x, track.y(), max(3.0, end_x - start_x), track.height())
+        painter.setPen(QPen(QColor("#8fc5ff"), 2))
+        painter.setBrush(QColor(67, 133, 222, 180))
+        painter.drawRoundedRect(selected, 7, 7)
+        painter.setBrush(QColor("#dcecff"))
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.drawRoundedRect(QRectF(start_x - 4, track.y() - 5, 8, track.height() + 10), 3, 3)
+        painter.drawRoundedRect(QRectF(end_x - 4, track.y() - 5, 8, track.height() + 10), 3, 3)
+        if self._playhead is not None:
+            playhead_x = self._x_for_time(self._playhead)
+            painter.setPen(QPen(QColor("#ffffff"), 2))
+            painter.drawLine(
+                QPointF(playhead_x, track.y() - 7),
+                QPointF(playhead_x, track.bottom() + 7))
+        painter.setPen(QColor("#b9c2d3"))
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
+        painter.drawText(QRectF(track.x(), track.bottom() + 8, track.width(), 18),
+                         Qt.AlignmentFlag.AlignLeft,
+                         f"{self._start:.1f}s")
+        painter.drawText(QRectF(track.x(), track.bottom() + 8, track.width(), 18),
+                         Qt.AlignmentFlag.AlignRight,
+                         f"{self._end:.1f}s / {self._duration:g}s")
+
+
+class _LocalVideoPreviewReader:
+    """Seek local video frames for the timestamp editor without temp files."""
+
+    def __init__(self, path: str):
+        self._capture = None
+        self._cv2 = None
+        if not path or not os.path.exists(path):
+            return
+        try:
+            import cv2
+            capture = cv2.VideoCapture(str(path))
+            if capture.isOpened():
+                self._cv2 = cv2
+                self._capture = capture
+            else:
+                capture.release()
+        except Exception:
+            self._capture = None
+            self._cv2 = None
+
+    def is_valid(self):
+        return self._capture is not None and self._cv2 is not None
+
+    def pixmap_at(self, seconds: float):
+        if not self.is_valid():
+            return QPixmap()
+        try:
+            self._capture.set(
+                self._cv2.CAP_PROP_POS_MSEC, max(0.0, float(seconds)) * 1000.0)
+            ok, image = self._capture.read()
+            if not ok or image is None or image.size == 0:
+                return QPixmap()
+            height, width = image.shape[:2]
+            scale = min(1.0, 1280.0 / max(1, width), 720.0 / max(1, height))
+            if scale < 1.0:
+                image = self._cv2.resize(
+                    image, None, fx=scale, fy=scale,
+                    interpolation=self._cv2.INTER_AREA)
+                height, width = image.shape[:2]
+            qimage = QImage(
+                image.data, width, height, int(image.strides[0]),
+                QImage.Format.Format_BGR888).copy()
+            return QPixmap.fromImage(qimage)
+        except Exception:
+            return QPixmap()
+
+    def close(self):
+        capture, self._capture = self._capture, None
+        if capture is not None:
+            try:
+                capture.release()
+            except Exception:
+                pass
 
 
 class _EditorResizeHandle(QPushButton):
@@ -800,6 +1164,10 @@ class CanvasNodeItem(QGraphicsObject):
         self.badge = badge or ""
         self.payload = dict(payload or {})
         self.connection_hover = False
+        self._move_press_scene_pos = None
+        self._move_press_screen_pos = None
+        self._move_drag_started = False
+        self._move_origin_positions = {}
         self.width = 270.0 if node_type == "shot" else 240.0
         self.height = 180.0 if node_type == "shot" else 156.0
         if node_type in ("asset_view", "asset_take", "shot_take"):
@@ -824,24 +1192,28 @@ class CanvasNodeItem(QGraphicsObject):
             self.thumbnail, max(320, int(self.width * 2)),
             max(240, int((self.height - 57) * 2)))
         self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         # 设备坐标缓存会在缩放倍率变化时按新分辨率重绘，文字不会被拉伸变糊。
         self.setCacheMode(QGraphicsItem.CacheMode.DeviceCoordinateCache)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        tip = "双击打开" if node_type not in ("shot",) else "双击回到分镜详细编辑"
-        if self.has_output_port():
-            tip += "\n按住右侧连接点拖动，可自由连线"
-        if self.has_input_port():
-            tip += "\n拖线松开到卡片任意位置即可连接"
-        self.setToolTip(tip)
+        # QGraphicsItem tooltips are native popup windows.  When the pointer has
+        # been hovering over a node, a click can race the tooltip timer: the
+        # popup is shown and immediately dismissed by the same click, producing
+        # a distracting one-frame flash over the canvas.  Node operations are
+        # already exposed by the persistent canvas UI, so do not attach a
+        # transient native tooltip to the whole card.
+        self.setToolTip("")
 
     def boundingRect(self):
         # 给抗锯齿描边留出无效区域；否则拖动时旧位置边缘可能不会被重绘，形成残影。
         return QRectF(-3, -3, self.width + 6, self.height + 6)
 
     def has_input_port(self):
+        # Batch outputs are result nodes rather than generation inputs, but
+        # they still need a visible left-side lineage port from their parent.
+        if self.payload.get("batch_result_parent_id"):
+            return True
         spec_key = infer_node_spec(self.node_type, self.payload)
         return any(
             spec_key in targets for targets in NODE_CONNECTION_TARGETS.values())
@@ -991,22 +1363,90 @@ class CanvasNodeItem(QGraphicsObject):
         return result
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.LeftButton and self.owner:
-            self.owner.begin_node_move(self)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.owner:
+                self.owner._defer_inline_editor_until_pointer_release = True
+            self._move_press_scene_pos = QPointF(event.scenePos())
+            self._move_press_screen_pos = QPoint(event.screenPos())
+            self._move_drag_started = False
+            self._move_origin_positions = {}
+        elif event.button() == Qt.MouseButton.RightButton and self.owner:
+            # Selecting with the context-menu button must not construct the
+            # large inline editor underneath the pending menu.
+            self.owner._suppress_inline_editor_for_context_menu = True
+            self.owner.hide_inline_editor()
         super().mousePressEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton and self.scene():
+            selected = [item for item in self.scene().selectedItems()
+                        if isinstance(item, CanvasNodeItem)]
+            if self not in selected:
+                selected.append(self)
+            self._move_origin_positions = {
+                str(item.node_id):QPointF(item.pos()) for item in selected}
+
+    def mouseMoveEvent(self, event):
+        if (self._move_press_screen_pos is not None and
+                event.buttons() & Qt.MouseButton.LeftButton):
+            pixel_delta = QPoint(event.screenPos()) - self._move_press_screen_pos
+            zoom = max(0.05, abs(float(
+                self.scene().views()[0].transform().m11()))
+                if self.scene() and self.scene().views() else 1.0)
+            if (not self._move_drag_started and
+                    pixel_delta.manhattanLength() < QApplication.startDragDistance()):
+                event.accept()
+                return
+            if not self._move_drag_started:
+                self._move_drag_started = True
+                if self.owner:
+                    # A simple click keeps the current editor intact.  Collapse
+                    # it only after the gesture has crossed the real drag
+                    # threshold, otherwise every click visibly closes and
+                    # rebuilds the proxy editor for one frame.
+                    self.owner.hide_inline_editor()
+                    self.owner.begin_node_move(self)
+            delta = QPointF(pixel_delta.x() / zoom, pixel_delta.y() / zoom)
+            # Move from immutable press-time origins.  Never integrate from the
+            # previous event: viewport changes or proxy-editor relayouts can
+            # otherwise amplify a tiny pointer delta into a node jump.
+            for node_id, origin in self._move_origin_positions.items():
+                target = self.owner._nodes.get(node_id) if self.owner else None
+                if target is not None:
+                    target.setPos(origin + delta)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        was_dragged = bool(self._move_drag_started)
         super().mouseReleaseEvent(event)
-        if event.button() == Qt.MouseButton.LeftButton and self.owner:
+        if (event.button() == Qt.MouseButton.LeftButton and self.owner and
+                was_dragged):
             self.owner.end_node_move(self)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self.owner:
+                self.owner._defer_inline_editor_until_pointer_release = False
+            self._move_press_scene_pos = None
+            self._move_press_screen_pos = None
+            self._move_drag_started = False
+            self._move_origin_positions = {}
+            if self.owner and not was_dragged:
+                # Wait until the complete click gesture has finished.  Opening
+                # the proxy editor during mouse press used to consume the first
+                # drag attempt and made users click a second time.
+                self.owner.show_inline_editor(self)
 
     def mouseDoubleClickEvent(self, event):
         self.owner.activate_node(self)
         event.accept()
 
     def contextMenuEvent(self, event):
-        self.owner.show_node_context_menu(self, event.screenPos())
-        event.accept()
+        self.owner._suppress_inline_editor_for_context_menu = True
+        self.owner.hide_inline_editor()
+        try:
+            self.owner.show_node_context_menu(self, event.screenPos())
+            event.accept()
+        finally:
+            self.owner._suppress_inline_editor_for_context_menu = False
 
 
 class ProductionGraphicsScene(QGraphicsScene):
@@ -1100,6 +1540,40 @@ class ProductionGraphicsView(QGraphicsView):
         self._wire_source = None
         self._wire_preview = None
         self._wire_hover_target = None
+        self._selection_toolbar = None
+
+    def set_selection_toolbar(self, toolbar):
+        self._selection_toolbar = toolbar
+        # Parent this chrome to the non-scrolling QGraphicsView, not its
+        # viewport.  QAbstractScrollArea physically translates viewport
+        # children while centering, which exposed a one-frame floating-window
+        # flash whenever a node click changed the visible scene area.
+        toolbar.setParent(self)
+        toolbar.setFixedHeight(44)
+        toolbar.show()
+        toolbar.raise_()
+        self._layout_selection_toolbar()
+
+    def _layout_selection_toolbar(self):
+        toolbar = self._selection_toolbar
+        if toolbar is None:
+            return
+        margin = 12
+        viewport_rect = self.viewport().geometry()
+        toolbar.setGeometry(
+            viewport_rect.x() + margin,
+            viewport_rect.y() + margin,
+            max(260, viewport_rect.width() - margin * 2), 44)
+        toolbar.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._layout_selection_toolbar()
+
+    def scrollContentsBy(self, dx, dy):
+        super().scrollContentsBy(dx, dy)
+        # Kept as a cheap safety re-layout for style/viewport replacements.
+        self._layout_selection_toolbar()
 
     def _set_interactive_quality(self, active: bool):
         self.setRenderHint(QPainter.RenderHint.Antialiasing, not active)
@@ -1196,6 +1670,18 @@ class ProductionGraphicsView(QGraphicsView):
 
     def mousePressEvent(self, event):
         scene_pos = self.mapToScene(event.position().toPoint())
+        # Controls embedded through QGraphicsProxyWidget must receive the
+        # click before canvas hit-testing.  In particular, the enlarged wire
+        # snap radius must never reinterpret a combo-box click as a port drag.
+        owner = getattr(self.scene(), "owner", None)
+        inline_proxy = getattr(owner, "_inline_editor_proxy", None)
+        clicked_item = self.itemAt(event.position().toPoint())
+        current_item = clicked_item
+        while current_item is not None:
+            if current_item is inline_proxy:
+                super().mousePressEvent(event)
+                return
+            current_item = current_item.parentItem()
         if event.button() == Qt.MouseButton.LeftButton:
             source = self.scene().owner.port_node_at(scene_pos, "output")
             if source is not None:
@@ -1224,8 +1710,11 @@ class ProductionGraphicsView(QGraphicsView):
     def mouseMoveEvent(self, event):
         if self._wire_source is not None:
             scene_pos = self.mapToScene(event.position().toPoint())
-            self._update_wire_preview(scene_pos)
-            self._set_wire_hover(self.scene().owner.port_node_at(scene_pos, "input"))
+            target = self.scene().owner.port_node_at(
+                scene_pos, "input", self._wire_source)
+            self._update_wire_preview(
+                target.port_scene_pos("input") if target is not None else scene_pos)
+            self._set_wire_hover(target)
             event.accept()
             return
         if self._panning and self._pan_start is not None:
@@ -1243,7 +1732,8 @@ class ProductionGraphicsView(QGraphicsView):
     def mouseReleaseEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self._wire_source is not None:
             scene_pos = self.mapToScene(event.position().toPoint())
-            target = self.scene().owner.port_node_at(scene_pos, "input")
+            target = self.scene().owner.port_node_at(
+                scene_pos, "input", self._wire_source)
             source = self._wire_source
             self._set_wire_hover(None)
             if self._wire_preview is not None:
@@ -2123,10 +2613,16 @@ class ProductionCanvasTab(QWidget):
         self._last_task_signature = ()
         self._inline_editor_proxy = None
         self._inline_editor_node_id = ""
+        self._inline_editor_building_node_id = ""
+        self._suppress_inline_editor_for_context_menu = False
+        self._defer_inline_editor_until_pointer_release = False
+        self._deferred_new_media_editor_id = ""
         self._inline_text_editor = None
         self._inline_editor_typing = False
         self._inline_editor_dirty = False
         self._standalone_tasks = {}
+        self._image_batch_queues = {}
+        self._active_image_batch_node_id = ""
         self._canvas_storyboard_queue = []
         self._canvas_storyboard_previous = ""
         self._canvas_storyboard_source = ""
@@ -2206,7 +2702,25 @@ class ProductionCanvasTab(QWidget):
         self.view = ProductionGraphicsView(self.scene)
         self.asset_library = AssetLibraryDrawer(self)
         self.navigator_panel = CanvasNavigatorPanel(self, self.asset_library)
+        self.navigator_collapse_handle = QPushButton("‹")
+        self.navigator_collapse_handle.setObjectName("navigatorCollapseHandle")
+        self.navigator_collapse_handle.setFixedSize(18, 76)
+        self.navigator_collapse_handle.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.navigator_collapse_handle.setToolTip("收起左侧画布/资产栏")
+        self.navigator_collapse_handle.setStyleSheet(
+            "QPushButton#navigatorCollapseHandle{background:#1d1e24;color:#aeb5c7;"
+            "border:1px solid #343640;border-left:none;border-radius:0 7px 7px 0;"
+            "padding:0;font-size:18px;font-weight:bold;}"
+            "QPushButton#navigatorCollapseHandle:hover{background:#292c36;"
+            "color:#ffffff;border-color:#6f8cff;}"
+            "QPushButton#navigatorCollapseHandle:pressed{background:#343948;}")
+        self.navigator_collapse_handle.clicked.connect(
+            lambda _=False: self.toggle_asset_library(
+                self.navigator_panel.isHidden()))
         content.addWidget(self.navigator_panel)
+        content.addWidget(
+            self.navigator_collapse_handle, 0,
+            Qt.AlignmentFlag.AlignVCenter)
         content.addWidget(self.view, 1)
 
         self.asset_inspector = PropertyInspector(self.db, compact=True)
@@ -2227,15 +2741,17 @@ class ProductionCanvasTab(QWidget):
         self.selection_toolbar.setObjectName("canvasSelectionToolbar")
         self.selection_toolbar.setStyleSheet(
             "QFrame#canvasSelectionToolbar{background:#18191e;"
-            "border-bottom:1px solid #343640;}"
+            "border:1px solid #343640;border-radius:9px;}"
             "QLabel{color:#b9bcc6;font-size:11px;}"
             "QPushButton#deleteCanvasSelection{background:#321f23;color:#ffb0b0;"
             "border:1px solid #61353d;border-radius:7px;padding:6px 12px;}"
             "QPushButton#deleteCanvasSelection:hover{background:#48252c;"
-            "border-color:#a85866;color:#ffd0d0;}")
+            "border-color:#a85866;color:#ffd0d0;}"
+            "QPushButton#deleteCanvasSelection:disabled{background:#202126;"
+            "color:#60636d;border-color:#30313a;}")
         selection_row = QHBoxLayout(self.selection_toolbar)
-        selection_row.setContentsMargins(18, 7, 18, 7)
-        self.selection_count_label = QLabel("已选择 1 个节点")
+        selection_row.setContentsMargins(14, 5, 8, 5)
+        self.selection_count_label = QLabel("未选择节点")
         selection_row.addWidget(self.selection_count_label)
         selection_row.addStretch()
         self.selection_delete_button = QPushButton("删除")
@@ -2246,9 +2762,9 @@ class ProductionCanvasTab(QWidget):
             "从画布中删除选中节点；不会删除本地媒体文件")
         self.selection_delete_button.clicked.connect(
             lambda _=False: self.delete_canvas_selection())
+        self.selection_delete_button.setEnabled(False)
         selection_row.addWidget(self.selection_delete_button)
-        self.selection_toolbar.hide()
-        root.addWidget(self.selection_toolbar)
+        self.view.set_selection_toolbar(self.selection_toolbar)
         root.addWidget(body, 1)
 
         self.canvas_drawer = self._build_canvas_drawer()
@@ -2800,7 +3316,8 @@ class ProductionCanvasTab(QWidget):
             except Exception:
                 if handle:
                     return True
-        return bool(self._canvas_storyboard_queue or self._canvas_character_queue or
+        return bool(self._image_batch_queues or self._canvas_storyboard_queue or
+                    self._canvas_character_queue or
                     any(self._serial_video_queues.values()))
 
     def _prepare_project_switch(self, action_name: str, confirm=True):
@@ -3092,6 +3609,8 @@ class ProductionCanvasTab(QWidget):
             except Exception:
                 pass
         self._standalone_tasks.clear()
+        self._image_batch_queues.clear()
+        self._active_image_batch_node_id = ""
         self._serial_video_queues.clear()
         self._canvas_storyboard_queue = []
         self._canvas_character_queue = []
@@ -3626,22 +4145,42 @@ class ProductionCanvasTab(QWidget):
         selected = [item for item in self.scene.selectedItems()
                     if isinstance(item, CanvasNodeItem)]
         if hasattr(self, "selection_toolbar"):
-            self.selection_toolbar.setVisible(bool(selected))
-            self.selection_count_label.setText(f"已选择 {len(selected)} 个节点")
+            self.selection_count_label.setText(
+                f"已选择 {len(selected)} 个节点" if selected else "未选择节点")
+            self.selection_delete_button.setEnabled(bool(selected))
+        if self._suppress_inline_editor_for_context_menu:
+            return
         if len(selected) == 1:
-            self.show_inline_editor(selected[0])
+            if not self._defer_inline_editor_until_pointer_release:
+                self.show_inline_editor(selected[0])
         elif len(selected) > 1:
             self.hide_inline_editor()
-        else:
+        elif not selected:
             # 点击 QGraphicsProxyWidget 内部编辑器时，Scene 会短暂清空节点选择；
             # 延后一拍判断焦点，避免把用户正在输入的编辑器立刻销毁。
-            QTimer.singleShot(0, self._hide_inline_editor_if_unfocused)
+            QTimer.singleShot(80, self._hide_inline_editor_if_unfocused)
 
     def _hide_inline_editor_if_unfocused(self):
         proxy = self._inline_editor_proxy
         if proxy is None:
             return
         panel = proxy.widget()
+        if bool(panel.property("canvasComboPopupOpen")):
+            return
+        # A QComboBox popup is a separate Qt popup window.  Its focused list
+        # view is not always a parentWidget descendant of the proxy panel, so
+        # the normal focus-chain check below used to destroy the editor while
+        # the user was choosing an item.  Keep the proxy alive for every open
+        # combo belonging to this panel.
+        for combo in panel.findChildren(QComboBox):
+            try:
+                if combo.view().isVisible():
+                    node = self._nodes.get(self._inline_editor_node_id)
+                    if node is not None and not node.isSelected():
+                        node.setSelected(True)
+                    return
+            except RuntimeError:
+                continue
         focus = QApplication.focusWidget()
         current = focus
         while current is not None:
@@ -3694,6 +4233,7 @@ class ProductionCanvasTab(QWidget):
         proxy = self._inline_editor_proxy
         self._inline_editor_proxy = None
         self._inline_editor_node_id = ""
+        self._inline_editor_building_node_id = ""
         self._inline_text_editor = None
         self._inline_editor_typing = False
         self._inline_editor_dirty = False
@@ -3701,22 +4241,71 @@ class ProductionCanvasTab(QWidget):
             self.scene.removeItem(proxy)
             proxy.deleteLater()
 
+    @classmethod
+    def _node_has_existing_media(cls, node) -> bool:
+        path = str(node.payload.get("path") or node.thumbnail or "")
+        if node.node_type == "image_node":
+            return bool(path and os.path.exists(path) and cls._is_image_path(path))
+        if node.node_type == "video_node":
+            return bool((path and os.path.exists(path) and cls._is_video_path(path)) or
+                        str(node.payload.get("provider_remote_url") or ""))
+        if node.node_type == "audio_node":
+            return bool(path and os.path.exists(path) and cls._is_audio_path(path))
+        return False
+
+    def _node_action_options(self, node) -> list[str]:
+        """Only expose operations that make sense for the node's current data."""
+        payload = node.payload
+        if node.node_type == "image_node":
+            if bool(payload.get("multi_image_composer")):
+                if (not bool(payload.get("batch_mode")) and
+                        not list(payload.get("references") or []) and
+                        str(payload.get("beginner_mode") or "") != "image_edit"):
+                    return ["文生图"]
+                return ["AI 编辑"]
+            if self._node_has_existing_media(node) or bool(payload.get("image_workbench")):
+                return ["AI 编辑", "图片高清", "智能扩图", "移除背景", "替换背景"]
+            return ["文生图", "图生图"]
+        if node.node_type == "video_node":
+            if bool(payload.get("video_style_transfer")):
+                return ["视频风格迁移"]
+            if self._node_has_existing_media(node):
+                return ["按时间戳修改", "提取首中尾帧", "基于完整视频续长"]
+            return ["图生视频", "文生视频", "基于尾帧续拍"]
+        if node.node_type == "audio_node":
+            if bool(payload.get("voice_clone")):
+                return ["克隆声音生成语音"]
+            return ["对白配音", "音效"]
+        if node.node_type == "shot":
+            return ["保存镜头修改", "生成关键帧", "参考图再生成", "生成视频", "生成对白"]
+        return ["编辑节点", "继续生成"]
+
     def show_inline_editor(self, node: CanvasNodeItem):
+        if self._suppress_inline_editor_for_context_menu:
+            return
         if self._refreshing or node.node_type in ("director", "generation_task", "workflow_group"):
             self.hide_inline_editor()
             return
-        if (node.node_type == "image_node" and
-                not bool(node.payload.get("multi_image_composer")) and
-                not bool(node.payload.get("image_workbench")) and
-                not bool(node.payload.get("asset_kind")) and
-                str(node.payload.get("generator_kind") or "") != "image"):
-            # 普通图片是素材，不在节点内重复提供生成参数。
+        if (node.node_type == "audio_node" and
+                self._node_has_existing_media(node) and
+                not bool(node.payload.get("voice_clone"))):
+            # Imported audio is a source/reference asset, not a speech or sound-
+            # effect generator.  Double-click previews it; its output port feeds
+            # the clone node without presenting unrelated generation actions.
             self.hide_inline_editor()
             return
-        if self._inline_editor_node_id == node.node_id:
+        if (self._inline_editor_node_id == node.node_id or
+                self._inline_editor_building_node_id == node.node_id):
             return
         self.hide_inline_editor()
-        panel = QFrame()
+        self._inline_editor_building_node_id = str(node.node_id)
+        # Build the editor as a real viewport child.  Constructing a complex
+        # image/video editor as a parentless QWidget gives Windows a chance to
+        # map it as a tiny native window with title-bar buttons.  It stays
+        # hidden and parented until the fully built widget is atomically handed
+        # to QGraphicsProxyWidget below.
+        panel = QFrame(self.view.viewport())
+        panel.hide()
         panel.setObjectName("inlineNodeEditor")
         panel.setFixedWidth(
             760 if (node.node_type == "storyboard_node" or
@@ -3752,6 +4341,10 @@ class ProductionCanvasTab(QWidget):
         is_storyboard_director = bool(
             node.node_type == "video_node" and
             _is_storyboard_director_payload(node.payload))
+        is_existing_video_source = bool(
+            node.node_type == "video_node" and
+            self._node_has_existing_media(node) and not is_storyboard_director)
+        batch_mode = None
         # 图片拥有参考职责、标记和风格；视频把首帧、尾帧和普通参考明确分开。
         if node.node_type == "image_node":
             chips = QHBoxLayout()
@@ -3786,14 +4379,22 @@ class ProductionCanvasTab(QWidget):
             layout.addLayout(chips)
             if bool(node.payload.get("multi_image_composer")):
                 reference_count = len(node.payload.get("references") or [])
+                reference_limit = 51 if bool(node.payload.get("batch_mode")) else 9
                 mapping_note = QLabel(
-                    f"多图合成 · {reference_count}/9 张参考 · "
+                    f"多图合成 · {reference_count}/{reference_limit} 张参考 · "
                     "每张图可单独指定主体、场景、构图、元素或风格")
                 mapping_note.setWordWrap(True)
                 mapping_note.setStyleSheet(
                     "color:#b8d8df;background:#192a30;border:1px solid #355866;"
                     "border-radius:7px;padding:7px;")
                 layout.addWidget(mapping_note)
+                batch_import = QPushButton("＋ 批量导入图片并自动连线")
+                batch_import.setToolTip(
+                    "一次选择多张图片；画布会为每张图建立素材节点并自动连接到当前图片节点")
+                batch_import.clicked.connect(
+                    lambda _=False, nid=str(node.node_id): QTimer.singleShot(
+                        0, lambda: self.choose_batch_images_for_node(nid)))
+                layout.addWidget(batch_import)
                 edit_mapping = QPushButton("设置每张图片的用途…")
                 edit_mapping.setEnabled(reference_count > 0)
                 edit_mapping.setToolTip(
@@ -3809,7 +4410,7 @@ class ProductionCanvasTab(QWidget):
                 layout.addLayout(mapping_row)
                 batch_row = QHBoxLayout()
                 batch_row.setSpacing(6)
-                batch_mode = QComboBox()
+                batch_mode = _CanvasComboBox(panel)
                 batch_mode.addItem("单次合成", "single")
                 batch_mode.addItem("批量搭配", "paired")
                 batch_mode.addItem("批量换风格", "style")
@@ -3821,7 +4422,7 @@ class ProductionCanvasTab(QWidget):
                 batch_mode.setToolTip(
                     "批量搭配：1 张主图分别搭配其余图片；批量换风格：每张图片独立处理")
                 batch_row.addWidget(batch_mode)
-                batch_subject = QComboBox()
+                batch_subject = _CanvasComboBox(panel)
                 batch_subject.setToolTip("批量搭配时固定使用的主图")
                 reference_assets = [
                     value for value in node.payload.get("reference_assets", [])
@@ -3836,7 +4437,7 @@ class ProductionCanvasTab(QWidget):
                 if saved_subject and batch_subject.findData(saved_subject) >= 0:
                     batch_subject.setCurrentIndex(batch_subject.findData(saved_subject))
                 batch_row.addWidget(batch_subject, 1)
-                batch_candidates = QComboBox()
+                batch_candidates = _CanvasComboBox(panel)
                 for count in (1, 2, 3, 4):
                     batch_candidates.addItem(f"每组 {count} 张", count)
                 batch_candidates.setCurrentIndex(max(
@@ -3858,7 +4459,7 @@ class ProductionCanvasTab(QWidget):
                 def apply_batch_mode(
                         _index=-1, n=node, selector=batch_mode,
                         subject=batch_subject, summary=batch_summary,
-                        count_field=batch_candidates):
+                        count_field=batch_candidates, note=mapping_note):
                     selected = str(selector.currentData() or "single")
                     enabled = selected != "single"
                     strategy = selected if enabled else "paired"
@@ -3866,7 +4467,8 @@ class ProductionCanvasTab(QWidget):
                     n.payload["batch_strategy"] = strategy
                     n.payload["editor_action"] = (
                         "批量换风格" if selected == "style" else
-                        "批量搭配生成" if selected == "paired" else "AI 编辑")
+                        "批量搭配生成" if selected == "paired" else
+                        "AI 编辑" if reference_count else "文生图")
                     record = self._custom_record(str(n.node_id))
                     if record is not None:
                         record.update({
@@ -3878,6 +4480,10 @@ class ProductionCanvasTab(QWidget):
                     item_count = (reference_count if selected == "style" else
                                   max(0, reference_count - 1) if selected == "paired" else 1)
                     output_count = item_count * int(count_field.currentData() or 1)
+                    note.setText(
+                        f"多图合成 · {reference_count}/"
+                        f"{51 if enabled else 9} 张参考 · "
+                        "每张图可单独指定主体、场景、构图、元素或风格")
                     summary.setText(
                         f"每张原图独立换风格 · {reference_count} 组 / {output_count} 张结果"
                         if selected == "style" else
@@ -3899,7 +4505,7 @@ class ProductionCanvasTab(QWidget):
                 batch_subject.currentIndexChanged.connect(apply_batch_subject)
                 batch_candidates.currentIndexChanged.connect(apply_batch_mode)
                 apply_batch_mode()
-        elif node.node_type == "video_node":
+        elif node.node_type == "video_node" and not is_existing_video_source:
             chips = QHBoxLayout()
             first_frame = str(node.payload.get("first_frame") or "")
             last_frame = str(node.payload.get("last_frame") or "")
@@ -4019,6 +4625,13 @@ class ProductionCanvasTab(QWidget):
             lambda height, node_id=str(node.node_id):
             self._store_inline_editor_height(node_id, height))
         layout.addWidget(resize_handle)
+        prompt_contract_note = QLabel()
+        prompt_contract_note.setWordWrap(True)
+        prompt_contract_note.setStyleSheet(
+            "color:#a9d6ff;background:#192633;border:1px solid #31516d;"
+            "border-radius:8px;padding:9px;")
+        prompt_contract_note.hide()
+        layout.addWidget(prompt_contract_note)
         self._inline_text_editor = editor
         if node.node_type == "text_node" and not is_copywriting:
             review_text = str(node.payload.get("script_review") or "").strip()
@@ -4102,52 +4715,37 @@ class ProductionCanvasTab(QWidget):
                     self.edit_video_style_transfer_settings(n))
                 style_transfer_row.addWidget(style_transfer_button)
                 layout.addLayout(style_transfer_row)
-            creative_label = QLabel(
-                "补充导演要求（会和上方脚本一起拆镜）" if is_storyboard_director else
-                "创意提示词（仅图生视频）")
-            creative_label.setStyleSheet("color:#74aee5;font-size:11px;")
-            layout.addWidget(creative_label)
-            creative_editor = _NodeTextEdit()
-            creative_editor.setAcceptRichText(False)
-            creative_editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-            creative_editor.setVerticalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-            creative_editor.setHorizontalScrollBarPolicy(
-                Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-            creative_editor.setFixedHeight(120)
-            creative_editor.canvasZoomRequested.connect(
-                lambda factor: self.view.zoom_by(factor, keep_center=False))
-            creative_editor.setPlainText(str(node.payload.get("creative_prompt") or ""))
-            creative_editor.setPlaceholderText(
-                ("写故事、镜头要求和成片目标。已分类的上传图会作为锁定资产参与拆镜，"
-                 "不会被误当成分镜格。" if is_storyboard_director else
-                 "补充你的想法：人物动作、镜头运动、节奏、氛围、光影变化……"
-                 "首尾帧仍作为画面约束，不会变成文生视频。"))
-            creative_editor.textChanged.connect(
-                lambda n=node, e=creative_editor:
-                self.update_custom_setting(n, "creative_prompt", e.toPlainText().strip()))
-            layout.addWidget(creative_editor)
+            if not is_existing_video_source:
+                creative_label = QLabel(
+                    "补充导演要求（会和上方脚本一起拆镜）" if is_storyboard_director else
+                    "创意提示词（仅图生视频）")
+                creative_label.setStyleSheet("color:#74aee5;font-size:11px;")
+                layout.addWidget(creative_label)
+                creative_editor = _NodeTextEdit()
+                creative_editor.setAcceptRichText(False)
+                creative_editor.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+                creative_editor.setVerticalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+                creative_editor.setHorizontalScrollBarPolicy(
+                    Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+                creative_editor.setFixedHeight(120)
+                creative_editor.canvasZoomRequested.connect(
+                    lambda factor: self.view.zoom_by(factor, keep_center=False))
+                creative_editor.setPlainText(str(node.payload.get("creative_prompt") or ""))
+                creative_editor.setPlaceholderText(
+                    ("写故事、镜头要求和成片目标。已分类的上传图会作为锁定资产参与拆镜，"
+                     "不会被误当成分镜格。" if is_storyboard_director else
+                     "补充你的想法：人物动作、镜头运动、节奏、氛围、光影变化……"
+                     "首尾帧仍作为画面约束，不会变成文生视频。"))
+                creative_editor.textChanged.connect(
+                    lambda n=node, e=creative_editor:
+                    self.update_custom_setting(n, "creative_prompt", e.toPlainText().strip()))
+                layout.addWidget(creative_editor)
         controls = QHBoxLayout()
         secondary_controls = None
         mode = None
         action_getter = None
-        options = {
-            "image_node": (["AI 编辑", "图片高清", "智能扩图", "移除背景", "替换背景"]
-                           if bool(node.payload.get("image_workbench")) else
-                           (["AI 编辑"] if bool(node.payload.get("multi_image_composer"))
-                            else (["文生图", "图生图"]
-                                  if bool(node.payload.get("asset_kind")) else
-                                  ["图生图"]))),
-            "video_node": (
-                ["视频风格迁移", "按时间戳修改", "基于完整视频续长"]
-                if bool(node.payload.get("video_style_transfer")) else
-                ["图生视频", "文生视频", "按时间戳修改", "提取首中尾帧",
-                 "基于尾帧续拍", "基于完整视频续长"]),
-            "audio_node": (
-                ["克隆声音生成语音"] if bool(node.payload.get("voice_clone"))
-                else ["对白配音", "音效"]),
-            "shot": ["保存镜头修改", "生成关键帧", "参考图再生成", "生成视频", "生成对白"],
-        }.get(node.node_type, ["编辑节点", "继续生成"])
+        options = self._node_action_options(node)
         if is_copywriting:
             record = self._custom_record(str(node.node_id)) or node.payload
             def copy_status(value):
@@ -4627,6 +5225,12 @@ class ProductionCanvasTab(QWidget):
             saved_action_index = mode.findText(saved_action)
             if saved_action_index >= 0:
                 mode.setCurrentIndex(saved_action_index)
+            elif (mode.count() and not is_voice_clone and not (
+                    node.node_type == "image_node" and
+                    bool(node.payload.get("multi_image_composer")) and
+                    bool(node.payload.get("batch_mode")))):
+                self.update_custom_setting(
+                    node, "editor_action", mode.currentText())
             mode.currentTextChanged.connect(
                 lambda value, n=node: self.update_custom_setting(n, "editor_action", value))
             controls.addWidget(mode, 1)
@@ -4641,15 +5245,16 @@ class ProductionCanvasTab(QWidget):
             model_combo = None
             ratio = None
             if node.node_type in ("image_node", "video_node"):
-                ratio = QComboBox(); ratio.addItems(["16:9", "9:16", "1:1", "4:5"])
+                ratio = _CanvasComboBox(panel); ratio.addItems(["16:9", "9:16", "1:1", "4:5"])
                 ratio.setCurrentText(str(node.payload.get("ratio") or "16:9"))
                 ratio.currentTextChanged.connect(
                     lambda value, n=node: self.update_custom_setting(n, "ratio", value))
                 controls.addWidget(ratio)
+                ratio.setVisible(not is_existing_video_source)
                 capabilities = (("text_to_image", "image_edit")
                                 if node.node_type == "image_node" else
                                 ("image_to_video", "text_to_video"))
-                provider_combo = QComboBox()
+                provider_combo = _CanvasComboBox(panel)
                 seen_providers = set()
                 for capability in capabilities:
                     for provider in get_ai_manager().registry.by_capability(capability):
@@ -4664,7 +5269,8 @@ class ProductionCanvasTab(QWidget):
                         "image_provider" if node.node_type == "image_node"
                         else "video_provider")
                 saved_provider = str(
-                    project_locked or node.payload.get("provider_name") or "")
+                    project_locked or node.payload.get("provider_name") or
+                    ("seedance" if is_existing_video_source else ""))
                 provider_combo.setCurrentIndex(max(
                     0, provider_combo.findData(saved_provider)))
                 saved_provider = str(provider_combo.currentData() or saved_provider)
@@ -4685,12 +5291,14 @@ class ProductionCanvasTab(QWidget):
                     provider_combo.setToolTip("当前节点使用的生成模型")
                 controls.addWidget(provider_combo)
                 if node.node_type == "video_node":
-                    video_model_combo = QComboBox()
+                    video_model_combo = _CanvasComboBox(panel)
                     locked_model = (self._storyboard_model_lock(source_id, "video_model")
                                     if source_id else "")
                     saved_model = str(
                         locked_model or node.payload.get("model") or
-                        self._video_provider_default_model(saved_provider))
+                        ("doubao-seedance-2-5-260628"
+                         if is_existing_video_source and saved_provider == "seedance"
+                         else self._video_provider_default_model(saved_provider)))
                     configured_model = self._configure_video_model_combo(
                         video_model_combo, saved_provider, saved_model)
                     if configured_model != saved_model and not locked_model:
@@ -4715,7 +5323,7 @@ class ProductionCanvasTab(QWidget):
                         "制片组节点的选择会同步到整个项目。")
                     controls.addWidget(video_model_combo)
             if node.node_type == "video_node":
-                duration_combo = QComboBox()
+                duration_combo = _CanvasComboBox(panel)
                 duration_values, resolution_values, ratio_values = self._video_output_options(
                     saved_provider,
                     self._combo_value(video_model_combo) if video_model_combo else "")
@@ -4729,7 +5337,8 @@ class ProductionCanvasTab(QWidget):
                     self.update_custom_setting(n, "duration", int(c.currentData() or 5)))
                 duration_combo.setToolTip("时长严格服从所选模型，不会在提交时静默修改")
                 controls.addWidget(duration_combo)
-                resolution_combo = QComboBox()
+                duration_combo.setVisible(not is_existing_video_source)
+                resolution_combo = _CanvasComboBox(panel)
                 for value in resolution_values:
                     resolution_combo.addItem(value, value)
                 saved_resolution = str(node.payload.get("resolution") or "720p")
@@ -4990,6 +5599,22 @@ class ProductionCanvasTab(QWidget):
                 (self.hide_inline_editor(), self.open_scene_stage(sid)))
             stage_row.addWidget(stage_button)
             layout.addLayout(stage_row)
+        def refresh_outer_prompt(_value=""):
+            action = (action_getter() if action_getter is not None else
+                      mode.currentText() if mode is not None else "")
+            note = INTERNAL_PROMPT_ACTIONS.get(str(action), "")
+            editor.setVisible(not bool(note))
+            resize_handle.setVisible(not bool(note))
+            prompt_contract_note.setText(note)
+            prompt_contract_note.setVisible(bool(note))
+            panel.adjustSize()
+
+        if mode is not None:
+            mode.currentTextChanged.connect(refresh_outer_prompt)
+        if batch_mode is not None:
+            batch_mode.currentIndexChanged.connect(refresh_outer_prompt)
+        refresh_outer_prompt()
+
         node_has_active_task = any(
             str(task.get("node_id") or "") == str(node.node_id) and
             not task["handle"].is_finished
@@ -5017,7 +5642,18 @@ class ProductionCanvasTab(QWidget):
         layout.addLayout(controls)
         if secondary_controls is not None:
             layout.addLayout(secondary_controls)
+        # Keep the proxy hidden while adopting the parentless panel.  If a
+        # visible proxy calls setWidget() immediately, Qt briefly exposes the
+        # panel as a native top-level window before converting it into an
+        # embedded canvas widget.  On Windows that appears as a one-frame small
+        # popup every time a node editor is opened.
         proxy = QGraphicsProxyWidget()
+        proxy.setVisible(False)
+        panel.setProperty(
+            "canvasEditorConstructedAsViewportChild",
+            panel.parentWidget() is self.view.viewport())
+        panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        panel.setParent(None)
         proxy.setWidget(panel)
         proxy.setZValue(200)
         proxy.setPos(node.pos() + QPointF(0, node.height + 18))
@@ -5025,7 +5661,25 @@ class ProductionCanvasTab(QWidget):
         self.scene.ensure_item_visible(proxy)
         self._inline_editor_proxy = proxy
         self._inline_editor_node_id = node.node_id
+        self._inline_editor_building_node_id = ""
         self._inline_editor_dirty = False
+        proxy.setVisible(True)
+        # The embedded QWidget emits its Show event when the proxy becomes
+        # visible.  Keep native-screen suppression through that event; clearing
+        # it beforehand is exactly what leaked a decorated mini-window on
+        # Windows.  Release it one event-loop turn later, after proxy adoption
+        # is complete, rather than retaining it indefinitely.
+        QTimer.singleShot(0, lambda value=panel:
+                          self._release_embedded_editor_screen_guard(value))
+
+    @staticmethod
+    def _release_embedded_editor_screen_guard(panel):
+        try:
+            if panel.graphicsProxyWidget() is not None:
+                panel.setAttribute(
+                    Qt.WidgetAttribute.WA_DontShowOnScreen, False)
+        except RuntimeError:
+            pass
 
     def _inline_editing_started(self, node):
         self._inline_editor_typing = True
@@ -5562,6 +6216,91 @@ class ProductionCanvasTab(QWidget):
             else f"＋参考 {len(values)}")
         button.setToolTip("\n".join(Path(value).name for value in values))
         self._save_layout_now()
+
+    def choose_batch_images_for_node(self, node_or_id):
+        """Import image files as real source nodes and wire them in one pass."""
+        node_id = str(getattr(node_or_id, "node_id", node_or_id) or "")
+        if node_id not in self._nodes:
+            return
+        # The file picker and the following canvas rebuild must run after the
+        # clicked inline-editor button has finished dispatching its signal.
+        self.hide_inline_editor()
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "批量导入图片并自动连线", "",
+            "图片 (*.png *.jpg *.jpeg *.webp *.bmp *.gif *.tif *.tiff)")
+        if paths:
+            self.import_images_into_node(node_id, paths)
+
+    def import_images_into_node(self, target_id: str, paths) -> list[str]:
+        """Create one image node per file and attach all of them to target."""
+        target_id = str(target_id or "")
+        target = self._nodes.get(target_id)
+        record = self._custom_record(target_id)
+        if (target is None or record is None or target.node_type != "image_node" or
+                not bool(record.get("multi_image_composer"))):
+            return []
+        existing_paths = {
+            os.path.normcase(os.path.abspath(str(value)))
+            for value in record.get("references", []) if value
+        }
+        supported = []
+        for value in paths or []:
+            path = os.path.abspath(os.path.normpath(str(value or "")))
+            key = os.path.normcase(path)
+            if (not path or key in existing_paths or
+                    not os.path.isfile(path) or not self._is_image_path(path)):
+                continue
+            existing_paths.add(key)
+            supported.append(path)
+        room = max(0, 51 - len(record.get("references") or []))
+        supported = supported[:room]
+        if not supported:
+            return []
+
+        origin = QPointF(target.pos())
+        created = []
+        references = [str(value) for value in record.get("references", []) if value]
+        typed = [dict(value) for value in record.get("reference_assets", [])
+                 if isinstance(value, dict) and value.get("path")]
+        edges = self._positions().setdefault("__workflow_edges__", [])
+        strategy = str(record.get("batch_strategy") or "paired")
+        for index, path in enumerate(supported):
+            column, row = divmod(index, 6)
+            position = origin + QPointF(
+                -540.0 - column * 390.0,
+                (row - min(2.5, (len(supported) - 1) / 2)) * 245.0)
+            source_id = self.create_custom_node(
+                "image_node", position, {
+                    "title":Path(path).stem, "path":path, "content":"",
+                    "reference_role":"composition", "status":"已批量导入画布",
+                }, defer_refresh=True)
+            created.append(source_id)
+            references.append(path)
+            typed.append({
+                "path":path,
+                "role":"source_image" if strategy == "style" else "composition",
+                "purpose":"source_image" if strategy == "style" else "composition",
+                "source_node_id":source_id,
+                "label":f"批量图片 {len(references):02d}",
+            })
+            edge = {"source":source_id, "target":target_id,
+                    "type":"batch_image"}
+            if edge not in edges:
+                edges.append(edge)
+
+        record.update({
+            "references":references[:51],
+            "reference_assets":typed[:51],
+            "batch_mode":True,
+            "batch_strategy":strategy,
+            "editor_action":(
+                "批量换风格" if strategy == "style" else "批量搭配生成"),
+            "status":f"已批量导入并连接 {len(created)} 张 · 共 {len(references[:51])} 张",
+        })
+        self._save_layout_now()
+        self.refresh()
+        self.focus_node(target_id)
+        return created
 
     def show_reference_menu(self, node, button):
         menu = QMenu(self)
@@ -6119,7 +6858,7 @@ class ProductionCanvasTab(QWidget):
             record.get("source_duration") or record.get("duration") or 10))
         dialog = QDialog(self)
         dialog.setWindowTitle("AI 视频局部编辑 · Seedance 2.5")
-        dialog.setMinimumSize(760, 720)
+        dialog.setMinimumSize(760, 650)
         dialog.setStyleSheet(
             "QDialog{background:#17181d;color:#ededf2;}"
             "QLabel{color:#d9dbe4;}QLineEdit,QTextEdit,QDoubleSpinBox,QComboBox{"
@@ -6133,7 +6872,21 @@ class ProductionCanvasTab(QWidget):
         heading.setStyleSheet("font-size:15px;font-weight:700;color:#eef6ff;")
         root.addWidget(heading)
         frame = _VideoRegionLabel()
-        frame.set_region(record.get("video_edit_region") or {})
+        saved_region = (record.get("video_edit_region")
+                        if isinstance(record.get("video_edit_region"), dict) else {})
+        legacy_default_region = bool(
+            saved_region and not record.get("video_edit_region_user_set") and
+            all(abs(float(saved_region.get(key) or 0) - expected) < 0.0001
+                for key, expected in (("x", 0.2), ("y", 0.2),
+                                      ("width", 0.35), ("height", 0.35))))
+        if legacy_default_region:
+            record["video_edit_region"] = {}
+            record["video_edit_region_user_set"] = False
+            node.payload.update({
+                "video_edit_region":{}, "video_edit_region_user_set":False,
+            })
+            self._save_layout_now()
+        frame.set_region({} if legacy_default_region else saved_region)
         preview_path = str(record.get("video_thumbnail") or "")
         source_path = str(record.get("path") or "")
         if (not preview_path or not os.path.exists(preview_path)) and self._is_video_path(source_path):
@@ -6147,20 +6900,116 @@ class ProductionCanvasTab(QWidget):
         else:
             frame.setText("暂无本地预览画面 · 仍可用百分比选区提交")
         root.addWidget(frame)
-        time_row = QHBoxLayout()
-        time_row.addWidget(QLabel("开始秒"))
-        start = QDoubleSpinBox(); start.setRange(0, duration); start.setDecimals(1)
-        start.setSingleStep(0.1)
-        start.setValue(max(0, min(duration, float(record.get("video_edit_start") or 0))))
-        time_row.addWidget(start, 1)
-        time_row.addWidget(QLabel("结束秒"))
-        end = QDoubleSpinBox(); end.setRange(0, duration); end.setDecimals(1)
-        end.setSingleStep(0.1)
-        end.setValue(max(start.value() + 0.1, min(
-            duration, float(record.get("video_edit_end") or min(duration, 4)))))
-        time_row.addWidget(end, 1)
-        time_row.addWidget(QLabel(f"视频共 {duration:g} 秒"))
-        root.addLayout(time_row)
+        preview_reader = _LocalVideoPreviewReader(source_path)
+        saved_start = max(
+            0.0, min(duration, float(record.get("video_edit_start") or 0)))
+        saved_end = max(saved_start + 0.1, min(
+            duration, float(record.get("video_edit_end") or min(duration, 4))))
+        timeline = _VideoTimeRange(duration)
+        timeline.set_range(saved_start, saved_end)
+        root.addWidget(timeline)
+        play_row = QHBoxLayout()
+        play_button = QPushButton()
+        play_button.setMinimumWidth(190)
+        play_row.addWidget(play_button)
+        play_row.addStretch(1)
+        root.addLayout(play_row)
+        pending_preview = {"second":(saved_start + saved_end) / 2.0}
+        preview_timer = QTimer(dialog)
+        preview_timer.setSingleShot(True)
+        preview_timer.setInterval(55)
+        playback = {"active":False, "end_ms":0}
+        media_player = None
+
+        def refresh_play_button():
+            if playback["active"]:
+                play_button.setText("■ 停止播放")
+                return
+            value_start, value_end = timeline.range()
+            play_button.setText(
+                f"▶ 播放选中片段（{max(0.1, value_end - value_start):.1f} 秒）")
+
+        try:
+            from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
+            if source_path and os.path.exists(source_path) and self._is_video_path(source_path):
+                media_player = QMediaPlayer(dialog)
+                audio_output = QAudioOutput(dialog)
+                video_sink = QVideoSink(dialog)
+                audio_output.setVolume(1.0)
+                media_player.setAudioOutput(audio_output)
+                media_player.setVideoSink(video_sink)
+                media_player.setSource(QUrl.fromLocalFile(os.path.abspath(source_path)))
+
+                def show_playback_frame(video_frame):
+                    image = video_frame.toImage()
+                    if not image.isNull():
+                        frame.setPixmap(QPixmap.fromImage(image))
+
+                video_sink.videoFrameChanged.connect(show_playback_frame)
+            else:
+                play_button.setEnabled(False)
+                play_button.setToolTip("当前节点没有可读取的本地视频文件")
+        except (ImportError, OSError) as error:
+            play_button.setEnabled(False)
+            play_button.setToolTip(f"当前环境缺少视频播放组件：{error}")
+
+        def stop_playback():
+            was_active = bool(playback["active"])
+            playback["active"] = False
+            timeline.set_playhead(None)
+            if media_player is not None and was_active:
+                media_player.stop()
+            refresh_play_button()
+
+        def track_playback_position(position_ms):
+            if not playback["active"]:
+                return
+            current_ms = int(position_ms or 0)
+            timeline.set_playhead(current_ms / 1000.0)
+            if current_ms >= int(playback["end_ms"]):
+                stop_playback()
+
+        def toggle_selected_playback():
+            if playback["active"]:
+                stop_playback()
+                return
+            if media_player is None:
+                return
+            value_start, value_end = timeline.range()
+            preview_timer.stop()
+            playback["active"] = True
+            playback["end_ms"] = max(
+                int(round(value_start * 1000.0)) + 1,
+                int(round(value_end * 1000.0)))
+            media_player.setPosition(int(round(value_start * 1000.0)))
+            timeline.set_playhead(value_start)
+            refresh_play_button()
+            media_player.play()
+
+        if media_player is not None:
+            media_player.positionChanged.connect(track_playback_position)
+        play_button.clicked.connect(toggle_selected_playback)
+        refresh_play_button()
+
+        def render_timeline_preview():
+            second = float(pending_preview["second"])
+            pixmap = preview_reader.pixmap_at(second)
+            if not pixmap.isNull():
+                frame.setPixmap(pixmap)
+
+        def schedule_timeline_preview(value_start, value_end):
+            stop_playback()
+            pending_preview["second"] = (
+                float(value_start) + float(value_end)) / 2.0
+            refresh_play_button()
+            if preview_reader.is_valid():
+                preview_timer.start()
+
+        preview_timer.timeout.connect(render_timeline_preview)
+        timeline.rangeChanged.connect(schedule_timeline_preview)
+        pending_preview["second"] = (saved_start + saved_end) / 2.0
+        if preview_reader.is_valid():
+            preview_timer.start()
         scope_row = QHBoxLayout()
         scope_row.addWidget(QLabel("定位方式"))
         scope = QComboBox(); scope.addItem("画面框选", "element")
@@ -6176,8 +7025,7 @@ class ProductionCanvasTab(QWidget):
         instruction.setAcceptRichText(False); instruction.setFixedHeight(90)
         instruction.setPlaceholderText(
             "直接描述怎么改，例如：把穿红衣服的人变成银色机器人，其他不变")
-        instruction.setPlainText(str(
-            record.get("video_edit_instruction") or record.get("content") or ""))
+        instruction.setPlainText(str(record.get("video_edit_instruction") or ""))
         root.addWidget(instruction)
         preserve_values = list(record.get("video_edit_preserve") or [
             "人物身份", "其他人物", "动作时序", "镜头运动", "画面构图", "原始声音"])
@@ -6195,12 +7043,14 @@ class ProductionCanvasTab(QWidget):
             element_mode = str(scope.currentData() or "element") != "whole"
             frame.setEnabled(element_mode); target.setEnabled(element_mode)
             value = frame.region()
-            region_note.setText(
-                (f"选区：X {round(value['x'] * 100)}–"
-                 f"{round((value['x'] + value['width']) * 100)}% · Y "
-                 f"{round(value['y'] * 100)}–"
-                 f"{round((value['y'] + value['height']) * 100)}%")
-                if element_mode else "由提示词识别修改目标，不发送画面选区")
+            has_region = bool(element_mode and value)
+            region_note.setVisible(has_region)
+            if has_region:
+                region_note.setText(
+                    f"选区：X {round(value['x'] * 100)}–"
+                    f"{round((value['x'] + value['width']) * 100)}% · Y "
+                    f"{round(value['y'] * 100)}–"
+                    f"{round((value['y'] + value['height']) * 100)}%")
 
         scope.currentIndexChanged.connect(lambda _index: refresh_scope())
         frame.regionChanged.connect(lambda _value: refresh_scope())
@@ -6213,9 +7063,10 @@ class ProductionCanvasTab(QWidget):
         root.addWidget(buttons)
 
         def accept_settings():
-            edit_start, edit_end = float(start.value()), float(end.value())
+            edit_start, edit_end = timeline.range()
             text = instruction.toPlainText().strip()
             element_mode = str(scope.currentData() or "element") != "whole"
+            selected_region = frame.region() if element_mode else {}
             if edit_end <= edit_start:
                 QMessageBox.information(dialog, "时间范围无效", "结束时间必须大于开始时间。")
                 return
@@ -6225,13 +7076,14 @@ class ProductionCanvasTab(QWidget):
             if not text:
                 QMessageBox.information(dialog, "缺少修改说明", "请写清想让画面怎么变化。")
                 return
-            if element_mode and not target.text().strip():
+            if selected_region and not target.text().strip():
                 QMessageBox.information(dialog, "缺少框选目标", "请说明框中的元素是什么。")
                 return
             patch = {
                 "video_edit_start":edit_start, "video_edit_end":edit_end,
                 "video_edit_scope":str(scope.currentData() or "element"),
-                "video_edit_region":frame.region(),
+                "video_edit_region":selected_region,
+                "video_edit_region_user_set":bool(selected_region),
                 "video_edit_target":target.text().strip(),
                 "video_edit_instruction":text,
                 "video_edit_preserve":[
@@ -6244,6 +7096,12 @@ class ProductionCanvasTab(QWidget):
 
         buttons.accepted.connect(accept_settings)
         buttons.rejected.connect(dialog.reject)
+        def clean_up_preview(_result):
+            stop_playback()
+            preview_timer.stop()
+            preview_reader.close()
+
+        dialog.finished.connect(clean_up_preview)
         dialog.exec()
 
     def submit_seedance_video_reference(self, node, content: str, action: str):
@@ -6260,10 +7118,14 @@ class ProductionCanvasTab(QWidget):
                 "Seedance 2.5。Seedance 2.0 仍可用于文生、首帧和首尾帧视频。")
             return
         typed = self._reference_assets_for_node(node)
-        if action in {"按时间戳修改", "基于完整视频续长"} and record.get(
-                "provider_remote_url"):
+        source_video = str(
+            record.get("provider_remote_url") or record.get("path") or "")
+        if (action in {"按时间戳修改", "基于完整视频续长"} and
+                source_video and
+                (source_video.startswith(("http://", "https://")) or
+                 (os.path.exists(source_video) and self._is_video_path(source_video)))):
             typed.append({
-                "path": str(record["provider_remote_url"]),
+                "path": source_video,
                 "role": "reference_video",
                 "label": ("待局部修改完整视频" if action == "按时间戳修改"
                           else "待续长完整视频"),
@@ -6312,6 +7174,12 @@ class ProductionCanvasTab(QWidget):
             end = float(record.get("video_edit_end") or 0)
             scope = str(record.get("video_edit_scope") or "element")
             target = str(record.get("video_edit_target") or "").strip()
+            region = record.get("video_edit_region") or {}
+            has_region = bool(
+                float(region.get("width") or 0) > 0 and
+                float(region.get("height") or 0) > 0)
+            if scope != "whole" and not has_region:
+                scope = "whole"
             if not instruction or end <= start or end - start > 30:
                 QMessageBox.information(
                     self, "按时间戳修改",
@@ -6323,7 +7191,6 @@ class ProductionCanvasTab(QWidget):
                 return
             preserve = "、".join(str(value) for value in
                                   record.get("video_edit_preserve", []) if value)
-            region = record.get("video_edit_region") or {}
             region_text = ""
             if scope != "whole":
                 x1 = round(float(region.get("x") or 0) * 100)
@@ -6359,11 +7226,17 @@ class ProductionCanvasTab(QWidget):
                 "style_preserve":list(record.get("style_preserve") or []),
             })
         if action == "按时间戳修改":
+            request_region = dict(record.get("video_edit_region") or {})
+            request_scope = str(record.get("video_edit_scope") or "element")
+            if (request_scope != "whole" and
+                    (float(request_region.get("width") or 0) <= 0 or
+                     float(request_region.get("height") or 0) <= 0)):
+                request_scope = "whole"
             params.update({
                 "video_edit_start":float(record.get("video_edit_start") or 0),
                 "video_edit_end":float(record.get("video_edit_end") or 0),
-                "video_edit_scope":str(record.get("video_edit_scope") or "element"),
-                "video_edit_region":dict(record.get("video_edit_region") or {}),
+                "video_edit_scope":request_scope,
+                "video_edit_region":request_region if request_scope != "whole" else {},
                 "video_edit_target":str(record.get("video_edit_target") or ""),
                 "video_edit_instruction":str(
                     record.get("video_edit_instruction") or ""),
@@ -12566,6 +13439,13 @@ class ProductionCanvasTab(QWidget):
         self.submit_blocking_storyboard(node, generate_panels=True)
 
     def extract_video_frames_to_canvas(self, node):
+        # Snapshot plain Python values before creating any scene items.  A
+        # normal create_custom_node() refresh deletes every existing
+        # CanvasNodeItem, so keeping and then reusing `node` causes the wrapped
+        # C++ object deletion reported by Qt.
+        source_id = str(node.node_id)
+        source_pos = QPointF(node.pos())
+        source_title = str(node.title or "视频")
         path = str(node.payload.get("path") or node.thumbnail or "")
         frames = self._extract_video_review_frames(path)
         if not frames:
@@ -12575,15 +13455,21 @@ class ProductionCanvasTab(QWidget):
         edges = self._positions().setdefault("__workflow_edges__", [])
         for index, frame in enumerate(frames):
             frame_id = self.create_custom_node("image_node",
-                node.pos() + QPointF(350 + index * 330, 0),
-                {"title":f"{node.title} · {labels[index]}", "path":frame,
-                 "content":f"来自 {Path(path).name} 的{labels[index]}"})
-            edges.append({"source":node.node_id, "target":frame_id, "type":"video_frame"})
-        record = self._custom_record(node.node_id)
+                source_pos + QPointF(350 + index * 330, 0),
+                {"title":f"{source_title} · {labels[index]}", "path":frame,
+                 "content":f"来自 {Path(path).name} 的{labels[index]}"},
+                defer_refresh=True)
+            edge = {"source":source_id, "target":frame_id, "type":"video_frame"}
+            if edge not in edges:
+                edges.append(edge)
+        record = self._custom_record(source_id)
         if record is not None:
-            record["review_frames"] = frames; record["tail_frame"] = frames[-1]
+            record["review_frames"] = list(frames)
+            record["video_review_frames"] = list(frames)
+            record["tail_frame"] = frames[-1]
+            record["video_tail_frame"] = frames[-1]
             record["status"] = "首中尾帧已提取"
-        self._save_layout_now(); self.refresh()
+        self._save_layout_now(); self.refresh(); self.focus_node(source_id)
 
     def continue_video_from_tail(self, node, content: str):
         path = str(node.payload.get("path") or node.thumbnail or "")
@@ -13406,8 +14292,13 @@ class ProductionCanvasTab(QWidget):
 
     def submit_multi_image_batch(self, node, content: str, action: str):
         """Run WebAI-compatible paired/style batches inside one image node."""
-        record = self._custom_record(str(node.node_id))
+        parent_id = str(node.node_id)
+        record = self._custom_record(parent_id)
         if record is None:
+            return False
+        if parent_id in self._image_batch_queues:
+            QMessageBox.information(
+                self, "图片批量生成", "这个节点已有批量任务在排队或生成中。")
             return False
         assets = [
             dict(value) for value in record.get("reference_assets", [])
@@ -13437,7 +14328,10 @@ class ProductionCanvasTab(QWidget):
         if style_contract:
             prompt = f"{prompt}\n\n{style_contract}".strip()
         if not prompt:
-            QMessageBox.information(self, "图片批量生成", "请先填写统一生成要求。")
+            QMessageBox.information(
+                self, "图片批量生成",
+                "请先在“风格探索器”选择风格。" if strategy == "style" else
+                "请先填写统一生成要求。")
             return False
         manager = get_ai_manager()
         providers = list(manager.registry.by_capability("image_edit"))
@@ -13453,10 +14347,7 @@ class ProductionCanvasTab(QWidget):
         if provider is None:
             QMessageBox.warning(self, "没有可用模型", "当前没有支持图片编辑的生成引擎。")
             return False
-        ratio = str(record.get("ratio") or "1:1")
-        sizes = {"16:9":"2048x1152", "9:16":"1152x2048",
-                 "1:1":"2048x2048", "4:5":"1638x2048",
-                 "4:3":"2048x1536", "3:2":"2048x1365"}
+        ratio = normalize_aspect_ratio(record.get("ratio"), "1:1")
         candidate_count = max(1, min(4, int(record.get("candidate_count") or 1)))
         output_count = len(work_items) * candidate_count
         record.update({
@@ -13466,7 +14357,7 @@ class ProductionCanvasTab(QWidget):
             "batch_completed_items": 0,
             "status": f"批量任务正在提交 · 0/{len(work_items)} 组",
         })
-        submitted = 0
+        jobs = []
         for item_index, (subject, source) in enumerate(work_items):
             typed = ([{
                 **subject, "role":"subject", "purpose":"subject",
@@ -13481,7 +14372,8 @@ class ProductionCanvasTab(QWidget):
             })
             paths = [str(value.get("path") or "") for value in typed]
             params = {
-                "size": sizes.get(ratio, "2048x2048"),
+                "size": resolve_image_output_size(provider.name, "2K", ratio),
+                "ratio": ratio,
                 "n": candidate_count, "quality":"high", "watermark":False,
                 "batch_single_node":True, "batch_strategy":strategy,
                 "batch_item_index":item_index,
@@ -13504,28 +14396,186 @@ class ProductionCanvasTab(QWidget):
                 metadata={"canvas_node_id":str(node.node_id),
                           "canvas_action":action, "batch_item_index":item_index},
                 use_cache=False)
-            try:
-                handle = manager.submit(provider.name, request)
-            except Exception as error:
-                record["status"] = (
-                    f"批量提交中断 · 已提交 {submitted}/{len(work_items)} 组")
-                self._save_layout_now()
-                QMessageBox.warning(self, "批量提交失败", str(error))
-                return submitted > 0
-            self._standalone_tasks[handle.id] = {
-                "handle":handle, "node_id":str(node.node_id),
+            jobs.append({
+                "node_id":parent_id,
                 "provider":provider.name, "request":request,
                 "fallback_providers":[], "provider_locked":bool(preferred),
                 "kind":"image_batch", "batch_item_index":item_index,
                 "batch_item_count":len(work_items),
                 "batch_output_count":output_count,
-            }
-            submitted += 1
-        record["status"] = f"批量生成中 · 0/{len(work_items)} 组 · 共 {output_count} 张"
+                "batch_retry_count":0,
+            })
+        self._image_batch_queues[parent_id] = {
+            "pending":jobs, "active_task_id":"", "total":len(jobs),
+            "failed":0, "last_error":"",
+        }
+        record["status"] = (
+            f"批量生成已排队 · 0/{len(work_items)} 组 · 共 {output_count} 张")
         self._save_layout_now()
-        node.badge = "批量生成 0%"
+        node.badge = "批量排队 0%"
         node.update()
+        self._submit_next_image_batch(parent_id)
         return True
+
+    @staticmethod
+    def _image_batch_retry_seconds(error) -> float:
+        """Return a provider-requested retry delay for an image rate limit."""
+        text = str(error or "")
+        lowered = text.lower()
+        if not any(marker in lowered for marker in (
+                "429", "ratelimit", "rate limit", "too many requests")):
+            return 0.0
+        match = re.search(
+            r"retry\s+after\s+(\d+(?:\.\d+)?)\s*seconds?", text,
+            flags=re.IGNORECASE)
+        seconds = float(match.group(1)) if match else 15.0
+        return max(2.0, min(300.0, seconds + 1.0))
+
+    def _submit_waiting_image_batch(self):
+        if self._active_image_batch_node_id:
+            return
+        for parent_id in list(self._image_batch_queues):
+            self._submit_next_image_batch(parent_id)
+            if self._active_image_batch_node_id:
+                break
+
+    def _submit_next_image_batch(self, parent_id: str):
+        """Submit exactly one image batch item so API limits cannot be flooded."""
+        parent_id = str(parent_id or "")
+        queue = self._image_batch_queues.get(parent_id)
+        if not queue:
+            return
+        if (self._active_image_batch_node_id and
+                self._active_image_batch_node_id != parent_id):
+            return
+        if queue.get("active_task_id"):
+            return
+        record = self._custom_record(parent_id)
+        if record is None:
+            self._image_batch_queues.pop(parent_id, None)
+            if self._active_image_batch_node_id == parent_id:
+                self._active_image_batch_node_id = ""
+            self._submit_waiting_image_batch()
+            return
+        pending = queue.get("pending") or []
+        if not pending:
+            total = max(1, int(queue.get("total") or 1))
+            failed = max(0, int(queue.get("failed") or 0))
+            completed = max(0, int(record.get("batch_completed_items") or 0))
+            generated = len(record.get("candidates") or [])
+            if failed:
+                record["status"] = (
+                    f"批量结束 · {completed}/{total} 组成功 · "
+                    f"{failed} 组失败 · 已生成 {generated} 张")
+            else:
+                record["status"] = f"批量生成完成 · {generated} 张"
+            record["batch_failed_items"] = failed
+            self._image_batch_queues.pop(parent_id, None)
+            if self._active_image_batch_node_id == parent_id:
+                self._active_image_batch_node_id = ""
+            self._save_layout_now()
+            self.refresh()
+            QTimer.singleShot(0, self._submit_waiting_image_batch)
+            return
+        self._active_image_batch_node_id = parent_id
+        job = pending.pop(0)
+        completed = max(0, int(record.get("batch_completed_items") or 0))
+        total = max(1, int(queue.get("total") or 1))
+        record["status"] = f"批量生成中 · {completed}/{total} 组"
+        try:
+            handle = get_ai_manager().submit(job["provider"], job["request"])
+        except Exception as error:
+            queue["failed"] = int(queue.get("failed") or 0) + 1
+            queue["last_error"] = str(error)
+            record["status"] = (
+                f"第 {int(job.get('batch_item_index') or 0) + 1} 组提交失败 · "
+                "已保留其他任务并继续")
+            self._save_layout_now()
+            QTimer.singleShot(
+                800, lambda value=parent_id: self._submit_next_image_batch(value))
+            return
+        task = dict(job)
+        task["handle"] = handle
+        task["batch_queue_parent_id"] = parent_id
+        self._standalone_tasks[handle.id] = task
+        queue["active_task_id"] = handle.id
+        self._save_layout_now()
+
+    def _materialize_image_batch_results(self, parent_id: str, paths, task=None):
+        """Keep every batch output as its own canvas image instead of replacing the parent."""
+        parent_id = str(parent_id or "")
+        parent = self._custom_record(parent_id)
+        if parent is None:
+            return []
+        result_paths = list(dict.fromkeys(
+            str(value or "") for value in (paths or [])
+            if value and os.path.exists(str(value))))
+        if not result_paths:
+            return []
+        candidates = list(dict.fromkeys(
+            list(parent.get("candidates") or []) + result_paths))
+        parent["candidates"] = candidates
+        records = self._positions().setdefault("__custom_nodes__", [])
+        edges = self._positions().setdefault("__workflow_edges__", [])
+        existing = {
+            str(value.get("path") or ""): value
+            for value in records
+            if isinstance(value, dict) and
+            str(value.get("batch_result_parent_id") or "") == parent_id and
+            value.get("path")
+        }
+        source_pos = self._positions().get(parent_id, [80.0, -260.0])
+        task = task if isinstance(task, dict) else {}
+        provider_label = str(task.get("provider") or "自动模型")
+        item_index = max(0, int(task.get("batch_item_index") or 0))
+        item_total = max(1, int(task.get("batch_item_count") or 1))
+        node_ids = []
+
+        def remember_result_edge(child_id: str):
+            edge = {"source":parent_id, "target":str(child_id),
+                    "type":"batch_result"}
+            if not any(
+                    isinstance(value, dict) and
+                    str(value.get("source") or "") == parent_id and
+                    str(value.get("target") or "") == str(child_id) and
+                    str(value.get("type") or "") == "batch_result"
+                    for value in edges):
+                edges.append(edge)
+
+        for path in result_paths:
+            result_number = candidates.index(path) + 1
+            status = (
+                f"批量结果 {result_number:02d} · 第 {item_index + 1}/{item_total} 组 · "
+                f"{provider_label}")
+            current = existing.get(path)
+            if current is not None:
+                current.update({
+                    "title": f"批量图片 {result_number:02d}",
+                    "status": status, "candidates": [path],
+                    "batch_result_index": result_number - 1,
+                })
+                current_id = str(current.get("id") or "")
+                node_ids.append(current_id)
+                remember_result_edge(current_id)
+                continue
+            zero_index = result_number - 1
+            column = zero_index % 3
+            row = zero_index // 3
+            child_id = self.create_custom_node(
+                "image_node", QPointF(
+                    float(source_pos[0]) + 500.0 + column * 330.0,
+                    float(source_pos[1]) + row * 300.0), {
+                    "title": f"批量图片 {result_number:02d}",
+                    "path": path, "content": "", "status": status,
+                    "source_node_id": parent_id,
+                    "batch_result_parent_id": parent_id,
+                    "batch_result_index": zero_index,
+                    "production_generated": True,
+                    "candidates": [path],
+                }, defer_refresh=True)
+            node_ids.append(child_id)
+            remember_result_edge(child_id)
+        return [value for value in node_ids if value]
 
     def submit_standalone_generation(self, node, content: str, action: str):
         """独立节点直接生成；镜头仅提供可选的故事、资产和连续性上下文。"""
@@ -13550,14 +14600,14 @@ class ProductionCanvasTab(QWidget):
         if (node.node_type == "video_node" and action == "图生视频" and
                 not raw_prompt and str(node.payload.get("creative_prompt") or "").strip()):
             raw_prompt = "基于输入的首尾关键帧生成连贯视频。"
-        if not raw_prompt:
-            QMessageBox.information(self, "生成节点", "请先填写生成描述。")
-            return
         if (node.node_type == "image_node" and
                 bool(node.payload.get("multi_image_composer")) and
                 bool(node.payload.get("batch_mode")) and
                 action in {"批量搭配生成", "批量换风格", "批量风格转换"}):
             self.submit_multi_image_batch(node, raw_prompt, action)
+            return
+        if not raw_prompt:
+            QMessageBox.information(self, "生成节点", "请先填写生成描述。")
             return
         prompt = self._apply_style_to_prompt(
             raw_prompt, str(node.payload.get("style") or ""))
@@ -13584,8 +14634,17 @@ class ProductionCanvasTab(QWidget):
                 prompt = f"{prompt}\n\n{style_contract}".strip()
             edit_actions = {"AI 编辑", "图生图", "图片高清", "智能扩图", "移除背景", "替换背景"}
             if action in edit_actions and not reference:
-                QMessageBox.information(self, "图片编辑", "请先上传图片，或连接一个图片节点作为参考。")
-                return
+                if bool(node.payload.get("multi_image_composer")):
+                    # 与 WebAI 一致：多图图片节点没有像素参考时就是文生图。
+                    # 旧工程可能仍保存为“AI 编辑”，在提交边界自动修复，避免
+                    # 明明连接了文字却错误要求再上传一张图片。
+                    action = "文生图"
+                    node.payload["editor_action"] = action
+                    if record is not None:
+                        record["editor_action"] = action
+                else:
+                    QMessageBox.information(self, "图片编辑", "请先上传图片，或连接一个图片节点作为参考。")
+                    return
             operation = "image_edit" if reference and action in edit_actions else "text_to_image"
             inputs = {"prompt": prompt}
             if operation == "image_edit":
@@ -13642,10 +14701,8 @@ class ProductionCanvasTab(QWidget):
                         inputs["mask"] = mask_path
                         if record is not None:
                             record["edit_mask_path"] = mask_path
-            ratio = str(node.payload.get("ratio") or "1:1")
-            sizes = {"16:9": "2048x1152", "9:16": "1152x2048",
-                     "1:1": "2048x2048", "4:5": "1638x2048"}
-            params = {"size": sizes.get(ratio, "2048x2048"),
+            ratio = normalize_aspect_ratio(node.payload.get("ratio"), "1:1")
+            params = {"ratio": ratio,
                       "n": max(1, min(4, int(node.payload.get("candidate_count") or 1))),
                       "quality": "high",
                       "watermark": False}
@@ -13871,6 +14928,12 @@ class ProductionCanvasTab(QWidget):
         if provider is None and action == "移除背景":
             provider = next((value for value in providers if value.name == "gptimage"), None)
         provider = provider or providers[0]
+        if operation in {"text_to_image", "image_edit"}:
+            # Image size is provider-specific.  Resolve it only after the
+            # selected provider is known, and carry ratio as an explicit
+            # contract so the control plane cannot silently rebuild it as 1:1.
+            params["size"] = resolve_image_output_size(
+                provider.name, "2K", str(params.get("ratio") or "1:1"))
         try:
             if record is not None:
                 current_path = str(record.get("path") or "")
@@ -14489,9 +15552,15 @@ class ProductionCanvasTab(QWidget):
                         for record in self._positions().get("__custom_nodes__", []):
                             if isinstance(record, dict) and record.get("id") == task["node_id"]:
                                 path = paths[0]
-                                record["path"] = path
-                                if not record.get("generator_kind"):
-                                    record["title"] = Path(path).stem
+                                is_image_batch = (
+                                    str(task.get("kind") or "") == "image_batch")
+                                if is_image_batch:
+                                    self._materialize_image_batch_results(
+                                        str(task["node_id"]), paths, task)
+                                else:
+                                    record["path"] = path
+                                    if not record.get("generator_kind"):
+                                        record["title"] = Path(path).stem
                                 record["actual_provider"] = str(
                                     task.get("provider") or "")
                                 provider_raw = getattr(
@@ -14509,7 +15578,7 @@ class ProductionCanvasTab(QWidget):
                                     record["candidate_batch_paths"] = list(dict.fromkeys(
                                         list(record.get("candidate_batch_paths") or []) + paths))
                                 provider_label = str(task.get("provider") or "自动模型")
-                                if str(task.get("kind") or "") == "image_batch":
+                                if is_image_batch:
                                     completed_items = min(
                                         int(record.get("batch_item_count") or 1),
                                         int(record.get("batch_completed_items") or 0) + 1)
@@ -14632,6 +15701,45 @@ class ProductionCanvasTab(QWidget):
                         self._save_layout_now()
             else:
                 task_kind = str(task.get("kind") or "")
+                if task_kind == "image_batch":
+                    error = handle.result.error if handle.result else "图片生成失败"
+                    parent_id = str(
+                        task.get("batch_queue_parent_id") or task.get("node_id") or "")
+                    queue = self._image_batch_queues.get(parent_id)
+                    retry_seconds = self._image_batch_retry_seconds(error)
+                    retry_count = max(0, int(task.get("batch_retry_count") or 0))
+                    record = self._custom_record(parent_id)
+                    if queue is not None:
+                        queue["active_task_id"] = ""
+                    if queue is not None and retry_seconds and retry_count < 4:
+                        retry_job = {
+                            key:value for key, value in task.items()
+                            if key not in {"handle", "_batch_advance_delay_ms"}
+                        }
+                        retry_job["batch_retry_count"] = retry_count + 1
+                        queue.setdefault("pending", []).insert(0, retry_job)
+                        if record is not None:
+                            record["status"] = (
+                                f"图片服务限流 · {retry_seconds:.0f} 秒后自动重试当前组 · "
+                                f"已完成 {int(record.get('batch_completed_items') or 0)}/"
+                                f"{int(queue.get('total') or 1)} 组")
+                            record["batch_last_retry_seconds"] = retry_seconds
+                        task["_batch_advance_delay_ms"] = int(retry_seconds * 1000)
+                    else:
+                        if queue is not None:
+                            queue["failed"] = int(queue.get("failed") or 0) + 1
+                            queue["last_error"] = str(error)
+                        if record is not None:
+                            total = int((queue or {}).get("total") or
+                                        task.get("batch_item_count") or 1)
+                            record["status"] = (
+                                f"第 {int(task.get('batch_item_index') or 0) + 1} 组失败 · "
+                                f"继续剩余任务 · 已完成 "
+                                f"{int(record.get('batch_completed_items') or 0)}/{total} 组")
+                            record["batch_last_error"] = str(error)[:500]
+                        task["_batch_advance_delay_ms"] = 1200
+                    self._save_layout_now()
+                    continue
                 if task_kind in {"clip_qc", "sequence_qc"}:
                     error = handle.result.error if handle.result else "自动审片失败"
                     source_id = str(task.get("source_id") or "")
@@ -14752,10 +15860,19 @@ class ProductionCanvasTab(QWidget):
         finished_video_groups = []
         finished_qc_sources = []
         finished_qc_groups = []
+        finished_image_batches = []
         for task_id in finished:
             task = self._standalone_tasks.pop(task_id, None) or {}
             group_id = str(task.get("workflow_group_id") or "")
             task_kind = str(task.get("kind") or "")
+            if task_kind == "image_batch":
+                parent_id = str(
+                    task.get("batch_queue_parent_id") or task.get("node_id") or "")
+                queue = self._image_batch_queues.get(parent_id)
+                if queue is not None and str(queue.get("active_task_id") or "") == task_id:
+                    queue["active_task_id"] = ""
+                finished_image_batches.append((
+                    parent_id, max(0, int(task.get("_batch_advance_delay_ms") or 1200))))
             if group_id and task_kind not in {"clip_qc", "sequence_qc"}:
                 finished_video_groups.append((group_id, str(task.get("node_id") or "")))
             if task_kind == "clip_qc":
@@ -14766,6 +15883,11 @@ class ProductionCanvasTab(QWidget):
         if finished:
             self._refresh_workflow_group_statuses()
             self.refresh()
+        for parent_id, delay_ms in finished_image_batches:
+            if parent_id in self._image_batch_queues:
+                QTimer.singleShot(
+                    delay_ms,
+                    lambda value=parent_id: self._submit_next_image_batch(value))
         for group_id, node_id in finished_video_groups:
             # A provider fallback carries the same group id.  Do not advance
             # until that replacement task has also reached a terminal state.
@@ -15230,6 +16352,12 @@ class ProductionCanvasTab(QWidget):
             visible = self.navigator_panel.isHidden()
         visible = bool(visible)
         self.navigator_panel.setVisible(visible)
+        handle = getattr(self, "navigator_collapse_handle", None)
+        if handle is not None:
+            handle.setText("‹" if visible else "›")
+            handle.setToolTip(
+                "收起左侧画布/资产栏" if visible else
+                "展开左侧画布/资产栏")
         if visible:
             self.asset_library.refresh()
             self.navigator_panel.refresh_outline()
@@ -15590,6 +16718,38 @@ class ProductionCanvasTab(QWidget):
         self.delete_canvas_selection()
         return True
 
+    @staticmethod
+    def _node_delete_confirmation_suppressed():
+        return QSettings("CreativeEnginePro", "ProductionCanvas").value(
+            "suppress_node_delete_confirmation", False, type=bool)
+
+    @staticmethod
+    def _set_node_delete_confirmation_suppressed(suppressed: bool):
+        QSettings("CreativeEnginePro", "ProductionCanvas").setValue(
+            "suppress_node_delete_confirmation", bool(suppressed))
+
+    def _confirm_canvas_node_deletion(self, count: int, warning: str = ""):
+        if self._node_delete_confirmation_suppressed():
+            return True
+        box = QMessageBox(self)
+        box.setWindowTitle("删除选中节点")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText(f"从画布/项目中移除 {count} 个选中节点吗？")
+        box.setInformativeText(
+            f"本地图片、视频和音频文件不会删除。{warning}")
+        box.setStandardButtons(
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        box.setDefaultButton(QMessageBox.StandardButton.No)
+        never_ask = QCheckBox("以后删除节点不再提醒", box)
+        never_ask.setToolTip("仍可使用 Ctrl+Z 恢复刚删除的节点")
+        box.setCheckBox(never_ask)
+        answer = QMessageBox.StandardButton(box.exec())
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        if never_ask.isChecked():
+            self._set_node_delete_confirmation_suppressed(True)
+        return True
+
     def delete_canvas_selection(self):
         """画布对象一律可删；只删除项目引用，不删除本地媒体文件。"""
         nodes = [item for item in self.scene.selectedItems()
@@ -15607,13 +16767,7 @@ class ProductionCanvasTab(QWidget):
                 "\n\n注意：删除自动审片节点只会隐藏报告，不会清除已经发现的质量问题。"
                 "主按钮会变成“恢复审片报告”。"
                 if hides_qc_report else "")
-            answer = QMessageBox.question(
-                self, "删除选中节点",
-                f"从画布/项目中移除 {len(removable)} 个选中节点吗？\n\n"
-                f"本地图片、视频和音频文件不会删除。{warning}",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No)
-            if answer != QMessageBox.StandardButton.Yes:
+            if not self._confirm_canvas_node_deletion(len(removable), warning):
                 return
 
         # 保存删除前的画布结构，Ctrl+Z 可恢复节点、位置和连线。
@@ -16005,10 +17159,27 @@ class ProductionCanvasTab(QWidget):
         origin = QPointF(scene_pos)
         for index, (path, node_type) in enumerate(supported):
             position = origin + QPointF(index * 300.0, (index % 2) * 36.0)
-            node_id = self.create_custom_node(node_type, position, {
+            payload = {
                 "title": Path(path).stem, "path": path, "content": "",
                 "status": "已拖入画布",
-            })
+            }
+            if node_type == "video_node":
+                try:
+                    from ui.media_library import _get_duration
+                    source_duration = float(_get_duration(path, "video") or 0)
+                except Exception:
+                    source_duration = 0.0
+                payload.update({
+                    "provider_name":"seedance",
+                    "model":"doubao-seedance-2-5-260628",
+                    "editor_action":"按时间戳修改",
+                    "ratio":"adaptive", "resolution":"720p",
+                    "generate_audio":True,
+                    "source_duration":source_duration,
+                    "duration":source_duration or 10,
+                    "status":"视频已导入 · 可抽帧或进行局部编辑",
+                })
+            node_id = self.create_custom_node(node_type, position, payload)
             record = self._custom_record(node_id)
             if record is not None and node_type == "video_node":
                 frames = self._extract_video_review_frames(path)
@@ -16112,14 +17283,41 @@ class ProductionCanvasTab(QWidget):
             spec_key, beginner_mode = item_actions[chosen]
             overrides = ({"editor_action": "图生视频", "title": "视频"}
                          if beginner_mode == "first_last_frame_video" else {})
-            self._create_registered_node(
-                spec_key, position, beginner_mode, overrides)
+            if spec_key in ("multi_image", "image", "video"):
+                # Let the native creation menu finish closing before publishing
+                # the large media editor.  Building a proxy while Windows is
+                # still releasing the QMenu popup can expose the embedded
+                # QWidget as a transient decorated window.
+                previous_defer = self._defer_inline_editor_until_pointer_release
+                self._defer_inline_editor_until_pointer_release = True
+                node_id = ""
+                try:
+                    node_id = self._create_registered_node(
+                        spec_key, position, beginner_mode, overrides)
+                finally:
+                    self._defer_inline_editor_until_pointer_release = previous_defer
+                self._deferred_new_media_editor_id = str(node_id or "")
+                QTimer.singleShot(
+                    80, lambda nid=str(node_id or ""):
+                    self._show_deferred_new_media_editor(nid))
+            else:
+                self._create_registered_node(
+                    spec_key, position, beginner_mode, overrides)
         elif chosen in skill_actions:
             self.create_canvas_skill(skill_actions[chosen], position)
         elif chosen in reference_actions:
             self._create_registered_node(reference_actions[chosen], position)
         elif chosen in template_actions:
             self.instantiate_workflow_template(template_actions[chosen], position)
+
+    def _show_deferred_new_media_editor(self, node_id: str):
+        if (not node_id or
+                str(self._deferred_new_media_editor_id or "") != str(node_id)):
+            return
+        self._deferred_new_media_editor_id = ""
+        node = self._nodes.get(str(node_id))
+        if node is not None and node.isSelected():
+            self.show_inline_editor(node)
 
     def _show_new_asset_menu_legacy(self, screen_pos,
                                     scene_pos: QPointF | None = None):
@@ -16197,7 +17395,8 @@ class ProductionCanvasTab(QWidget):
                 "content":"" if mode == "text_to_image" else
                           "连接一张或多张图片，并描述希望如何修改。",
                 "multi_image_composer":True, "references":[],
-                "reference_assets":[], "editor_action":"AI 编辑",
+                "reference_assets":[], "editor_action":(
+                    "文生图" if mode == "text_to_image" else "AI 编辑"),
                 "beginner_mode":mode, "ratio":"16:9",
                 "status":("写下想生成的画面" if mode == "text_to_image" else
                           "等待连接参考图片"),
@@ -16319,7 +17518,8 @@ class ProductionCanvasTab(QWidget):
             self.new_asset(kind, scene_pos)
 
     def create_custom_node(self, node_type: str, scene_pos: QPointF,
-                           initial_payload: dict | None = None):
+                           initial_payload: dict | None = None,
+                           defer_refresh: bool = False):
         import uuid
         labels = {
             "text_node": "剧本工作台", "image_node": "图片节点",
@@ -16363,14 +17563,16 @@ class ProductionCanvasTab(QWidget):
                         "generate_audio", "audio_prompt", "reference_settings",
                         "batch_mode", "batch_strategy", "batch_subject_source_id",
                         "batch_item_count", "batch_output_count",
-                        "batch_completed_items",
+                        "batch_completed_items", "batch_result_parent_id",
+                        "batch_result_index",
                         "beginner_mode", "beginner_description", "beginner_flow",
                         "ratio_confirmed", "reference_mentions",
                         "plain_text", "voice_clone",
                         "voice_consent", "reference_transcript",
                         "transcription_source_asset_id", "video_style_transfer",
                         "video_edit_start", "video_edit_end", "video_edit_scope",
-                        "video_edit_region", "video_edit_target",
+                        "video_edit_region", "video_edit_region_user_set",
+                        "video_edit_target",
                         "video_edit_instruction", "video_edit_preserve",
                         "source_duration",
                         "production_generated", "timeline_mode", "shots",
@@ -16394,9 +17596,10 @@ class ProductionCanvasTab(QWidget):
                     record[key] = json.loads(json.dumps(initial_payload[key], ensure_ascii=False))
         values.append(record)
         self._positions()[node_id] = [round(scene_pos.x(), 2), round(scene_pos.y(), 2)]
-        self._save_layout_now()
-        self.refresh()
-        self.focus_node(node_id)
+        if not defer_refresh:
+            self._save_layout_now()
+            self.refresh()
+            self.focus_node(node_id)
         return node_id
 
     def create_canvas_skill(self, skill_id: str, scene_pos: QPointF):
@@ -16770,28 +17973,39 @@ class ProductionCanvasTab(QWidget):
         shot_node = next((item for item in selected if item.node_type == "shot"), None)
         return asset_node, shot_node
 
-    def port_node_at(self, scene_pos: QPointF, direction: str):
+    def port_node_at(self, scene_pos: QPointF, direction: str,
+                     source: CanvasNodeItem | None = None):
         """返回命中连接区域的最上层节点。
 
-        输出从卡片右缘附近起拖；输入允许松开到整张镜头卡片，降低精确操作成本。
+        只有拖线中的输入端使用大范围吸附。输出端是“开始连线”的
+        点击入口，必须明确点中右侧圆点，不能把图片右侧内容当成端口。
+        输入仍允许松开到兼容卡片内部，降低精确操作成本。
         """
         candidates = sorted(self._nodes.values(), key=lambda item: item.zValue(), reverse=True)
-        direct = next((node for node in candidates
-                       if node.isVisible() and node.hit_port(scene_pos, direction)), None)
-        if direct is not None:
-            return direct
+        candidates = [node for node in candidates if node.isVisible() and
+                      ((direction == "input" and node.has_input_port()) or
+                       (direction == "output" and node.has_output_port()))]
+        if source is not None and direction == "input":
+            source_key = infer_node_spec(source.node_type, source.payload)
+            candidates = [
+                node for node in candidates if node is not source and
+                registry_can_connect(
+                    source_key, infer_node_spec(node.node_type, node.payload))]
+        zoom = max(0.05, abs(float(self.view.transform().m11())))
+        radius = (54.0 if direction == "input" else 14.0) / zoom
+        nearby = sorted(
+            candidates,
+            key=lambda node:
+                (node.port_scene_pos(direction).x() - scene_pos.x()) ** 2 +
+                (node.port_scene_pos(direction).y() - scene_pos.y()) ** 2)
+        if nearby:
+            port = nearby[0].port_scene_pos(direction)
+            if ((port.x() - scene_pos.x()) ** 2 +
+                    (port.y() - scene_pos.y()) ** 2) <= radius ** 2:
+                return nearby[0]
         if direction == "input":
             return next((node for node in candidates
-                         if node.isVisible() and node.has_input_port() and
-                         node.sceneBoundingRect().contains(scene_pos)), None)
-        # 输出热区覆盖右缘 28px、高度中心上下 32px；圆点仍是视觉锚点。
-        for node in candidates:
-            if not node.isVisible() or not node.has_output_port():
-                continue
-            local = node.mapFromScene(scene_pos)
-            if (node.width - 28.0 <= local.x() <= node.width + 14.0 and
-                    node.height * 0.5 - 32.0 <= local.y() <= node.height * 0.5 + 32.0):
-                return node
+                         if node.sceneBoundingRect().contains(scene_pos)), None)
         return None
 
     def _remember_workflow_edge(self, source_id: str, target_id: str,
@@ -17040,6 +18254,26 @@ class ProductionCanvasTab(QWidget):
                     inherited_into_empty = not str(record.get("content") or "").strip()
                     if inherited_into_empty:
                         record["content"] = source_text
+                    if target_key == "multi_image":
+                        has_image_reference = any(
+                            value and os.path.exists(str(value)) and
+                            self._is_image_path(str(value))
+                            for value in ([record.get("path")] +
+                                          list(record.get("references", []))))
+                        record["editor_action"] = (
+                            "AI 编辑" if has_image_reference else "文生图")
+                        record["status"] = "已同步文字 · 可直接生成图片"
+                    elif target_key == "video":
+                        has_frame = any(
+                            value and os.path.exists(str(value))
+                            for value in (record.get("first_frame"),
+                                          record.get("last_frame")))
+                        record["editor_action"] = (
+                            "图生视频" if has_frame else "文生视频")
+                        record["status"] = "已同步文字 · 可直接生成视频"
+                    elif target_key == "audio":
+                        record["editor_action"] = "对白配音"
+                        record["status"] = "已同步文字 · 可直接生成配音"
                     if relation == "script_source":
                         record.update({
                             "source_script_node_id": str(source.node_id),
@@ -17053,7 +18287,9 @@ class ProductionCanvasTab(QWidget):
                             "source_text_title": str(source.title or "文本"),
                             "source_text_content": source_text,
                             "source_relation": relation,
-                            "status": "已继承上游内容 · 等待设置",
+                            "status": (record.get("status")
+                                       if target_key in {"multi_image", "video", "audio"}
+                                       else "已继承上游内容 · 等待设置"),
                         })
                     target.payload.update(record)
                     if (inherited_into_empty and

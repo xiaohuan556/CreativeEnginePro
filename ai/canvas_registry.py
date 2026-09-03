@@ -47,7 +47,9 @@ NODE_SPECS = {
     "multi_image": _spec("image_node", "图片", "image", "primary", {
         "multi_image_composer": True, "references": [],
         "reference_assets": [], "reference_settings": [],
-        "editor_action": "AI 编辑", "ratio": "16:9",
+        # An empty image node is text-to-image.  Connecting its first image
+        # promotes the action to AI edit at the connection boundary.
+        "editor_action": "文生图", "ratio": "16:9",
         "candidate_count": 1, "batch_mode": False, "batch_strategy":"paired",
         "style_preset":"", "style_recipe":None, "style_custom":"",
         "style_scope":"whole", "style_strength":70,
@@ -230,31 +232,31 @@ def connection_create_choices(source_key: str, source_kind: str = ""):
     if source_key == "text":
         rows = [
             choice("script", "写成分镜脚本", "继续扩写人物、场景和分镜", "text_source", beginner_mode="write_script"),
-            choice("multi_image", "用文字生成图片", "当前文字自动带入图片提示词", "text_source", beginner_mode="text_to_image"),
+            choice("multi_image", "用文字生成图片", "当前文字自动带入图片提示词", "text_source", beginner_mode="text_to_image", editor_action="文生图"),
             choice("video", "用文字生成视频", "当前文字作为画面、动作和运镜描述", "text_source", beginner_mode="text_to_video", editor_action="文生视频"),
-            choice("audio", "把文字生成配音", "当前文字作为要朗读的台词", "text_source", beginner_mode="text_to_speech"),
+            choice("audio", "把文字生成配音", "当前文字作为要朗读的台词", "text_source", beginner_mode="text_to_speech", editor_action="对白配音"),
             choice("shot", "设计一个镜头", "继续设置景别、动作、运镜和对白", "text_source", beginner_mode="make_shot"),
             choice("skill", "使用导演工具", "制作机位、调度或连续性方案", "text_source"),
         ]
     elif source_key == "script":
         rows = [
             choice("storyboard", "开始自动制片", "读取完整脚本并生成多镜头短片", "script_source", beginner_mode="idea_to_movie"),
-            choice("multi_image", "生成分镜画面", "使用脚本内容生成分镜图片", "text_source", beginner_mode="text_to_image"),
+            choice("multi_image", "生成分镜画面", "使用脚本内容生成分镜图片", "text_source", beginner_mode="text_to_image", editor_action="文生图"),
             choice("video", "生成单段视频", "生成一个独立视频片段", "text_source", beginner_mode="text_to_video", editor_action="文生视频"),
-            choice("audio", "生成脚本对白", "读取台词并生成配音", "text_source", beginner_mode="text_to_speech"),
+            choice("audio", "生成脚本对白", "读取台词并生成配音", "text_source", beginner_mode="text_to_speech", editor_action="对白配音"),
             choice("shot", "拆成单个镜头", "带入镜头节点继续精细控制", "text_source", beginner_mode="make_shot"),
             choice("skill", "继续导演设计", "制作调度、机位和连续性方案", "text_source"),
         ]
     elif source_key == "copywriting":
         rows = [
-            choice("multi_image", "生成口播配图", "使用口播文案生成配套画面", "text_source", beginner_mode="text_to_image"),
-            choice("video", "生成口播视频", "把文案作为内容和节奏依据", "text_source", beginner_mode="text_to_video"),
-            choice("audio", "生成口播配音", "把文案直接生成朗读音频", "text_source", beginner_mode="text_to_speech"),
+            choice("multi_image", "生成口播配图", "使用口播文案生成配套画面", "text_source", beginner_mode="text_to_image", editor_action="文生图"),
+            choice("video", "生成口播视频", "把文案作为内容和节奏依据", "text_source", beginner_mode="text_to_video", editor_action="文生视频"),
+            choice("audio", "生成口播配音", "把文案直接生成朗读音频", "text_source", beginner_mode="text_to_speech", editor_action="对白配音"),
         ]
     elif source_key == "skill":
         rows = [
-            choice("multi_image", "把方案生成图片", "将导演方案生成画面", "text_source", beginner_mode="text_to_image"),
-            choice("video", "把方案生成视频", "将导演方案落实成动态镜头", "text_source", beginner_mode="text_to_video"),
+            choice("multi_image", "把方案生成图片", "将导演方案生成画面", "text_source", beginner_mode="text_to_image", editor_action="文生图"),
+            choice("video", "把方案生成视频", "将导演方案落实成动态镜头", "text_source", beginner_mode="text_to_video", editor_action="文生视频"),
             choice("shot", "把方案落实为镜头", "继续设置动作和运镜", "text_source", beginner_mode="make_shot"),
         ]
     elif source_kind in {"image", "reference"} or source_key in {
@@ -283,9 +285,9 @@ def connection_create_choices(source_key: str, source_kind: str = ""):
         ]
     elif source_key == "shot":
         rows = [
-            choice("multi_image", "生成本镜关键帧", "按景别、构图和动作生成图片", "shot_source", beginner_mode="text_to_image"),
-            choice("video", "生成本镜视频", "只生成当前镜头", "shot_source", beginner_mode="text_to_video"),
-            choice("audio", "生成本镜对白", "只生成当前镜头对白或声音", "shot_source", beginner_mode="text_to_speech"),
+            choice("multi_image", "生成本镜关键帧", "按景别、构图和动作生成图片", "shot_source", beginner_mode="text_to_image", editor_action="文生图"),
+            choice("video", "生成本镜视频", "只生成当前镜头", "shot_source", beginner_mode="text_to_video", editor_action="文生视频"),
+            choice("audio", "生成本镜对白", "只生成当前镜头对白或声音", "shot_source", beginner_mode="text_to_speech", editor_action="对白配音"),
             choice("shot", "创建连续下一镜", "继承人物、场景、方向和动作连续性", "shot_source", beginner_mode="make_shot"),
         ]
     return [row for row in rows if can_connect(source_key, row["target"])]

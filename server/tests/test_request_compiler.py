@@ -17,6 +17,24 @@ def test_image_and_director_video_params_match_desktop_contract() -> None:
     assert video_params["duration"] == 9
 
 
+def test_image_compiler_preserves_desktop_size_and_original_ratio_constraints() -> None:
+    _, params = compile_request(
+        "image_edit", {"prompt": "保持原图构图"},
+        {"size": "auto", "ratio": "original", "quality": "standard",
+         "strength": 0.35, "n": 1})
+    assert params["size"] == "auto"
+    assert params["ratio"] == "original"
+    assert params["quality"] == "standard"
+    assert params["strength"] == 0.35
+
+    _, portrait = compile_request(
+        "text_to_image", {"prompt": "竖屏小狗"},
+        {"size": "1152x2048", "ratio": "9:16", "n": 2})
+    assert portrait["size"] == "1152x2048"
+    assert portrait["ratio"] == "9:16"
+    assert portrait["n"] == 2
+
+
 def test_image_style_prompt_is_appended_once() -> None:
     style_prompt = "以输入图片为唯一结构基准。\n只改变：整张画面的材质。"
     inputs, _ = compile_request(

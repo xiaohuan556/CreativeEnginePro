@@ -20,6 +20,7 @@ from core.downloader import (
     _yt_tiktok_args, _yt_douyin_args, _is_youtube, _is_tiktok,
     _is_douyin, YOUTUBE_COOKIES_FILE, _find_browser_for_cookies,
     auto_detect_browser, get_available_browsers, BROWSER_LABELS,
+    tiktok_scrape_fallback,
 )
 
 INPUT_STYLE = (
@@ -88,6 +89,18 @@ class _ScrapeWorker(QThread):
                 err = r.stderr.decode("utf-8", errors="replace").strip()
                 if not err:
                     err = r.stdout.decode("utf-8", errors="replace").strip()
+                if _is_tiktok(self._url):
+                    try:
+                        self.progress.emit("yt-dlp 被 TikTok 拦截，正在读取官方主页作品…")
+                        results = tiktok_scrape_fallback(
+                            self._url, max_count=fetch_count,
+                            timeout=45)
+                        if self._random_pick and len(results) > self._max:
+                            results = random.sample(results, self._max)
+                        self.finished.emit(results[:self._max])
+                        return
+                    except Exception as fallback_error:
+                        err = str(fallback_error) or err
                 self.error.emit(err[:200] or "yt-dlp 退出码 %d" % r.returncode)
                 return
 

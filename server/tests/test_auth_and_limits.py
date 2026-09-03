@@ -91,6 +91,29 @@ def test_admin_controls_accounts_and_task_limits() -> None:
         assert any(event["action"] == "task.queued" for event in audit.json()["events"])
 
 
+def test_admin_can_delete_an_unused_account_but_not_self() -> None:
+    seed_admin()
+    with TestClient(app) as admin_client:
+        csrf = login(admin_client, "admin", "Correct-Horse-42!")
+        created = admin_client.post("/api/admin/users", headers={"x-csrf-token": csrf}, json={
+            "username": "unused.account", "display_name": "待删除账号",
+            "password": "Unused-Secure-42!", "role": "producer", "approved": True,
+        })
+        assert created.status_code == 201, created.text
+        user_id = created.json()["user"]["id"]
+
+        deleted = admin_client.delete(
+            f"/api/admin/users/{user_id}", headers={"x-csrf-token": csrf})
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted_user_id"] == user_id
+        assert all(item["id"] != user_id for item in admin_client.get("/api/admin/users").json()["users"])
+
+        current_admin = admin_client.get("/api/auth/me").json()["user"]
+        rejected = admin_client.delete(
+            f"/api/admin/users/{current_admin['id']}", headers={"x-csrf-token": csrf})
+        assert rejected.status_code == 409
+
+
 def test_login_is_rate_limited_without_revealing_account_state() -> None:
     seed_admin()
     with TestClient(app) as client:

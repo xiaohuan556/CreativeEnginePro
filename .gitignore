@@ -2,10 +2,12 @@ __pycache__/
 *.pyc
 build/
 dist/
+local_server_data/
 Cache/
 work_temp/
 work_output/
 .workbuddy/
+.vscode/
 *.spec
 ffmpeg.exe
 ffmpeg_temp.7z

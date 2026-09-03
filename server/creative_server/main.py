@@ -498,6 +498,39 @@ def revoke_user_sessions(user_id: str, request: Request, admin: User = Depends(r
     return {"ok": True, "revoked": removed}
 
 
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id: str, request: Request, admin: User = Depends(require_admin), db: Session = Depends(get_db)) -> dict:
+    user = db.get(User, user_id)
+    if not user:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "账号不存在")
+    if user.id == admin.id:
+        raise HTTPException(status.HTTP_409_CONFLICT, "不能删除当前登录的管理员账号")
+    # Account deletion is deliberately limited to accounts without production
+    # history. Suspending an established account preserves its projects/audit trail.
+    has_history = any((
+        db.scalar(select(func.count()).select_from(Project).where(Project.owner_id == user.id)) or 0,
+        db.scalar(select(func.count()).select_from(Asset).where(Asset.owner_id == user.id)) or 0,
+        db.scalar(select(func.count()).select_from(GenerationTask).where(GenerationTask.owner_id == user.id)) or 0,
+        db.scalar(select(func.count()).select_from(ProductionRun).where(ProductionRun.owner_id == user.id)) or 0,
+        db.scalar(select(func.count()).select_from(WorkflowRun).where(WorkflowRun.owner_id == user.id)) or 0,
+        db.scalar(select(func.count()).select_from(WorkflowTemplate).where(WorkflowTemplate.owner_id == user.id)) or 0,
+        db.scalar(select(func.count()).select_from(ProjectRevision).where(ProjectRevision.actor_id == user.id)) or 0,
+    ))
+    if has_history:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "该账号已有项目或生成记录，不能直接删除；请将账号状态改为停用，以保留制片数据。",
+        )
+    username = user.username
+    db.execute(delete(ProjectMember).where(ProjectMember.user_id == user.id))
+    db.execute(delete(LoginSession).where(LoginSession.user_id == user.id))
+    db.execute(delete(UsageLimit).where(UsageLimit.user_id == user.id))
+    db.delete(user)
+    record_audit(db, request, "admin.user_deleted", admin, "user", user_id, {"username": username})
+    db.commit()
+    return {"ok": True, "deleted_user_id": user_id}
+
+
 @app.get("/api/admin/usage")
 def admin_usage(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     if user.role != "admin": raise HTTPException(status.HTTP_403_FORBIDDEN, "只有管理员可以查看使用统计")

@@ -6,7 +6,8 @@ import numpy as np
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 try:
-    from PyQt6.QtCore import QPointF, QRectF
+    from PyQt6.QtCore import QPoint, QPointF, QRectF, Qt
+    from PyQt6.QtTest import QTest
     from PyQt6.QtWidgets import QApplication
     from ui.image_editor import (
         Artboard,
@@ -113,6 +114,35 @@ class ImageEditorSelectionClipboardTests(unittest.TestCase):
         self.assertEqual((30, 40), self.editor.selection.shape)
         self.assertTrue(self.editor.selection[7:17, 5:15].all())
         self.assertEqual(100, int(self.editor.selection.sum()))
+
+    def test_brush_and_eraser_keep_tool_cursor_after_mouse_move(self):
+        self.editor.resize(900, 620)
+        self.editor.show()
+        self.app.processEvents()
+
+        self.editor.set_tool(Tool.BRUSH)
+        QTest.mouseMove(self.editor.view.viewport(), QPoint(120, 120))
+        self.app.processEvents()
+        self.assertEqual(
+            Qt.CursorShape.BitmapCursor,
+            self.editor.view.viewport().cursor().shape())
+        self.assertIsNotNone(self.editor.view._brush_hover_pos)
+        old_radius = self.editor._brush_cursor_view_radius()
+
+        self.editor._ob_brush.setValue(80)
+        self.app.processEvents()
+        self.assertGreater(self.editor._brush_cursor_view_radius(), old_radius)
+        self.assertEqual(
+            Qt.CursorShape.BitmapCursor,
+            self.editor.view.viewport().cursor().shape())
+
+        self.editor.set_tool(Tool.ERASER)
+        QTest.mouseMove(self.editor.view.viewport(), QPoint(160, 140))
+        self.app.processEvents()
+        self.assertEqual(
+            Qt.CursorShape.BitmapCursor,
+            self.editor.view.viewport().cursor().shape())
+        self.assertIsNotNone(self.editor.view._brush_hover_pos)
 
 
 if __name__ == "__main__":

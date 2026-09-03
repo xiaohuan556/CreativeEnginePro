@@ -39,6 +39,20 @@ def test_dangling_wire_choices_keep_semantic_relations():
     }
 
 
+def test_text_like_generation_choices_select_runnable_media_actions():
+    for source_key in ("text", "script", "copywriting", "skill", "shot"):
+        choices = connection_create_choices(source_key)
+        image = next((row for row in choices if row["target"] == "multi_image"), None)
+        video = next((row for row in choices if row["target"] == "video"), None)
+        audio = next((row for row in choices if row["target"] == "audio"), None)
+        if image:
+            assert image["overrides"]["editor_action"] == "文生图"
+        if video:
+            assert video["overrides"]["editor_action"] == "文生视频"
+        if audio:
+            assert audio["overrides"]["editor_action"] == "对白配音"
+
+
 def test_specialized_nodes_reuse_desktop_editors_without_losing_identity():
     node_type, payload = creation_payload("voice_clone", "clone_voice")
     assert node_type == "audio_node"

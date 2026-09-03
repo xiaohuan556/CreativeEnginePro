@@ -511,7 +511,7 @@ class CanvasView(QGraphicsView):
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setCursor(Qt.CursorShape.CrossCursor)
+        self._set_canvas_cursor(Qt.CursorShape.CrossCursor)
         self.composite_item = QGraphicsPixmapItem()
         self.scene.addItem(self.composite_item)
         self.sel_item = QGraphicsPixmapItem()
@@ -557,6 +557,7 @@ class CanvasView(QGraphicsView):
         self._pan_start = QPoint()
         self._guide_drag = None        # 'h'/'v'：正在从标尺拖出参考线
         self._guide_move = None        # ('h'/'v', idx)：正在拖动已有参考线
+        self._brush_hover_pos = None   # 视口坐标；绘制笔刷/橡皮擦实际作用范围
 
     RULER_W = 20  # 标尺宽度(px, 视口坐标)
     PAN_MARGIN = 8000  # 场景四周留白(px)：保证可平移到画布外空白，不受 sceneRect 限制
@@ -583,6 +584,48 @@ class CanvasView(QGraphicsView):
             self._paint_eyedrop_hud()
         except Exception:
             pass
+        try:
+            self._paint_brush_cursor()
+        except Exception:
+            pass
+
+    def _set_canvas_cursor(self, cursor):
+        """Keep the view and its real mouse surface on the same tool cursor."""
+        self.setCursor(cursor)
+        self.viewport().setCursor(cursor)
+
+    def _paint_brush_cursor(self):
+        """Draw an accurate brush footprint that follows zoom and layer scale."""
+        if (self.editor.tool not in (Tool.BRUSH, Tool.ERASER) or
+                self._brush_hover_pos is None):
+            return
+        center = QPointF(self._brush_hover_pos)
+        radius = self.editor._brush_cursor_view_radius()
+        painter = QPainter(self.viewport())
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(0, 0, 0, 220), 3.0))
+        painter.drawEllipse(center, radius, radius)
+        color = (QColor("#ffb35c") if self.editor.tool == Tool.ERASER
+                 else QColor(self.editor.fg))
+        pen = QPen(color, 1.5)
+        if self.editor.tool == Tool.ERASER:
+            pen.setStyle(Qt.PenStyle.DashLine)
+        painter.setPen(pen)
+        painter.drawEllipse(center, radius, radius)
+        if self.editor.tool == Tool.BRUSH:
+            painter.setPen(QPen(QColor("#ffffff"), 1.0))
+            painter.setBrush(color)
+            painter.drawEllipse(center, 2.5, 2.5)
+        else:
+            painter.save()
+            painter.translate(center)
+            painter.rotate(-35)
+            painter.setPen(QPen(QColor("#ffffff"), 1.0))
+            painter.setBrush(QColor("#ffb35c"))
+            painter.drawRoundedRect(QRectF(-5, -3, 10, 6), 1.5, 1.5)
+            painter.restore()
+        painter.end()
 
     def _paint_eyedrop_hud(self):
         """吸管工具悬停时，在光标旁画一个跟随的取色小圆（编辑区「小标志」）。
@@ -614,6 +657,9 @@ class CanvasView(QGraphicsView):
         prev = getattr(self.editor, "_eyedrop_preview", None)
         if prev is not None:
             self.editor._eyedrop_preview = None
+            self.viewport().update()
+        if self._brush_hover_pos is not None:
+            self._brush_hover_pos = None
             self.viewport().update()
         super().leaveEvent(e)
 
@@ -786,6 +832,10 @@ class CanvasView(QGraphicsView):
         self._start = self.editor._snap_pt(self._start) if self.editor.snap_on else self._start  # P3 网格/参考线吸附
         self._last = self._start
         tool = self.editor.tool
+        if tool in (Tool.BRUSH, Tool.ERASER):
+            self._brush_hover_pos = QPointF(e.position())
+            self._set_canvas_cursor(self.editor._brush_cursor(painting=True))
+            self.viewport().update()
         mods = e.modifiers()
         self.editor._sel_combine = "add" if (mods & Qt.KeyboardModifier.ShiftModifier) else (
             "sub" if (mods & Qt.KeyboardModifier.AltModifier) else "new")
@@ -884,11 +934,11 @@ class CanvasView(QGraphicsView):
             if e.modifiers() & Qt.KeyboardModifier.AltModifier:
                 self.editor._set_clone_source(self._start)
                 self._dragging = False
-                self.setCursor(self.editor._clone_cursor(alt=True))
+                self._set_canvas_cursor(self.editor._clone_cursor(alt=True))
             else:
                 self.editor._push_undo("克隆图章" if tool == Tool.CLONE else "修复画笔")
                 self.editor._clone_painting = True
-                self.setCursor(self.editor._clone_cursor(painting=True))
+                self._set_canvas_cursor(self.editor._clone_cursor(painting=True))
                 self.editor._stroke_clone(self._start, e)
         elif tool == Tool.EYEDROPPER:
             self.editor._pick_color(self._start)
@@ -935,6 +985,12 @@ class CanvasView(QGraphicsView):
                 self.verticalScrollBar().setValue(
                     self.verticalScrollBar().value() + dy)
             return
+        if self.editor.tool in (Tool.BRUSH, Tool.ERASER):
+            self._brush_hover_pos = QPointF(e.position())
+            self.viewport().update()
+        elif self._brush_hover_pos is not None:
+            self._brush_hover_pos = None
+            self.viewport().update()
         # P5 标尺参考线拖拽预览
         if self._guide_drag is not None:
             sp = self.canvas_pos(e)
@@ -964,24 +1020,28 @@ class CanvasView(QGraphicsView):
                 gi = self.editor._hit_guide(
                     p, tol=6.0 / max(0.2, self.transform().m11()))
                 if gi is not None:
-                    self.setCursor(Qt.CursorShape.SplitVCursor if gi[0] == 'h'
-                                   else Qt.CursorShape.SplitHCursor)
+                    self._set_canvas_cursor(
+                        Qt.CursorShape.SplitVCursor if gi[0] == 'h'
+                        else Qt.CursorShape.SplitHCursor)
                     return
             if self.editor.tool in (Tool.CLONE, Tool.HEAL):
                 # 克隆图章/修复画笔：悬停保持图章光标（Alt 状态实时跟手）
-                self.setCursor(self.editor._clone_cursor(
-                    alt=bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)))
+                cursor = self.editor._clone_cursor(
+                    alt=bool(e.modifiers() & Qt.KeyboardModifier.AltModifier))
             elif self.editor.tool == Tool.EYEDROPPER:
                 # 吸管：保持专属光标 + 实时取色预览 HUD（编辑区「小标志」）
-                self.setCursor(self.editor._eyedropper_cursor())
+                cursor = self.editor._eyedropper_cursor()
                 vx, vy = e.position().x(), e.position().y()
                 self.editor._update_eyedrop_preview(int(p.x()), int(p.y()), vx, vy)
             elif self.editor.tool == Tool.GRADIENT:
                 # 渐变：保持线段光标，提示「拖拽画渐变线段」
-                self.setCursor(self.editor._gradient_cursor())
+                cursor = self.editor._gradient_cursor()
+            elif self.editor.tool in (Tool.BRUSH, Tool.ERASER):
+                cursor = self.editor._brush_cursor()
             else:
                 # 其他工具把手统一普通箭头
-                self.setCursor(Qt.CursorShape.ArrowCursor)
+                cursor = Qt.CursorShape.ArrowCursor
+            self._set_canvas_cursor(cursor)
             return
         if not self._dragging:
             return
@@ -1148,9 +1208,13 @@ class CanvasView(QGraphicsView):
         elif tool in (Tool.CLONE, Tool.HEAL):
             self.editor._clone_painting = False
             # 松开后：若仍按住 Alt → 维持「设源点」光标，否则回到常态
-            self.setCursor(
+            self._set_canvas_cursor(
                 self.editor._clone_cursor(
                     alt=bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)))
+        elif tool in (Tool.BRUSH, Tool.ERASER):
+            self._set_canvas_cursor(self.editor._brush_cursor())
+            self._brush_hover_pos = QPointF(e.position())
+            self.viewport().update()
         elif tool == Tool.POLY_LASSO:
             pass  # 多边形套索通过 Enter 或双击闭合
         elif tool == Tool.QUICK_SELECT:
@@ -2874,7 +2938,7 @@ class ImageEditorWidget(QWidget):
         # 笔刷
         self._ob_brush_lbl = QLabel("笔刷大小")
         self._ob_brush = self._slider(1, 200, self.brush_size,
-                                      lambda v: setattr(self, "brush_size", v))
+                                      self._on_brush_size_slider)
         # 容差（魔棒）
         self._ob_tol_lbl = QLabel("容差")
         self._ob_tol = self._slider(1, 150, self.tolerance,
@@ -3510,6 +3574,17 @@ class ImageEditorWidget(QWidget):
         self._ob_brush.blockSignals(True)
         self._ob_brush.setValue(self.brush_size)
         self._ob_brush.blockSignals(False)
+        self._refresh_brush_cursor()
+
+    def _on_brush_size_slider(self, value):
+        self.brush_size = max(1, min(200, int(value)))
+        self._refresh_brush_cursor()
+
+    def _refresh_brush_cursor(self):
+        if self.tool not in (Tool.BRUSH, Tool.ERASER):
+            return
+        self.view._set_canvas_cursor(self._brush_cursor())
+        self.view.viewport().update()
 
     def _zoom_view(self, factor):
         """缩放画布视图。"""
@@ -3527,7 +3602,7 @@ class ImageEditorWidget(QWidget):
 
         # 克隆图章 / 修复画笔：按住 Alt 时光标变「设源点」样式
         if e.key() == Qt.Key.Key_Alt and self.tool in (Tool.CLONE, Tool.HEAL):
-            self.view.setCursor(self._clone_cursor(alt=True))
+            self.view._set_canvas_cursor(self._clone_cursor(alt=True))
             return
 
         # ── P4 自由变换态：Enter 确认 / Esc 取消（优先级最高）──
@@ -3680,7 +3755,7 @@ class ImageEditorWidget(QWidget):
         if e.key() == Qt.Key.Key_Space and not e.modifiers() and not e.isAutoRepeat():
             self._space_prev_tool = self.tool
             self._space_held = True
-            self.view.setCursor(Qt.CursorShape.OpenHandCursor)
+            self.view._set_canvas_cursor(Qt.CursorShape.OpenHandCursor)
             # P2: 不用 DragMode（受 sceneRect 限制），改为手动滚动手柄
             # 第一次 mouseMove 时 _pan_last 由 CanvasView.mousePressEvent 初始化
             self.view._pan_last = None
@@ -3724,7 +3799,7 @@ class ImageEditorWidget(QWidget):
             return
         # 克隆图章 / 修复画笔：松开 Alt 时恢复常态光标
         if e.key() == Qt.Key.Key_Alt and self.tool in (Tool.CLONE, Tool.HEAL):
-            self.view.setCursor(self._clone_cursor(alt=False))
+            self.view._set_canvas_cursor(self._clone_cursor(alt=False))
             return
         super().keyReleaseEvent(e)
 
@@ -4130,6 +4205,49 @@ class ImageEditorWidget(QWidget):
         self._anchor = self.active
         self._show_handles = (len(self.selected) == 1)
 
+    def _brush_cursor_view_radius(self):
+        """Brush footprint radius in viewport pixels, including current zoom."""
+        zoom = max(0.01, abs(float(self.view.transform().m11() or 1.0)))
+        layer_scale = 1.0
+        if (not getattr(self, "_mask_edit", False) and self.active is not None and
+                self.active.kind == "image"):
+            layer_scale = max(0.01, abs(float(self.active.scale or 1.0)))
+        radius = float(self.brush_size) * zoom / layer_scale / 2.0
+        return max(2.5, min(320.0, radius))
+
+    def _brush_cursor(self, painting=False):
+        """Tool-specific OS cursor; the full-size footprint is drawn by CanvasView."""
+        size = 36
+        center = size // 2
+        pixmap = QPixmap(size, size)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        is_eraser = self.tool == Tool.ERASER
+        color = QColor("#ffb35c") if is_eraser else QColor(self.fg)
+        painter.setBrush(
+            QColor(color.red(), color.green(), color.blue(), 65)
+            if painting else Qt.BrushStyle.NoBrush)
+        painter.setPen(QPen(QColor(0, 0, 0, 220), 3.0))
+        painter.drawEllipse(QPointF(center, center), 10.0, 10.0)
+        painter.setPen(QPen(color, 1.7, Qt.PenStyle.DashLine
+                            if is_eraser else Qt.PenStyle.SolidLine))
+        painter.drawEllipse(QPointF(center, center), 10.0, 10.0)
+        if is_eraser:
+            painter.save()
+            painter.translate(center, center)
+            painter.rotate(-35)
+            painter.setPen(QPen(QColor("#ffffff"), 1.0))
+            painter.setBrush(color)
+            painter.drawRoundedRect(QRectF(-5, -3, 10, 6), 1.5, 1.5)
+            painter.restore()
+        else:
+            painter.setPen(QPen(QColor("#ffffff"), 1.0))
+            painter.setBrush(color)
+            painter.drawEllipse(QPointF(center, center), 2.5, 2.5)
+        painter.end()
+        return QCursor(pixmap, center, center)
+
 
     def _clone_cursor(self, alt=False, painting=False):
         """克隆图章 / 修复画笔 的自定义光标：笔刷范围环 + 中心图章图标，
@@ -4240,6 +4358,8 @@ class ImageEditorWidget(QWidget):
         self.status_tool.setText(tool_names.get(t, ""))
         if t == Tool.MOVE:
             cursor = Qt.CursorShape.OpenHandCursor
+        elif t in (Tool.BRUSH, Tool.ERASER):
+            cursor = self._brush_cursor()
         elif t in (Tool.CLONE, Tool.HEAL):
             cursor = self._clone_cursor()
         elif t == Tool.EYEDROPPER:
@@ -4251,7 +4371,10 @@ class ImageEditorWidget(QWidget):
                 self._eyedrop_img = None
         elif t == Tool.GRADIENT:
             cursor = self._gradient_cursor()
-        self.view.setCursor(cursor)
+        self.view._set_canvas_cursor(cursor)
+        if t not in (Tool.BRUSH, Tool.ERASER):
+            self.view._brush_hover_pos = None
+        self.view.viewport().update()
         self._update_option_bar()
 
     def _update_option_bar(self):

@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from core.openverse_api import download_audio, prepare_search_query, search_audio
+from core.openverse_api import (
+    download_audio, fallback_audio_search_links, prepare_search_query, search_audio,
+)
 
 
 class _Response:
@@ -31,6 +33,14 @@ class _Response:
 
 
 class OpenverseApiTests(unittest.TestCase):
+    def test_unreachable_service_has_source_only_search_fallbacks(self):
+        results = fallback_audio_search_links("雨声", "sound_effect")
+        self.assertGreaterEqual(len(results), 3)
+        self.assertTrue(all(item["source_only"] for item in results))
+        self.assertTrue(all(not item["audio_url"] for item in results))
+        self.assertTrue(any("pixabay.com/sound-effects/search/" in
+                            item["landing_url"] for item in results))
+
     def test_chinese_music_and_sound_queries_are_converted_locally(self):
         self.assertEqual(("rain sound", True), prepare_search_query("雨声"))
         converted, changed = prepare_search_query("轻快科技背景音乐")
