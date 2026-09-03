@@ -2,6 +2,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -945,6 +946,74 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
                 edge.get("source") == parent_id and
                 edge.get("target") == child_id
                 for edge in panel._positions()["__workflow_edges__"]))
+        panel.close()
+
+    def test_imported_video_keeps_its_cover_after_result_nodes_are_created(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_imported_video_parent_"))
+        source = media_root / "uploaded.mp4"
+        cover = media_root / "uploaded-middle.jpg"
+        result = media_root / "generated.mp4"
+        for path in (source, cover, result):
+            path.touch()
+        parent_id = panel.create_custom_node(
+            "video_node", QPointF(100, 100), {
+                "title":"uploaded", "path":str(source),
+                "video_thumbnail":str(cover), "media_origin":"uploaded",
+                "source_media_path":str(source), "source_duration":10,
+            })
+
+        with patch.object(panel, "_extract_video_review_frames", return_value=[]):
+            panel._materialize_standalone_generation_results(
+                parent_id, [str(result)], "video", {"provider":"seedance"})
+        panel.refresh()
+
+        self.assertEqual(str(cover), panel._nodes[parent_id].thumbnail)
+        self.assertTrue(panel._is_imported_media_record(
+            panel._custom_record(parent_id), "video_node"))
+        panel.close()
+
+    def test_completed_video_edit_does_not_overwrite_uploaded_source_node(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_video_source_result_"))
+        source = media_root / "uploaded.mp4"
+        cover = media_root / "uploaded-middle.jpg"
+        result = media_root / "edited.mp4"
+        generated_cover = media_root / "edited-middle.jpg"
+        for path in (source, cover, result, generated_cover):
+            path.touch()
+        parent_id = panel.create_custom_node(
+            "video_node", QPointF(100, 100), {
+                "title":"uploaded", "path":str(source),
+                "video_thumbnail":str(cover), "media_origin":"uploaded",
+                "source_media_path":str(source), "source_duration":10,
+            })
+        handle = SimpleNamespace(
+            progress=1.0, is_finished=True, is_success=True,
+            result=SimpleNamespace(data=str(result), provider_raw={}))
+        panel._standalone_tasks["finished-edit"] = {
+            "handle":handle, "node_id":parent_id, "provider":"seedance",
+            "kind":"", "preserve_source_media":True,
+            "source_media_path":str(source),
+        }
+
+        with (
+            patch.object(
+                panel, "_extract_video_review_frames",
+                return_value=[str(generated_cover)] * 3),
+            patch.object(panel, "_run_spatial_consistency_review", return_value={}),
+            patch.object(canvas_module, "inspect_frame_paths", return_value={}),
+            patch.object(canvas_module, "inspect_av_sync", return_value={}),
+        ):
+            panel._poll_standalone_tasks()
+
+        parent = panel._custom_record(parent_id)
+        self.assertEqual(str(source), parent["path"])
+        self.assertEqual("uploaded", parent["title"])
+        self.assertEqual(str(cover), parent["video_thumbnail"])
+        child_ids = list(parent.get("materialized_result_node_ids") or [])
+        self.assertEqual(1, len(child_ids))
+        self.assertEqual(str(result), panel._custom_record(child_ids[0])["path"])
         panel.close()
 
     def test_batch_style_does_not_require_outer_prompt(self):

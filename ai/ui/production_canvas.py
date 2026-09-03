@@ -3980,15 +3980,33 @@ class ProductionCanvasTab(QWidget):
 
     @classmethod
     def _media_thumbnail_for_record(cls, record: dict, node_type: str):
-        # Once standalone outputs have been materialized as individual cards,
-        # keep the source card visually as the generator.  Its persisted path
-        # remains available to retries/downstream compatibility, while every
-        # actual result is shown exactly once on the right-hand side.
-        if record.get("materialized_result_node_ids"):
+        # Once generator outputs have been materialized as individual cards,
+        # keep an empty generator card on the left.  Imported media is different:
+        # it remains the visible source/reference and must never turn into an
+        # empty "AI" placeholder merely because candidates exist on the right.
+        if (record.get("materialized_result_node_ids") and
+                not cls._is_imported_media_record(record, node_type)):
             return ""
         if str(node_type or "") == "video_node":
             return cls._video_thumbnail_path(record)
         return str(record.get("path") or "")
+
+    @classmethod
+    def _is_imported_media_record(cls, record: dict, node_type: str = ""):
+        """Distinguish a user media source from an empty AI generator card."""
+        if not isinstance(record, dict):
+            return False
+        kind = str(node_type or record.get("type") or "")
+        if kind not in {"image_node", "video_node"}:
+            return False
+        if (record.get("generator_kind") or record.get("production_generated") or
+                record.get("generation_result_parent_id") or
+                record.get("batch_result_parent_id")):
+            return False
+        path = str(record.get("source_media_path") or record.get("path") or "")
+        if not path or not os.path.isfile(path):
+            return False
+        return cls._is_video_path(path) if kind == "video_node" else cls._is_image_path(path)
 
     def _build_nodes(self):
         repaired_composers = False
@@ -7925,6 +7943,11 @@ class ProductionCanvasTab(QWidget):
                 "handle": handle, "node_id": node.node_id,
                 "provider": provider.name, "request": request,
                 "fallback_providers": [], "provider_locked": True,
+                "preserve_source_media":bool(
+                    action in {"按时间戳修改", "基于完整视频续长"} and
+                    self._is_imported_media_record(record, "video_node")),
+                "source_media_path":str(
+                    record.get("source_media_path") or source_video or ""),
             }
             record["last_action"] = action
             record["status"] = "Seedance 2.5 视频任务已提交"
@@ -16191,10 +16214,24 @@ class ProductionCanvasTab(QWidget):
                                 path = paths[0]
                                 is_image_batch = (
                                     str(task.get("kind") or "") == "image_batch")
+                                preserve_source_media = bool(
+                                    task.get("preserve_source_media") or
+                                    self._is_imported_media_record(
+                                        record, str(record.get("type") or "")))
+                                if preserve_source_media:
+                                    original_path = str(
+                                        record.get("source_media_path") or
+                                        task.get("source_media_path") or
+                                        record.get("path") or "")
+                                    if original_path and os.path.isfile(original_path):
+                                        record["media_origin"] = "uploaded"
+                                        record["source_media_path"] = original_path
+                                        record.setdefault(
+                                            "source_media_title", Path(original_path).stem)
                                 if is_image_batch:
                                     self._materialize_image_batch_results(
                                         str(task["node_id"]), paths, task)
-                                else:
+                                elif not preserve_source_media:
                                     record["path"] = path
                                     if not record.get("generator_kind"):
                                         record["title"] = Path(path).stem
@@ -16205,7 +16242,7 @@ class ProductionCanvasTab(QWidget):
                                 if isinstance(provider_raw, dict):
                                     remote_url = str(
                                         provider_raw.get("video_url") or "")
-                                    if remote_url:
+                                    if remote_url and not preserve_source_media:
                                         record["provider_remote_url"] = remote_url
                                     record["provider_result"] = json.loads(json.dumps(
                                         provider_raw, ensure_ascii=False, default=str))
@@ -16279,7 +16316,7 @@ class ProductionCanvasTab(QWidget):
                                 spatial_review = (
                                     self._run_spatial_consistency_review(record, frames)
                                     if kind == "video" and frames else {})
-                                if kind == "video" and frames:
+                                if kind == "video" and frames and not preserve_source_media:
                                     record["video_review_frames"] = frames
                                     record["video_tail_frame"] = frames[-1]
                                     record["video_thumbnail"] = (
@@ -17814,7 +17851,8 @@ class ProductionCanvasTab(QWidget):
             position = origin + QPointF(index * 300.0, (index % 2) * 36.0)
             payload = {
                 "title": Path(path).stem, "path": path, "content": "",
-                "status": "已拖入画布",
+                "status": "已拖入画布", "media_origin":"uploaded",
+                "source_media_path":path, "source_media_title":Path(path).stem,
             }
             if node_type == "video_node":
                 try:
