@@ -46,6 +46,8 @@ if (-not (Test-Path -LiteralPath $PythonExe)) {
 
 $releaseDir = Join-Path $projectRoot "build\release"
 New-Item -ItemType Directory -Force -Path $releaseDir | Out-Null
+$safeBuildVersion = ($Version -replace '[^A-Za-z0-9._-]', '_')
+$pyInstallerWorkPath = Join-Path $projectRoot "build\pyinstaller-$safeBuildVersion"
 $manifestPath = Join-Path $releaseDir "release_manifest.json"
 $manifest = [ordered]@{
     channel = "release"
@@ -73,11 +75,31 @@ if (-not $SkipTests) {
 
 $env:CEP_RELEASE_MANIFEST = $manifestPath
 try {
-    & $PythonExe -m PyInstaller --clean --noconfirm --distpath $DistPath CreativeEnginePro.spec
+    # Keep each release's intermediate PKG separate. A running one-file build,
+    # antivirus, or Windows Search can temporarily lock an older PKG and should
+    # not prevent a new release from being produced.
+    & $PythonExe -m PyInstaller --clean --noconfirm --workpath $pyInstallerWorkPath --distpath $DistPath CreativeEnginePro.spec
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller build failed." }
 }
 finally {
     Remove-Item Env:CEP_RELEASE_MANIFEST -ErrorAction SilentlyContinue
+}
+
+# Guard against PyInstaller producing a default 200x200 window titled "tk".
+# Font family names with spaces are written into Tcl without quoting by some
+# PyInstaller versions and abort the splash script before it becomes branded.
+$splashScript = Join-Path $pyInstallerWorkPath "CreativeEnginePro\Splash-00_script.tcl"
+if (-not (Test-Path -LiteralPath $splashScript)) {
+    throw "Startup splash script was not generated."
+}
+$splashSource = Get-Content -LiteralPath $splashScript -Raw
+if ($splashSource -notmatch "font actual TkDefaultFont" -or
+        $splashSource -notmatch "wm overrideredirect \. 1" -or
+        $splashSource -notmatch "progress_fill" -or
+        $splashSource -notmatch "__CEP_READY__" -or
+        $splashSource -notmatch "splash_monitor_x" -or
+        $splashSource -match 'itemconfigure \$tag -text \$var') {
+    throw "Startup splash validation failed; refusing to publish a blank Tk window."
 }
 
 $exe = Join-Path $DistPath "CreativeEnginePro.exe"

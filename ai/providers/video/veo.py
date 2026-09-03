@@ -676,12 +676,15 @@ class SeedanceProvider(VideoProvider):
 
     @staticmethod
     def _remote_media_url(value, label: str) -> str:
+        """Return a cloud-readable Seedance media URL."""
         url = str(value or "").strip()
-        if url.startswith(("http://", "https://", "data:")):
+        if url.startswith(("http://", "https://", "asset://")):
             return url
-        raise ArkHTTPError(
-            f"Seedance {label}必须是服务端可访问的远程 URL；"
-            "当前本地文件不能直接作为视频编辑或续长素材")
+        path = Path(url).expanduser()
+        if not path.is_file():
+            raise ArkHTTPError(f"Seedance {label}文件不存在或无法读取：{url}")
+        from .provider_media_relay import publish_local_media
+        return publish_local_media(path)
 
     def _creds(self):
         from api_config import get as _ac_get
@@ -726,6 +729,26 @@ class SeedanceProvider(VideoProvider):
             prompt = (request.inputs.get("prompt") or "").strip()
             if not prompt:
                 raise ArkHTTPError("缺少 prompt")
+
+            timestamp_lock_requested = bool(
+                request.params.get("video_edit_hard_lock"))
+            timestamp_source = str(
+                request.params.get("video_edit_source_path") or "").strip()
+            timestamp_start = float(
+                request.params.get("video_edit_start") or 0)
+            timestamp_end = float(
+                request.params.get("video_edit_end") or 0)
+            timestamp_scope = str(
+                request.params.get("video_edit_scope") or "whole")
+            timestamp_region = (
+                request.params.get("video_edit_region")
+                if timestamp_scope != "whole" else {})
+            if timestamp_lock_requested:
+                if not timestamp_source or not Path(timestamp_source).is_file():
+                    raise ArkHTTPError(
+                        "视频局部编辑需要可读取的本地原视频，才能硬锁时间段和框选区域")
+                if timestamp_end <= timestamp_start:
+                    raise ArkHTTPError("视频局部编辑时间范围无效")
 
             typed_refs = normalize_reference_assets(
                 request.inputs.get("reference_assets"),
@@ -952,8 +975,24 @@ class SeedanceProvider(VideoProvider):
                     video_url = (status.get("content") or {}).get("video_url")
                     if not video_url:
                         raise ArkHTTPError(f"Seedance 成功但缺少 video_url: {str(status)[:300]}")
-                    out = self._out_dir() / f"seedance_{uuid.uuid4().hex[:8]}.mp4"
-                    download(video_url, out, timeout=600)
+                    result_id = uuid.uuid4().hex[:8]
+                    out = self._out_dir() / f"seedance_{result_id}.mp4"
+                    raw_out = (
+                        self._out_dir() / f"seedance_raw_{result_id}.mp4"
+                        if timestamp_lock_requested else out)
+                    download(video_url, raw_out, timeout=600)
+                    hard_lock = {}
+                    if timestamp_lock_requested:
+                        from .timestamp_edit_lock import enforce_timestamp_edit_lock
+                        hard_lock = enforce_timestamp_edit_lock(
+                            timestamp_source, raw_out, out,
+                            start=timestamp_start, end=timestamp_end,
+                            region=timestamp_region,
+                        )
+                        try:
+                            raw_out.unlink(missing_ok=True)
+                        except OSError:
+                            pass
                     h.progress = 1.0
                     h.result = TaskResult(
                         success=True, data=out,
@@ -962,6 +1001,7 @@ class SeedanceProvider(VideoProvider):
                                       "duration": status.get("duration"),
                                       "task_id": task_id,
                                       "video_url": video_url,
+                                      "timestamp_edit_lock": hard_lock,
                                       "prompt_compat": _prompt_compat_applied},
                     )
                     h.status = TaskStatus.DONE

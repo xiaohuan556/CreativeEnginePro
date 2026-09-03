@@ -1,0 +1,6 @@
+{
+  "server_ip": "auto",
+  "expires_at": "2026-12-02T00:00:00+08:00",
+  "version_prefix": "1.0.0-local",
+  "output_dir": "build/release-local"
+}

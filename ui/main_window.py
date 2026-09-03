@@ -270,6 +270,8 @@ class _SettingsDialog(QDialog):
 # ==================== 主工作站 ====================
 class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, ImageEditorHandler):
 
+    logoutRequested = pyqtSignal()
+
     def select_tail_video(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "选择标准尾页视频", "", "Video Files (*.mp4 *.mov *.avi)")
         if file_path:
@@ -277,6 +279,11 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
     def __init__(self):
         super().__init__()
+        self._release_policy = None
+        self._auth_client = None
+        self._authenticated_user = {}
+        self._personal_center_dialog = None
+        self._account_logout_prepared = False
         self.tasks = []
         self.undo_stack = []
         self.config = {
@@ -776,6 +783,19 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 self.nav_btns.append(btn)
                 btn.clicked.connect(self.switch_tab)
         side_lay.addStretch()
+
+        # ── 👤 当前桌面账号 ──
+        # 开发模式没有授权账号，因此默认隐藏；正式登录成功后由 main.py 注入。
+        self.btn_personal_center = QPushButton("  👤 个人中心")
+        self.btn_personal_center.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_personal_center.setVisible(False)
+        self.btn_personal_center.setStyleSheet(
+            "QPushButton { text-align:left; padding:9px 12px; border:none; border-left:3px solid transparent;"
+            "font-size:12px; color:#aebfd3; background:transparent; }"
+            "QPushButton:hover { color:#fff; background:rgba(61,142,248,0.10); border-left:3px solid #3d8ef8; }"
+        )
+        self.btn_personal_center.clicked.connect(self.open_personal_center)
+        side_lay.addWidget(self.btn_personal_center)
 
         # ── 🧹 系统工具 ──
         btn_clean = QPushButton("  🧹 清理缓存")
@@ -2323,6 +2343,53 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self._settings_dlg.raise_()
         self._settings_dlg.activateWindow()
 
+    def configure_authenticated_session(self, policy, client, user: dict) -> None:
+        """Attach the authenticated desktop identity to the visible shell."""
+        self._release_policy = policy
+        self._auth_client = client
+        self._authenticated_user = dict(user or {})
+        display_name = str(
+            self._authenticated_user.get("display_name")
+            or self._authenticated_user.get("username") or "当前账号")
+        role = str(self._authenticated_user.get("role") or "")
+        self.btn_personal_center.setText("  👤 个人中心")
+        self.btn_personal_center.setToolTip(
+            f"当前登录：{display_name}" + (f"（{role}）" if role else ""))
+        self.btn_personal_center.setVisible(True)
+
+    def open_personal_center(self) -> None:
+        if self._release_policy is None or self._auth_client is None:
+            self.statusBar().showMessage("开发模式未启用桌面账号登录", 3000)
+            return
+        from ui.personal_center import PersonalCenterDialog
+        dialog = PersonalCenterDialog(
+            self._release_policy, self._auth_client,
+            self._authenticated_user, self)
+        self._personal_center_dialog = dialog
+        dialog.logoutRequested.connect(self._request_account_logout)
+        dialog.exec()
+        if self._personal_center_dialog is dialog and not dialog._logout_pending:
+            self._personal_center_dialog = None
+        dialog.deleteLater()
+
+    def _request_account_logout(self) -> None:
+        dialog = self._personal_center_dialog
+        # Use the editor's normal unsaved-work decision before invalidating the
+        # account.  Cancelling here leaves the current session fully intact.
+        if hasattr(self, "editor_tab") and not self.editor_tab._check_save_before_close():
+            if dialog is not None:
+                dialog.set_logout_pending(
+                    False, "已取消退出登录；请先处理未保存的剪辑工程。")
+            return
+        self._account_logout_prepared = True
+        self.logoutRequested.emit()
+
+    def complete_account_logout(self) -> None:
+        """Close the account centre after the controller clears the session."""
+        if self._personal_center_dialog is not None:
+            self._personal_center_dialog.accept()
+            self._personal_center_dialog = None
+
     def _on_global_settings_saved(self, payload: dict):
         """把设置中心保存的路径立即同步到已经创建的下载/扒取面板。"""
         try:
@@ -2351,7 +2418,8 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
     def closeEvent(self, event):
         """保存窗口几何 + 检查编辑器是否有未保存更改 + 清理自动保存"""
-        if hasattr(self, 'editor_tab') and not self.editor_tab._check_save_before_close():
+        if (not self._account_logout_prepared and hasattr(self, 'editor_tab')
+                and not self.editor_tab._check_save_before_close()):
             event.ignore()
             return
         if hasattr(self, 'editor_tab'):

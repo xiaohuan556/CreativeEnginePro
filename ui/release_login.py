@@ -4,9 +4,9 @@ from __future__ import annotations
 import urllib.parse
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QKeySequence, QShortcut
+from PyQt6.QtGui import QKeySequence, QPixmap, QShortcut
 from PyQt6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFrame,
+    QApplication, QDialog, QFrame,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QVBoxLayout,
 )
 
@@ -14,6 +14,8 @@ from core.release_gate import (
     AuthenticationError, AuthenticationUnavailable, DesktopAuthClient,
     LoginResult, ReleasePolicy,
 )
+from ui.widgets import CheckMarkBox
+from utils.app_paths import resource_root
 
 
 class _LoginWorker(QThread):
@@ -54,7 +56,10 @@ class ReleaseLoginDialog(QDialog):
                 background:#202020; border:1px solid #383838;
                 border-radius:5px;
             }
-            QFrame#accentLine { background:#3d8ef8; border:0; border-radius:1px; }
+            QLabel#brandLogo {
+                background:#f2f3f6; border:1px solid #d5d8df;
+                border-radius:8px; padding:5px;
+            }
             QLabel#brandName { color:#eeeeee; font-size:15px; font-weight:700; }
             QLabel#brandCaption { color:#777777; font-size:10px; }
             QLabel#teamBadge {
@@ -108,8 +113,13 @@ class ReleaseLoginDialog(QDialog):
         brand = QHBoxLayout()
         brand.setSpacing(11)
         logo = QLabel()
-        logo.setFixedSize(42, 42)
-        logo.setPixmap(QApplication.windowIcon().pixmap(42, 42))
+        logo.setObjectName("brandLogo")
+        logo.setFixedSize(44, 44)
+        logo.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo_pixmap = QPixmap(str(resource_root() / "assets" / "icon.png"))
+        logo.setPixmap(logo_pixmap.scaled(
+            32, 32, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
         brand_text = QVBoxLayout()
         brand_text.setSpacing(2)
         brand_name = QLabel("CreativeEnginePro")
@@ -155,7 +165,7 @@ class ReleaseLoginDialog(QDialog):
         self.password_toggle.clicked.connect(self._toggle_password)
         password_row.addWidget(self.password_toggle)
 
-        self.remember = QCheckBox("在此电脑保持登录")
+        self.remember = CheckMarkBox("在此电脑保持登录")
         self.remember.setToolTip(
             "只保存由 Windows 当前用户加密的登录会话，不保存账号密码；管理员可随时使会话失效")
         self.settings = QSettings("CreativeEnginePro", "Desktop")
@@ -195,14 +205,9 @@ class ReleaseLoginDialog(QDialog):
 
         card = QFrame()
         card.setObjectName("loginCard")
-        accent_line = QFrame()
-        accent_line.setObjectName("accentLine")
-        accent_line.setFixedHeight(3)
         content = QVBoxLayout(card)
         content.setContentsMargins(28, 20, 28, 20)
         content.setSpacing(9)
-        content.addWidget(accent_line)
-        content.addSpacing(3)
         content.addLayout(brand)
         content.addSpacing(10)
         content.addWidget(title)
@@ -372,6 +377,26 @@ class _SessionWorker(QThread):
             self.completed.emit(self.client.validate_session())
         except Exception as error:
             self.failed.emit(error)
+
+
+class DesktopLogoutWorker(QThread):
+    """Revoke an account session without blocking the desktop UI."""
+
+    completed = pyqtSignal(str)
+
+    def __init__(self, client: DesktopAuthClient, parent=None):
+        super().__init__(parent)
+        self.client = client
+
+    def run(self) -> None:
+        try:
+            self.completed.emit(self.client.logout())
+        except Exception as error:
+            # ``DesktopAuthClient.logout`` already clears local state in a
+            # finally block.  Keep the transition usable if an unexpected
+            # transport/runtime error still reaches this boundary.
+            self.client.forget_saved_session()
+            self.completed.emit(f"本机登录记录已清除；服务器注销异常：{error}")
 
 
 class DesktopSessionGuard(QObject):

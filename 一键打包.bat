@@ -1,33 +1,27 @@
 @echo off
-echo ========================================
-echo     CreativeEnginePro 正在打包...
-echo ========================================
-echo.
-
-:: 自动切换到 bat 文件所在的当前项目目录
+chcp 65001 >nul
+title CreativeEnginePro 一键打包
 cd /d "%~dp0"
 
-echo 当前目录 %CD%
+echo ============================================================
+echo CreativeEnginePro 正式版一键打包
+echo ============================================================
+echo 将自动执行：环境检查、全量测试、EXE 打包、成品验证和校验码生成。
+echo 打包过程中请不要关闭此窗口。
 echo.
-set /p CEP_AUTH_URL=请输入正式登录服务器 HTTPS 地址:
-if "%CEP_AUTH_URL%"=="" (
-  echo 错误：正式版必须配置登录服务器地址。
-  pause
-  exit /b 1
-)
 
-echo 开始测试并打包正式版（已启用 --clean）...
-echo.
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\build_release.ps1" -AuthBaseUrl "%CEP_AUTH_URL%"
-if errorlevel 1 (
-  echo.
-  echo 打包失败，请查看上方错误信息。
-  pause
-  exit /b 1
-)
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0tools\one_click_build.ps1"
+set "CEP_BUILD_EXIT=%ERRORLEVEL%"
 
 echo.
-echo ========================================
-echo 打包完成！单文件 EXE 已生成在 dist 文件夹里
-echo ========================================
+if not "%CEP_BUILD_EXIT%"=="0" goto build_failed
+echo [成功] 正式版已经生成，成品目录已打开。
+echo 可以发送 CreativeEnginePro.exe；校验文件建议一并保留。
 pause
+exit /b 0
+
+:build_failed
+echo [失败] 打包没有完成，请把本窗口中的错误信息发给开发者。
+echo 详细日志：%~dp0build\one-click-package.log
+pause
+exit /b %CEP_BUILD_EXIT%

@@ -181,14 +181,52 @@ sys.path.insert(0, base_path)
 sys.path.insert(0, os.path.join(base_path, "core"))
 sys.path.insert(0, os.path.join(base_path, "ui"))
 
+
+def _set_windows_app_identity() -> None:
+    """Give Windows a stable taskbar identity and the packaged app icon."""
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "CreativeEnginePro.Desktop")
+    except Exception:
+        pass
+
+
+def _update_boot_splash(message: str = "", close: bool = False) -> None:
+    """Update/close PyInstaller's extraction splash when running one-file."""
+    try:
+        import pyi_splash
+        if pyi_splash.is_alive():
+            if message:
+                pyi_splash.update_text(message)
+            if close:
+                pyi_splash.close()
+    except (ImportError, RuntimeError):
+        pass
+    if close:
+        # The packaged EXE is also reused for yt-dlp/AI workers. Suppress the
+        # splash for those later child launches; it belongs only to app boot.
+        os.environ["PYINSTALLER_SUPPRESS_SPLASH_SCREEN"] = "1"
+
+
+def _complete_boot_splash() -> None:
+    """Show 100% briefly, then hand over cleanly to the real Qt window."""
+    _update_boot_splash("__CEP_READY__")
+    QTimer.singleShot(180, lambda: _update_boot_splash(close=True))
+
 # --- 3. 先创建 QApplication（必须在任何 Qt 对象创建之前）---
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 from PyQt6.QtGui import QFont, QIcon
 
 if __name__ == '__main__':
+    _set_windows_app_identity()
     app = QApplication(sys.argv)
     # 应用级图标会自动传递给主窗口、弹窗和 Windows 任务栏。
     app.setWindowIcon(QIcon(os.path.join(base_path, "assets", "icon.ico")))
+    _update_boot_splash("__CEP_AUTH__")
 
     # 正式版日期锁与公司账号门禁。开发清单默认不要求登录；正式构建脚本会
     # 生成 require_login=true 且固化 HTTPS 服务地址的授权清单。
@@ -197,10 +235,12 @@ if __name__ == '__main__':
         from ui.release_login import ReleaseLoginDialog
         release_policy = ReleasePolicy.load()
     except Exception as error:
+        _update_boot_splash(close=True)
         QMessageBox.critical(None, "版本授权异常", str(error))
         sys.exit(1)
 
     if release_policy.is_expired():
+        _update_boot_splash(close=True)
         QMessageBox.critical(
             None, "版本已到期",
             f"当前版本已于 {release_policy.expiry_label} 到期，请联系管理员获取新版本。")
@@ -212,6 +252,9 @@ if __name__ == '__main__':
     if release_policy.require_login and not bundle_smoke:
         auth_client = DesktopAuthClient(release_policy.auth_base_url)
         login_dialog = ReleaseLoginDialog(release_policy, auth_client)
+        login_dialog.show()
+        app.processEvents()
+        _complete_boot_splash()
         if login_dialog.exec() != QDialog.DialogCode.Accepted or login_dialog.result is None:
             sys.exit(0)
         authenticated_user = login_dialog.result.user
@@ -241,23 +284,71 @@ if __name__ == '__main__':
         configure_desktop_control_client(auth_client)
     from ui.main_window import UltimateEngine
 
-    window = UltimateEngine()
-    if authenticated_user:
-        display_name = str(authenticated_user.get("display_name") or authenticated_user.get("username") or "")
-        if display_name:
-            window.setWindowTitle(f"{window.windowTitle()} · {display_name}")
-    if auth_client is not None:
-        from ui.release_login import DesktopSessionGuard, close_for_invalid_session
-        # Retain the guard on the window; otherwise Qt/Python may collect it.
-        window._release_session_guard = DesktopSessionGuard(
-            release_policy, auth_client, window)
-        window._release_session_guard.invalidated.connect(close_for_invalid_session)
+    window = None
+    session_state = {"logout_worker": None, "login_notice": ""}
+
+    def _build_authenticated_window(client, user):
+        target = UltimateEngine()
+        if user:
+            display_name = str(user.get("display_name") or user.get("username") or "")
+            if display_name:
+                target.setWindowTitle(f"{target.windowTitle()} · {display_name}")
+        if client is not None:
+            from ui.release_login import DesktopSessionGuard, close_for_invalid_session
+            target.configure_authenticated_session(release_policy, client, user)
+            # Retain the guard on the window; otherwise Qt/Python may collect it.
+            target._release_session_guard = DesktopSessionGuard(
+                release_policy, client, target)
+            target._release_session_guard.invalidated.connect(close_for_invalid_session)
+            target.logoutRequested.connect(lambda: _begin_account_logout(target, client))
+        return target
+
+    def _show_login_after_logout():
+        next_client = DesktopAuthClient(release_policy.auth_base_url)
+        dialog = ReleaseLoginDialog(release_policy, next_client)
+        notice = str(session_state.pop("login_notice", "") or "")
+        if notice:
+            dialog.status.setStyleSheet("color:#d4b873;")
+            dialog.status.setText(notice)
+        if dialog.exec() != QDialog.DialogCode.Accepted or dialog.result is None:
+            app.quit()
+            return
+        configure_desktop_control_client(next_client)
+        next_window = _build_authenticated_window(next_client, dialog.result.user)
+        session_state["window"] = next_window
+        next_window.show()
+        app.setQuitOnLastWindowClosed(True)
+
+    def _finish_account_logout(target, warning: str):
+        configure_desktop_control_client(None)
+        target.complete_account_logout()
+        if hasattr(target, "_release_session_guard"):
+            target._release_session_guard._timer.stop()
+        app.setQuitOnLastWindowClosed(False)
+        target.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        target.close()
+        session_state["window"] = None
+        session_state["logout_worker"] = None
+        session_state["login_notice"] = (
+            "已退出当前账号。" + (f" {warning}" if warning else ""))
+        QTimer.singleShot(0, _show_login_after_logout)
+
+    def _begin_account_logout(target, client):
+        from ui.release_login import DesktopLogoutWorker
+        if session_state.get("logout_worker") is not None:
+            return
+        worker = DesktopLogoutWorker(client, target)
+        session_state["logout_worker"] = worker
+        worker.completed.connect(
+            lambda warning: _finish_account_logout(target, warning))
+        worker.start()
+
+    window = _build_authenticated_window(auth_client, authenticated_user)
+    session_state["window"] = window
     if bundle_smoke:
         # Build-time probe: prove that Qt and the complete main window can be
         # constructed from the frozen bundle.  It never exposes a usable app
         # or bypasses the login gate for an interactive session.
-        from PyQt6.QtCore import QTimer
-
         marker = os.environ.get("CEP_BUNDLE_SMOKE_MARKER", "").strip()
 
         def _complete_bundle_smoke():
@@ -276,7 +367,11 @@ if __name__ == '__main__':
             os._exit(0)
 
         window.show()
+        app.processEvents()
+        _complete_boot_splash()
         QTimer.singleShot(750, _complete_bundle_smoke)
     else:
         window.show()
+        app.processEvents()
+        _complete_boot_splash()
     sys.exit(app.exec())

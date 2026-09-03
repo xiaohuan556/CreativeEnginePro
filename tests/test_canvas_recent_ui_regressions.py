@@ -185,6 +185,15 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         self.assertFalse(toolbar.isHidden())
         self.assertEqual("未选择节点", panel.selection_count_label.text())
         self.assertFalse(panel.selection_delete_button.isEnabled())
+        self.assertIn(
+            "QFrame#canvasSelectionToolbar{background:transparent;",
+            toolbar.styleSheet())
+        self.assertIn(
+            "QLabel#canvasSelectionCount{background:transparent;",
+            toolbar.styleSheet())
+        self.assertFalse(toolbar.autoFillBackground())
+        self.assertTrue(panel.selection_count_label.testAttribute(
+            Qt.WidgetAttribute.WA_TransparentForMouseEvents))
 
         node_id = panel.create_custom_node(
             "text_node", QPointF(100, 100), {"content":"固定工具栏测试"})
@@ -568,6 +577,139 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         self.assertEqual("批量换风格", record["editor_action"])
         panel.close()
 
+    def test_multi_image_editor_uses_plain_colored_reference_text(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_inline_refs_"))
+        images = [media_root / "reference-1.png", media_root / "reference-2.png"]
+        for image in images:
+            image.touch()
+        node_id = panel.create_custom_node("image_node", QPointF(100, 100), {
+            "multi_image_composer":True,
+            "content":"让第一张图穿上第二张图的衣服",
+            "references":[str(image) for image in images],
+            "reference_assets":[
+                {"path":str(image), "role":"composition",
+                 "source_node_id":f"source-{index}"}
+                for index, image in enumerate(images)],
+        })
+
+        panel.show_inline_editor(panel._nodes[node_id])
+        self.app.processEvents()
+        widget = panel._inline_editor_proxy.widget()
+        button_texts = [button.text() for button in widget.findChildren(
+            canvas_module.QPushButton)]
+        self.assertNotIn("设置每张图片的用途…", button_texts)
+        self.assertIsNone(widget.findChild(
+            canvas_module.QScrollArea, "inlineImageReferences"))
+        editor = panel._inline_text_editor
+        self.assertNotIn("\ufffc", editor.toPlainText())
+        self.assertIn("【图片1】", editor.toPlainText())
+        self.assertIn("【图片2】", editor.toPlainText())
+        self.assertNotIn("\n", editor.toPlainText())
+        serialized = panel._custom_record(node_id)["content"]
+        self.assertIn("【图片1】", serialized)
+        self.assertIn("【图片2】", serialized)
+        mentions = panel._custom_record(node_id)["reference_mentions"]
+        self.assertNotEqual(mentions[0]["color"], mentions[1]["color"])
+        objects = panel._inline_reference_objects(editor)
+        self.assertEqual([str(image) for image in images], [
+            value["path"] for value in objects])
+        for mention, reference in zip(mentions, objects):
+            self.assertEqual(mention["token"], reference["text"])
+            cursor = canvas_module.QTextCursor(editor.document())
+            cursor.setPosition(reference["position"])
+            cursor.movePosition(
+                canvas_module.QTextCursor.MoveOperation.NextCharacter,
+                canvas_module.QTextCursor.MoveMode.KeepAnchor)
+            self.assertEqual(
+                mention["path"],
+                str(cursor.charFormat().property(
+                    canvas_module._REFERENCE_PATH_PROPERTY)))
+            self.assertEqual(
+                canvas_module.QColor(mention["color"]),
+                cursor.charFormat().foreground().color())
+            self.assertEqual(
+                Qt.BrushStyle.NoBrush,
+                cursor.charFormat().background().style())
+        panel.close()
+
+    def test_ctrl_reference_is_inserted_at_cursor_and_click_locates_source(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_cursor_ref_"))
+        image = media_root / "coat.png"
+        image.touch()
+        source_id = panel.create_custom_node(
+            "image_node", QPointF(100, 100), {"path":str(image)})
+        target_id = panel.create_custom_node(
+            "image_node", QPointF(500, 100), {
+                "multi_image_composer":True, "content":"让角色穿上这件衣服",
+                "references":[], "reference_assets":[],
+            })
+        panel.show_inline_editor(panel._nodes[target_id])
+        editor = panel._inline_text_editor
+        cursor = editor.textCursor()
+        cursor.setPosition(1)
+        editor.setTextCursor(cursor)
+
+        self.assertTrue(panel._attach_image_nodes_as_references(
+            target_id, [source_id]))
+        self.app.processEvents()
+        self.assertIn("让 【图片1】 角色", editor.toPlainText())
+        self.assertIn(
+            "让 【图片1】 角色",
+            panel._custom_record(target_id)["content"])
+        self.assertFalse(bool(editor.currentCharFormat().property(
+            canvas_module._REFERENCE_PATH_PROPERTY)))
+        editor.insertPlainText("继续输入")
+        typed_cursor = editor.textCursor()
+        typed_cursor.movePosition(
+            canvas_module.QTextCursor.MoveOperation.PreviousCharacter,
+            canvas_module.QTextCursor.MoveMode.KeepAnchor)
+        self.assertFalse(bool(typed_cursor.charFormat().property(
+            canvas_module._REFERENCE_PATH_PROPERTY)))
+        editor.referenceActivated.emit(str(image), source_id)
+        self.app.processEvents()
+        self.assertTrue(panel._nodes[source_id].isSelected())
+
+        token = "【图片1】"
+        object_position = editor.toPlainText().index(token)
+        cursor = canvas_module.QTextCursor(editor.document())
+        cursor.setPosition(object_position)
+        cursor.setPosition(
+            object_position + len(token),
+            canvas_module.QTextCursor.MoveMode.KeepAnchor)
+        cursor.removeSelectedText()
+        panel._sync_inline_reference_mentions(
+            target_id, editor, allow_removal=True)
+        self.assertEqual([], panel._custom_record(target_id)["references"])
+        panel.close()
+
+    def test_ctrl_reference_helper_uses_plain_reference_role(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_ctrl_refs_"))
+        image = media_root / "reference.png"
+        image.touch()
+        source_id = panel.create_custom_node(
+            "image_node", QPointF(100, 100), {"path":str(image)})
+        target_id = panel.create_custom_node(
+            "image_node", QPointF(500, 100), {
+                "multi_image_composer":True,
+                "references":[], "reference_assets":[],
+            })
+
+        self.assertTrue(panel._attach_image_nodes_as_references(
+            target_id, [source_id]))
+        record = panel._custom_record(target_id)
+        self.assertEqual([str(image.resolve())], record["references"])
+        self.assertEqual("reference", record["reference_assets"][0]["role"])
+        self.assertEqual("已引用 1 张图片", record["status"])
+        self.assertTrue(any(
+            edge.get("source") == source_id and
+            edge.get("target") == target_id and
+            edge.get("type") == "reference"
+            for edge in panel._positions()["__workflow_edges__"]))
+        panel.close()
+
     def test_inline_combo_popups_keep_proxy_alive_and_commit_selection(self):
         panel = self.make_panel()
         panel.resize(1200, 800)
@@ -582,9 +724,22 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
             combo for combo in widget.findChildren(canvas_module.QComboBox)
             if combo.findData("paired") >= 0 and combo.findData("style") >= 0)
 
-        batch_combo.showPopup()
+        # Exercise the real press/release path: placing the menu too close to
+        # the pointer used to make mouse-up close it immediately, which looked
+        # like the size/model dropdown could not be clicked.
+        QTest.mouseClick(
+            batch_combo, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, batch_combo.rect().center())
         self.app.processEvents()
         self.assertTrue(batch_combo._canvas_popup_menu.isVisible())
+        popup_actions = batch_combo._canvas_popup_menu.actions()
+        self.assertTrue(
+            popup_actions[batch_combo.currentIndex()].text().startswith("✓  "))
+        self.assertTrue(all(not action.isCheckable() for action in popup_actions))
+        self.assertFalse(any(
+            action.text().startswith("✓  ")
+            for index, action in enumerate(popup_actions)
+            if index != batch_combo.currentIndex()))
         self.assertTrue(widget.property("canvasComboPopupOpen"))
         panel.scene.clearSelection()
         panel._hide_inline_editor_if_unfocused()
@@ -607,6 +762,189 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         ratio_combo.hidePopup()
         self.app.processEvents()
         self.assertEqual("9:16", panel._custom_record(node_id)["ratio"])
+        panel.close()
+
+    def test_inline_combo_popup_is_below_its_control_after_zoom_and_pan(self):
+        panel = self.make_panel()
+        panel.resize(1200, 800)
+        panel.show()
+        node_id = panel.create_custom_node("image_node", QPointF(420, 260), {
+            "multi_image_composer":True, "references":[], "reference_assets":[],
+        })
+        panel.show_inline_editor(panel._nodes[node_id])
+        self.app.processEvents()
+        panel.view.scale(1.35, 1.35)
+        panel.view.centerOn(panel._inline_editor_proxy.sceneBoundingRect().center())
+        self.app.processEvents()
+
+        widget = panel._inline_editor_proxy.widget()
+        ratio_combo = next(
+            combo for combo in widget.findChildren(canvas_module.QComboBox)
+            if combo.findText("16:9") >= 0 and combo.findText("9:16") >= 0)
+        proxy = widget.graphicsProxyWidget()
+        panel_point = ratio_combo.mapTo(
+            widget, QPoint(0, ratio_combo.height()))
+        expected = panel.view.viewport().mapToGlobal(
+            panel.view.mapFromScene(proxy.mapToScene(QPointF(panel_point))))
+        self.assertEqual(expected, ratio_combo._popup_anchor())
+
+        QTest.mouseClick(
+            ratio_combo, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, ratio_combo.rect().center())
+        self.app.processEvents()
+        menu = ratio_combo._canvas_popup_menu
+        self.assertTrue(menu.isVisible())
+        # A parentless QMenu remains a real screen popup instead of becoming
+        # a second proxy widget with a duplicate scene-coordinate transform.
+        self.assertIsNone(menu.parent())
+        popup_size = menu.sizeHint()
+        screen = QApplication.screenAt(expected) or QApplication.primaryScreen()
+        available = screen.availableGeometry()
+        bounded_x = max(available.left(), min(
+            expected.x(), available.right() - popup_size.width() + 1))
+        bounded_y = expected.y()
+        if bounded_y + popup_size.height() > available.bottom() + 1:
+            above_y = (
+                expected.y() - ratio_combo.height() - popup_size.height())
+            if above_y >= available.top():
+                bounded_y = above_y
+            else:
+                bounded_y = max(
+                    available.top(),
+                    available.bottom() - popup_size.height() + 1)
+        bounded_y = max(available.top(), min(
+            bounded_y, available.bottom() - popup_size.height() + 1))
+        position_debug = (
+            f"menu={menu.pos()}, raw={expected}, bounded="
+            f"QPoint({bounded_x}, {bounded_y}), size={popup_size}, "
+            f"screen={available}")
+        self.assertLessEqual(
+            abs(menu.pos().x() - bounded_x), 2, position_debug)
+        self.assertLessEqual(
+            abs(menu.pos().y() - bounded_y), 2, position_debug)
+        menu.close()
+
+        model_combo = next(
+            combo for combo in widget.findChildren(canvas_module.QComboBox)
+            if combo is not ratio_combo and combo.isVisible() and combo.count())
+        QTest.mouseClick(
+            model_combo, Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier, model_combo.rect().center())
+        self.app.processEvents()
+        self.assertTrue(model_combo._canvas_popup_menu.isVisible())
+        self.assertIsNone(model_combo._canvas_popup_menu.parent())
+        model_combo._canvas_popup_menu.close()
+        panel.close()
+
+    def test_multi_image_composer_repairs_stale_scene_asset_badge(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_stale_scene_badge_"))
+        reference = media_root / "reference.png"
+        result = media_root / "result.png"
+        reference.touch(); result.touch()
+        node_id = panel.create_custom_node("image_node", QPointF(100, 100), {
+            "title":"图片", "multi_image_composer":True,
+            "references":[str(reference)], "path":str(result),
+            "asset_kind":"scene", "scene_reference_set":{"master":str(result)},
+            "status":"场景视图 1/5 · 待补齐",
+        })
+
+        record = panel._custom_record(node_id)
+        self.assertNotIn("asset_kind", record)
+        self.assertNotIn("scene_reference_set", record)
+        self.assertEqual("已引用 1 张图片 · 已生成结果", record["status"])
+        self.assertEqual(record["status"], panel._nodes[node_id].badge)
+        panel.close()
+
+    def test_every_inline_node_combo_uses_proxy_safe_popup(self):
+        panel = self.make_panel()
+        media_root = Path(tempfile.mkdtemp(prefix="cep_all_inline_combos_"))
+        imported_image = media_root / "uploaded.png"
+        imported_image.touch()
+        cases = (
+            ("text_node", {"content":"一句文字", "plain_text":True}),
+            ("text_node", {"content":"一段脚本", "script_versions":[]}),
+            ("image_node", {"content":"修改图片", "path":str(imported_image),
+                            "editor_action":"AI 编辑"}),
+            ("image_node", {"content":"生成画面", "multi_image_composer":True}),
+            ("video_node", {"content":"生成视频", "editor_action":"文生视频"}),
+            ("audio_node", {"content":"生成对白", "editor_action":"对白配音"}),
+            ("skill_node", {"content":"检查连续性", "skill_id":"continuity"}),
+        )
+        for index, (node_type, payload) in enumerate(cases):
+            node_id = panel.create_custom_node(
+                node_type, QPointF(100 + index * 20, 100), payload)
+            panel.show_inline_editor(panel._nodes[node_id])
+            self.app.processEvents()
+            widget = panel._inline_editor_proxy.widget()
+            combos = widget.findChildren(canvas_module.QComboBox)
+            self.assertTrue(all(isinstance(
+                combo, canvas_module._CanvasComboBox) for combo in combos))
+            panel.hide_inline_editor()
+        panel.close()
+
+    def test_single_image_generation_materializes_every_result_with_own_edge(self):
+        panel = self.make_panel()
+        parent_id = panel.create_custom_node(
+            "image_node", QPointF(100, 100), {
+                "title":"图片", "multi_image_composer":True,
+                "references":[], "candidates":[],
+            })
+        media_root = Path(tempfile.mkdtemp(prefix="cep_single_image_results_"))
+        paths = [media_root / f"candidate-{index}.png" for index in range(3)]
+        for path in paths:
+            path.touch()
+
+        child_ids = panel._materialize_standalone_generation_results(
+            parent_id, [str(path) for path in paths], "image",
+            {"provider":"gptimage"})
+
+        self.assertEqual(3, len(child_ids))
+        parent = panel._custom_record(parent_id)
+        self.assertEqual(child_ids, parent["materialized_result_node_ids"])
+        for index, (child_id, path) in enumerate(zip(child_ids, paths)):
+            child = panel._custom_record(child_id)
+            self.assertEqual(str(path), child["path"])
+            self.assertEqual(parent_id, child["generation_result_parent_id"])
+            self.assertEqual(index, child["generation_result_index"])
+            self.assertGreater(
+                panel._positions()[child_id][0], panel._positions()[parent_id][0])
+            self.assertTrue(any(
+                edge.get("source") == parent_id and
+                edge.get("target") == child_id and
+                edge.get("type") == "generation_result"
+                for edge in panel._positions()["__workflow_edges__"]))
+        panel.refresh()
+        self.assertEqual("", panel._nodes[parent_id].thumbnail)
+        self.assertTrue(all(child_id in panel._nodes for child_id in child_ids))
+        panel.close()
+
+    def test_single_video_generation_materializes_every_result_with_own_edge(self):
+        panel = self.make_panel()
+        parent_id = panel.create_custom_node(
+            "video_node", QPointF(100, 100), {
+                "title":"视频", "candidates":[],
+            })
+        media_root = Path(tempfile.mkdtemp(prefix="cep_single_video_results_"))
+        paths = [media_root / f"candidate-{index}.mp4" for index in range(2)]
+        for path in paths:
+            path.touch()
+
+        with patch.object(panel, "_extract_video_review_frames", return_value=[]):
+            child_ids = panel._materialize_standalone_generation_results(
+                parent_id, [str(path) for path in paths], "video",
+                {"provider":"seedance"}, primary_video_frames=[])
+
+        self.assertEqual(2, len(child_ids))
+        for child_id, path in zip(child_ids, paths):
+            child = panel._custom_record(child_id)
+            self.assertEqual("video", child["kind"])
+            self.assertEqual(str(path), child["path"])
+            self.assertEqual(parent_id, child["generation_result_parent_id"])
+            self.assertTrue(any(
+                edge.get("source") == parent_id and
+                edge.get("target") == child_id
+                for edge in panel._positions()["__workflow_edges__"]))
         panel.close()
 
     def test_batch_style_does_not_require_outer_prompt(self):
@@ -1176,7 +1514,7 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         self.assertEqual(record["references"], [str(base.resolve())])
         self.assertEqual(len(record["reference_assets"]), 1)
         self.assertEqual(record["reference_assets"][0]["source_node_id"], base_id)
-        self.assertEqual(record["status"], "已连接 1 张参考 · 请设置每张图用途")
+        self.assertEqual(record["status"], "已引用 1 张图片")
         panel.close()
 
 

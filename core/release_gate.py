@@ -425,6 +425,29 @@ class DesktopAuthClient:
         self.user = dict(payload.get("user") or {})
         return LoginResult(self.user, self._server_time(payload))
 
+    def logout(self) -> str:
+        """Revoke the server session and always remove the local login memory.
+
+        The returned string is an optional warning.  A network outage must not
+        trap someone inside a remembered local account: local cookies and the
+        encrypted session file are cleared in every case.
+        """
+        warning = ""
+        try:
+            self.request_json("POST", "/api/auth/logout", write=True)
+        except AuthenticationError:
+            # The session is already invalid, which is equivalent to logout.
+            pass
+        except AuthenticationUnavailable as error:
+            warning = f"服务器暂时无法确认注销，但本机登录记录已经清除：{error}"
+        finally:
+            self.forget_saved_session()
+            self.session.cookies.clear()
+            self.csrf_token = ""
+            self.user = {}
+            self._desktop_project_id = ""
+        return warning
+
 
 _desktop_control_client: DesktopAuthClient | None = None
 

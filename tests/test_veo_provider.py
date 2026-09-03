@@ -111,6 +111,118 @@ class VeoProviderTests(unittest.TestCase):
         self.assertIn("仅支持 4–15 秒", handle.result.error)
         mock_post.assert_not_called()
 
+    def test_seedance_local_reference_video_is_submitted_as_web_url(self):
+        source = Path(self.temp_dir.name) / "reference.mp4"
+        source.write_bytes(b"local-video-bytes")
+        provider = SeedanceProvider(
+            api_key="ark-test", model=SEEDANCE_25_MODEL,
+            base_url="https://video.example/v3")
+        request = TaskRequest(
+            operation="video_edit",
+            inputs={
+                "prompt":"保持主体，修改镜头运动",
+                "reference_assets":[{
+                    "path":str(source), "role":"reference_video",
+                }],
+            },
+            params={
+                "model":SEEDANCE_25_MODEL, "duration":5,
+                "ratio":"adaptive", "resolution":"720p",
+            })
+        succeeded = {
+            "status":"succeeded",
+            "content":{"video_url":"https://example.test/result.mp4"},
+        }
+        with (
+            patch(
+                "ai.providers.video.provider_media_relay.publish_local_media",
+                return_value="https://relay.example/reference.mp4") as publish,
+            patch("ai.providers.video.veo.ark_post", return_value={"id":"task-1"}) as post,
+            patch("ai.providers.video.veo.ark_get", return_value=succeeded),
+            patch("ai.providers.video.veo.download"),
+            patch.object(provider, "_out_dir", return_value=self.output_dir),
+        ):
+            handle = provider.execute(request)
+
+        self.assertTrue(handle.is_success, handle.result.error)
+        payload = post.call_args.args[2]
+        video_item = next(
+            item for item in payload["content"]
+            if item.get("type") == "video_url")
+        self.assertEqual(
+            "https://relay.example/reference.mp4",
+            video_item["video_url"]["url"])
+        publish.assert_called_once_with(source)
+
+    def test_seedance_keeps_remote_and_asset_media_urls_unchanged(self):
+        self.assertEqual(
+            "https://example.test/reference.mp4",
+            SeedanceProvider._remote_media_url(
+                "https://example.test/reference.mp4", "参考视频"))
+        self.assertEqual(
+            "asset://asset-123",
+            SeedanceProvider._remote_media_url(
+                "asset://asset-123", "参考视频"))
+
+    def test_seedance_timestamp_edit_hard_locks_downloaded_result(self):
+        source = Path(self.temp_dir.name) / "original.mp4"
+        source.write_bytes(b"original-video")
+        provider = SeedanceProvider(
+            api_key="ark-test", model=SEEDANCE_25_MODEL,
+            base_url="https://video.example/v3")
+        request = TaskRequest(
+            operation="video_edit",
+            inputs={
+                "prompt":"只修改选定范围",
+                "reference_assets":[{
+                    "path":str(source), "role":"reference_video",
+                }],
+            },
+            params={
+                "model":SEEDANCE_25_MODEL, "duration":-1,
+                "ratio":"adaptive", "resolution":"720p",
+                "video_edit_hard_lock":True,
+                "video_edit_source_path":str(source),
+                "video_edit_start":2.0, "video_edit_end":6.0,
+                "video_edit_scope":"element",
+                "video_edit_region":{
+                    "x":0.1, "y":0.2, "width":0.3, "height":0.4},
+            })
+        succeeded = {
+            "status":"succeeded",
+            "content":{"video_url":"https://example.test/result.mp4"},
+        }
+        lock_metadata = {
+            "applied":True, "outside_time_preserved":True,
+            "outside_region_preserved":True,
+        }
+
+        def fake_download(_url, target, timeout=0):
+            Path(target).write_bytes(b"generated-video")
+
+        with (
+            patch(
+                "ai.providers.video.provider_media_relay.publish_local_media",
+                return_value="https://relay.example/reference.mp4"),
+            patch("ai.providers.video.veo.ark_post", return_value={"id":"task-1"}),
+            patch("ai.providers.video.veo.ark_get", return_value=succeeded),
+            patch("ai.providers.video.veo.download", side_effect=fake_download),
+            patch(
+                "ai.providers.video.timestamp_edit_lock.enforce_timestamp_edit_lock",
+                return_value=lock_metadata) as enforce,
+            patch.object(provider, "_out_dir", return_value=self.output_dir),
+        ):
+            handle = provider.execute(request)
+
+        self.assertTrue(handle.is_success, handle.result.error)
+        enforce.assert_called_once()
+        args = enforce.call_args.args
+        self.assertEqual(source, Path(args[0]))
+        self.assertEqual(2.0, enforce.call_args.kwargs["start"])
+        self.assertEqual(6.0, enforce.call_args.kwargs["end"])
+        self.assertEqual(
+            lock_metadata, handle.result.provider_raw["timestamp_edit_lock"])
+
     def test_transient_poll_failures_do_not_duplicate_submit(self):
         patches = self._patches([
             TimeoutError("timed out"),
