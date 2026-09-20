@@ -601,6 +601,14 @@ class DubbingPanel(QWidget):
             self._play_btn.setEnabled(True)
 
             dur = _audio_duration(path)
+            if dur <= 0:
+                # Last-resort guard: even if a packaged machine cannot probe
+                # the generated file, never add a zero-width audio clip.
+                subtitle_dur = 0.0
+                if self._subtitle_end is not None:
+                    subtitle_dur = max(
+                        0.0, float(self._subtitle_end) - float(self._subtitle_start))
+                dur = max(0.5, subtitle_dur)
             if self._add_audio_cb is not None:
                 try:
                     self._add_audio_cb(path, dur, self._subtitle_start, self._subtitle_end)

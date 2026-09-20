@@ -95,15 +95,6 @@ def _build_registry() -> ProviderRegistry:
     except Exception:
         pass
 
-    # 自托管 CosyVoice：模型运行在独立 GPU 服务，主应用只发送参考录音与文字。
-    try:
-        import os
-        cosyvoice_url = os.getenv("COSYVOICE_BASE_URL", "").strip() or "http://127.0.0.1:50000"
-        from .providers.voice import CosyVoiceProvider
-        reg.register(CosyVoiceProvider(cosyvoice_url))
-    except Exception:
-        pass
-
     # 4) OpenAI 图像 + 视频（GPT-Image / Veo）
     #    复用同一个 OPENAI_API_KEY（ModelHub 统一代理）。
     try:

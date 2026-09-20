@@ -650,6 +650,32 @@ class SubtitleManagerDialog(QDialog):
         self._ai_worker.error.connect(self._on_trans_error)
         self._ai_worker.start()
 
+    def _stop_ai_worker(self):
+        """Safely release the translation worker owned by this dialog."""
+        worker = self._ai_worker
+        if worker is None:
+            return
+
+        # Clear the dialog reference first so late queued callbacks cannot be
+        # mistaken for the worker of a later translation request.
+        self._ai_worker = None
+        try:
+            worker.finished.disconnect(self._on_trans_done)
+        except (TypeError, RuntimeError, AttributeError):
+            pass
+        try:
+            worker.error.disconnect(self._on_trans_error)
+        except (TypeError, RuntimeError, AttributeError):
+            pass
+
+        if worker.isRunning():
+            worker.requestInterruption()
+            worker.quit()
+            if not worker.wait(3000):
+                worker.terminate()
+                worker.wait(1000)
+        worker.deleteLater()
+
     def _custom_translate(self):
         lang, ok = QInputDialog.getText(self, "自定义语种", "目标语言（如：法语）：")
         if ok and lang.strip():
@@ -671,6 +697,12 @@ class SubtitleManagerDialog(QDialog):
 
     def _on_trans_error(self, e: str):
         self._ai_status.setText(f"翻译失败: {e[:80]}")
+
+    def done(self, result):
+        # QDialog.accept()/reject() can finish a modal dialog without relying
+        # on closeEvent, so cleanup belongs in done().
+        self._stop_ai_worker()
+        super().done(result)
 
     def _do_sync(self):
         subs = self._selected_subs()
@@ -1049,7 +1081,8 @@ class EditorTab(QWidget):
         lay.setSpacing(0)
         self.props_panel = ClipPropertiesPanel(
             self.timeline, add_audio_cb=self._dubbing_add_audio,
-            get_subtitles_cb=self._get_selected_subtitles)
+            get_subtitles_cb=self._get_selected_subtitles,
+            get_selected_clips_cb=self._selected_clip_items)
         lay.addWidget(self.props_panel, 1)
         lay.addStretch()
         props_scroll.setWidget(container)
@@ -4283,16 +4316,11 @@ class EditorTab(QWidget):
 
     def _do_open_export_dialog(self):
         # 检测纯音频时间线 → 音频导出模式
-        has_video = any(
-            len(track) > 0
-            for tl in self._timelines
-            for track in tl.video_tracks
-        )
-        has_audio = any(
-            len(track) > 0
-            for tl in self._timelines
-            for track in tl.audio_tracks
-        ) or has_video  # 视频轨也含音频
+        # 导出只针对当前可见时间线，检测范围也必须一致。旧逻辑检查“所有时间线”，
+        # 当前时间线为空时仍允许继续，最终会生成一个看似成功的纯黑视频。
+        current_tl = self.timeline
+        has_video = any(len(track) > 0 for track in current_tl.video_tracks)
+        has_audio = any(len(track) > 0 for track in current_tl.audio_tracks) or has_video
 
         if not has_video and not has_audio:
             self._exporting = False

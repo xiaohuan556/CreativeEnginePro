@@ -144,8 +144,15 @@ class EdgeTTSEngine:
             pass
         # 2) 回退：ffmpeg -i 解析 stderr 中的 Duration 行
         try:
-            r = subprocess.run([FFMPEG_BIN, "-i", str(audio_path)],
-                               capture_output=True, text=True)
+            # FFmpeg writes UTF-8 paths to stderr.  On Chinese Windows,
+            # text=True otherwise decodes with GBK and can fail as soon as the
+            # auto-language engine prefixes a filename with a language name.
+            # That failure used to return 0 seconds and create a hairline clip.
+            r = subprocess.run(
+                [FFMPEG_BIN, "-i", str(audio_path)],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace",
+            )
             m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", r.stderr)
             if m:
                 h, mi, s = m.groups()

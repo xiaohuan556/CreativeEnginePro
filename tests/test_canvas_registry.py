@@ -7,11 +7,12 @@ from ai.providers.video.seedance_models import (
 )
 
 
-def test_creation_menu_matches_webai_beginner_order():
+def test_desktop_creation_menu_excludes_unbundled_voice_clone():
     assert [row[1] for row in CREATION_ITEMS] == [
         "文本", "脚本", "图片", "视频", "音频",
-        "短片", "口播", "克隆", "多图导演", "拉片", "镜头",
+        "短片", "口播", "多图导演", "拉片", "镜头",
     ]
+    assert all(row[0] != "voice_clone" for row in CREATION_ITEMS)
 
 
 def test_manual_links_use_production_whitelist():
@@ -35,8 +36,9 @@ def test_dangling_wire_choices_keep_semantic_relations():
     }
     video_choices = connection_create_choices("video", "video")
     assert {row["relation"] for row in video_choices} == {
-        "video_source", "content_video", "voice_reference",
+        "video_source", "content_video",
     }
+    assert connection_create_choices("audio", "audio") == []
 
 
 def test_text_like_generation_choices_select_runnable_media_actions():
@@ -53,7 +55,9 @@ def test_text_like_generation_choices_select_runnable_media_actions():
             assert audio["overrides"]["editor_action"] == "对白配音"
 
 
-def test_specialized_nodes_reuse_desktop_editors_without_losing_identity():
+def test_legacy_voice_clone_nodes_keep_identity_without_new_creation_entry():
+    # Existing project data remains readable even though the unbundled feature
+    # is no longer offered in the desktop creation/connection menus.
     node_type, payload = creation_payload("voice_clone", "clone_voice")
     assert node_type == "audio_node"
     assert infer_node_spec(node_type, payload) == "voice_clone"

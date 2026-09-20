@@ -137,7 +137,6 @@ CREATION_ITEMS = (
     ("audio", "音频", "生成配音或音效", "文字 → 音频", "text_to_speech"),
     ("storyboard", "短片", "从故事或脚本自动完成多镜头短片", "故事 / 脚本 → 短片", "idea_to_movie"),
     ("copywriting", "口播", "生成、改写或翻译口播文案", "产品信息 → 口播", "write_copy"),
-    ("voice_clone", "克隆", "用已授权的参考声音朗读新文字", "声音 + 文字 → 音频", "clone_voice"),
     ("multi_director", "多图导演", "直接多图成视频，或先拆镜和运动分镜再成片", "多张图片 → 视频 / 短片", "multi_image_director"),
     ("analysis", "拉片", "分析切镜、运镜、节奏、动作和声音", "视频 → 拉片报告", "break_down_video"),
     ("shot", "镜头", "控制一个镜头的画面、动作、运镜和对白", "镜头设计 → 多种结果", "make_shot"),
@@ -153,11 +152,11 @@ NODE_CONNECTION_TARGETS = {
     "scene_reference": ("multi_image", "video", "multi_director", "shot", "storyboard"),
     "character_reference": ("multi_image", "video", "multi_director", "shot", "storyboard"),
     "element_reference": ("multi_image", "video", "multi_director", "shot", "storyboard"),
-    "video": ("analysis", "video_style_transfer", "voice_clone"),
-    "multi_director": ("analysis", "video_style_transfer", "voice_clone"),
-    "video_style_transfer": ("analysis", "video_style_transfer", "voice_clone"),
-    "long_timeline": ("analysis", "video_style_transfer", "voice_clone"),
-    "audio": ("voice_clone",),
+    "video": ("analysis", "video_style_transfer"),
+    "multi_director": ("analysis", "video_style_transfer"),
+    "video_style_transfer": ("analysis", "video_style_transfer"),
+    "long_timeline": ("analysis", "video_style_transfer"),
+    "audio": (),
     "analysis": ("script", "shot", "skill"),
     "shot": ("multi_image", "video", "audio", "shot"),
     "skill": ("multi_image", "video", "shot"),
@@ -273,10 +272,7 @@ def connection_create_choices(source_key: str, source_kind: str = ""):
         rows = [
             choice("analysis", "分析这个视频", "分析切镜、运镜、节奏和声音", "video_source", beginner_mode="break_down_video"),
             choice("video_style_transfer", "作为内容视频迁移风格", "保留动作镜头，只改变画风与质感", "content_video"),
-            choice("voice_clone", "提取参考音色", "使用已获授权视频中的清晰人声", "voice_reference", beginner_mode="clone_voice"),
         ]
-    elif source_key == "audio":
-        rows = [choice("voice_clone", "作为声音克隆参考", "提取音色并朗读新的文字", "voice_reference", beginner_mode="clone_voice")]
     elif source_key == "analysis":
         rows = [
             choice("script", "根据报告重写脚本", "把拉片报告带入脚本工作台", "analysis_source", beginner_mode="write_script"),

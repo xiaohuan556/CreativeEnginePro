@@ -167,9 +167,10 @@ class ClipPropertiesPanel(QWidget):
     _TAB_DUBBING = 5
 
     def __init__(self, timeline: EditTimeline, parent=None, add_audio_cb=None,
-                 get_subtitles_cb=None):
+                 get_subtitles_cb=None, get_selected_clips_cb=None):
         super().__init__(parent)
         self.tl = timeline
+        self._get_selected_clips_cb = get_selected_clips_cb
         self._clip = None
         self._track = ""
         self._blocking = False
@@ -1132,14 +1133,63 @@ class ClipPropertiesPanel(QWidget):
         self._rebuild_ui()
 
     # ─── 工具方法 ───
+    def _property_targets(self, clip) -> list:
+        """Return same-kind marquee selections when the edited clip is among them."""
+        if not callable(self._get_selected_clips_cb):
+            return [clip]
+        try:
+            selected = self._get_selected_clips_cb() or []
+        except Exception:
+            return [clip]
+
+        parsed = []
+        for item in selected:
+            if isinstance(item, (tuple, list)) and item:
+                candidate = item[0]
+                kind = item[1] if len(item) > 1 else self._track
+            else:
+                candidate = item
+                kind = self._track
+            if candidate is not None:
+                parsed.append((candidate, kind))
+
+        # Do not let a stale canvas selection modify unrelated clips.
+        if not any(candidate is clip for candidate, _kind in parsed):
+            return [clip]
+
+        targets = []
+        seen = set()
+        for candidate, kind in parsed:
+            if kind != self._track or id(candidate) in seen:
+                continue
+            seen.add(id(candidate))
+            targets.append(candidate)
+        return targets or [clip]
+
     def _set(self, clip, attr: str, value):
         """设置属性并触发预览刷新。
         自动关键帧：若该属性已有至少一个关键帧，则自动在当前时间点插入关键帧。
         速度变更时同步缩放所有关键帧时间。
         字幕同步：若开启了字幕同步开关，自动同步样式到所有其他字幕块。
         """
-        old_val = getattr(clip, attr, None)
-        setattr(clip, attr, value)
+        # Group editing is for shared visual/audio properties.  Content and
+        # placement in time remain per-clip even while several items are
+        # selected, otherwise editing one subtitle sentence would duplicate
+        # its text across the whole selection.
+        per_clip_attrs = {
+            "id", "text", "source_path", "timeline_start", "timeline_end",
+            "trim_start", "trim_end", "source_duration", "keyframes",
+        }
+        targets = ([clip] if attr in per_clip_attrs
+                   else self._property_targets(clip))
+        old_values = {id(target): getattr(target, attr, None)
+                      for target in targets}
+        for target in targets:
+            setattr(target, attr, value)
+            if attr == "fill_enabled" and value:
+                setattr(target, "word_animation", False)
+            elif attr == "word_animation" and value:
+                setattr(target, "fill_enabled", False)
 
         # 字幕统一样式：debounce 同步到所有其他字幕块（避免拖拽滑块时全量遍历卡顿）
         if (self._sync_subs and self._track == "subtitle"
@@ -1148,19 +1198,25 @@ class ClipPropertiesPanel(QWidget):
             self._sync_debounce.start()
 
         # 速度变更：同步缩放所有关键帧时间
-        if attr == "speed" and old_val is not None and old_val != value:
-            ratio = value / old_val
-            kfs = getattr(clip, "keyframes", None) or {}
-            for prop, kf_list in kfs.items():
-                kfs[prop] = [(t * ratio, v) for t, v in kf_list]
+        if attr == "speed":
+            for target in targets:
+                old_val = old_values[id(target)]
+                if old_val is None or old_val == value:
+                    continue
+                ratio = value / old_val
+                kfs = getattr(target, "keyframes", None) or {}
+                for prop, kf_list in kfs.items():
+                    kfs[prop] = [(t * ratio, v) for t, v in kf_list]
 
         # 自动关键帧逻辑
-        kfs = getattr(clip, "keyframes", None) or {}
-        if attr in kfs and kfs[attr] and self._current_sec is not None:
-            rel_t = self._current_sec - clip.timeline_start
-            if 0 <= rel_t <= getattr(clip, 'duration', 9999):
-                kfs[attr] = [(t, v) for t, v in kfs[attr] if abs(t - rel_t) > 0.05]
-                kfs[attr].append((rel_t, value))
+        for target in targets:
+            kfs = getattr(target, "keyframes", None) or {}
+            if attr in kfs and kfs[attr] and self._current_sec is not None:
+                rel_t = self._current_sec - target.timeline_start
+                if 0 <= rel_t <= getattr(target, 'duration', 9999):
+                    kfs[attr] = [(t, v) for t, v in kfs[attr]
+                                 if abs(t - rel_t) > 0.05]
+                    kfs[attr].append((rel_t, value))
         self.property_changed.emit()
 
     def _undo_set(self, clip, attr: str, value):

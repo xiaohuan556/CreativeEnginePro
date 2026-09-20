@@ -725,6 +725,15 @@ class SeedanceProvider(VideoProvider):
                 raise ArkHTTPError(
                     f"{model_profile['label']} 仅支持 {min_duration}–{max_duration} 秒；"
                     f"当前请求为 {duration} 秒，请在节点参数中调整")
+            ratio = str(request.params.get("ratio") or "adaptive").strip()
+            supported_ratios = list(
+                model_profile.get("ratios") or ["adaptive", "16:9", "9:16"])
+            if ratio not in supported_ratios:
+                visible_ratios = "、".join(
+                    value for value in supported_ratios if value != "adaptive")
+                raise ArkHTTPError(
+                    f"{model_profile['label']} 不支持画面比例 {ratio}；"
+                    f"请选择 {visible_ratios}。视频续长会由系统自动使用 adaptive")
 
             prompt = (request.inputs.get("prompt") or "").strip()
             if not prompt:
@@ -844,7 +853,7 @@ class SeedanceProvider(VideoProvider):
                 "model": model,
                 "content": content,
                 "generate_audio": generate_audio,
-                "ratio": request.params.get("ratio", "adaptive"),
+                "ratio": ratio,
                 "duration": duration,
                 "watermark": bool(request.params.get("watermark", False)),
             }

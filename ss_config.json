@@ -1,7 +1,7 @@
 {
   "imgs_per_video": 6,
   "video_duration": 12,
-  "video_count": 5,
+  "video_count": 20,
   "fps": 30,
   "resolution": "1080x1920",
   "transition_frames": 10,
@@ -21,5 +21,21 @@
   "bgm_selected": 0,
   "shuffle_mode": true,
   "output_dir": "",
-  "file_prefix": "Themepack_ios_GG_MID009_DA003_20260709_"
+  "file_prefix": "ithemes__ios_GG_MID004_DA003_20260910_",
+  "ai_source_dir": "C:\\Users\\A\\Desktop\\CreativeEnginePro\\MediaLibrary\\Pinterest\\20260804_150749",
+  "ai_style_keys": [],
+  "ai_custom_enabled": false,
+  "ai_custom_prompt": "",
+  "ai_engine": "gptimage",
+  "ai_size": "1024x1024",
+  "ai_quality_label": "标准",
+  "ai_strength": 60,
+  "ai_target": 5,
+  "ai_auto_render": true,
+  "pinterest_url": "https://www.pinterest.com/search/pins/?q=spider%20man%20wallpaper&rs=ac&len=10&source_id=ac_0uJCj7ED&eq=Spider-Man&etslf=1607",
+  "pinterest_count": 5,
+  "pinterest_auto_ai": true,
+  "ai_aspect": "original",
+  "pinterest_portrait": true,
+  "ai_ref_image": "G:/gh/2026年产出/0730/产品/Themepack_ios_GG_MID004_DA003_20260730_1.png"
 }

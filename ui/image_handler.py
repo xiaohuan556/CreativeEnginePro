@@ -59,6 +59,37 @@ def format_size(size_bytes):
         return f"{size_bytes / (1024 * 1024):.1f}MB"
 
 
+def build_image_export_path(out_dir, src_path, rename_tpl, index, total,
+                            used_paths=None, output_ext=None):
+    """Build a collision-safe output path for one image in a batch."""
+    base = os.path.splitext(os.path.basename(src_path))[0]
+    template = (rename_tpl or '').strip()
+    index_text = str(index + 1).zfill(2)
+
+    if template:
+        final_name = (template
+                      .replace('{index}', index_text)
+                      .replace('{name}', base))
+        # A fixed custom name used to make every item overwrite the previous
+        # one, leaving only the final image in the output directory.
+        if total > 1 and '{index}' not in template:
+            final_name = f"{final_name}_{index_text}"
+    else:
+        final_name = base
+
+    ext = output_ext or os.path.splitext(src_path)[1]
+    candidate = os.path.join(out_dir, final_name + ext)
+    reserved = used_paths if used_paths is not None else set()
+    normalized = os.path.normcase(os.path.abspath(candidate))
+    suffix = 2
+    while normalized in reserved:
+        candidate = os.path.join(out_dir, f"{final_name}_{suffix:02d}{ext}")
+        normalized = os.path.normcase(os.path.abspath(candidate))
+        suffix += 1
+    reserved.add(normalized)
+    return candidate
+
+
 # ==================== 图片导入线程 ====================
 
 class ImageImportThread(QThread):
@@ -114,6 +145,7 @@ class ImageExportThread(QThread):
         rename_tpl = self.config['rename'].strip()
         fmt        = self.config['format']
         quality    = self.config['quality']
+        used_paths = set()
 
         for i, task in enumerate(self.tasks):
             if not self._is_running:
@@ -147,18 +179,12 @@ class ImageExportThread(QThread):
 
                 result = fit_image(img, target_w, target_h, mode)
 
-                base = os.path.splitext(os.path.basename(src_path))[0]
-                if rename_tpl:
-                    final_name = (rename_tpl
-                                  .replace('{index}', str(i + 1).zfill(2))
-                                  .replace('{name}', base))
-                else:
-                    final_name = base
-
                 ext_map = {'JPG': '.jpg', 'PNG': '.png',
                            '原格式': os.path.splitext(src_path)[1]}
                 ext = ext_map.get(fmt, os.path.splitext(src_path)[1])
-                out_path = os.path.join(out_dir, final_name + ext)
+                out_path = build_image_export_path(
+                    out_dir, src_path, rename_tpl, i, total, used_paths,
+                    output_ext=ext)
 
                 if ext.lower() in ['.jpg', '.jpeg']:
                     params = [cv2.IMWRITE_JPEG_QUALITY, quality]
@@ -171,11 +197,12 @@ class ImageExportThread(QThread):
                 cv2.imencode(ext, result, params)[1].tofile(out_path)
 
                 self.log_signal.emit(f"STATUS_UPDATE_IMG:{row_idx}:已完成")
-                self.progress_signal.emit(int((i + 1) / total * 100))
 
             except Exception as e:
                 self.log_signal.emit(f"STATUS_UPDATE_IMG:{row_idx}:出错")
                 self.log_signal.emit(f"第{row_idx+1}张出错: {e}")
+            finally:
+                self.progress_signal.emit(int((i + 1) / total * 100))
 
         self.finished_signal.emit()
 

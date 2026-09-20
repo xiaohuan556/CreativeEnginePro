@@ -174,6 +174,82 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         self.assertFalse(panel.selection_delete_button.icon().isNull())
         panel.close()
 
+    def test_web_canvas_group_is_visual_and_never_becomes_executable_workflow(self):
+        panel = self.make_panel()
+        first_id = panel.create_custom_node(
+            "text_node", QPointF(100, 100), {"title":"成员一"})
+        second_id = panel.create_custom_node(
+            "image_node", QPointF(520, 100), {"title":"成员二"})
+        panel._positions().setdefault("__custom_nodes__", []).append({
+            "id":"canvas-group:web-import",
+            "type":"workflow_group",
+            "title":"Web 分组",
+            "canvas_group":True,
+            "group_name":"Web 分组",
+            "branch_name":"广告支线",
+            "group_nodes":[first_id, second_id],
+            "collapsed":False,
+        })
+        panel.refresh()
+
+        self.assertNotIn("canvas-group:web-import", panel._nodes)
+        self.assertIn("canvas-group:web-import", panel._canvas_groups)
+        self.assertFalse(any(
+            record.get("id") == "canvas-group:web-import"
+            for record in panel._positions().get("__custom_nodes__", [])))
+        group = panel._canvas_groups["canvas-group:web-import"]
+        self.assertEqual([first_id, second_id], group.member_ids)
+        self.assertLess(group.zValue(), panel._nodes[first_id].zValue())
+        panel.close()
+
+    def test_canvas_group_collapse_hides_only_its_members(self):
+        panel = self.make_panel()
+        first_id = panel.create_custom_node("text_node", QPointF(100, 100))
+        second_id = panel.create_custom_node("image_node", QPointF(520, 100))
+        outside_id = panel.create_custom_node("text_node", QPointF(900, 100))
+        panel._positions()["__canvas_groups__"] = [{
+            "id":"canvas-group:test", "canvas_group":True,
+            "group_name":"测试分组", "branch_name":"", "collapsed":False,
+            "group_nodes":[first_id, second_id],
+        }]
+        panel.refresh()
+
+        self.assertTrue(panel.toggle_canvas_group("canvas-group:test"))
+        self.assertFalse(panel._nodes[first_id].isVisible())
+        self.assertFalse(panel._nodes[second_id].isVisible())
+        self.assertTrue(panel._nodes[outside_id].isVisible())
+        self.assertTrue(panel._canvas_groups["canvas-group:test"].isVisible())
+        self.assertTrue(panel.toggle_canvas_group("canvas-group:test"))
+        self.assertTrue(panel._nodes[first_id].isVisible())
+        self.assertTrue(panel._nodes[second_id].isVisible())
+        panel.close()
+
+    def test_auto_layout_with_multiple_selection_does_not_move_unselected_nodes(self):
+        panel = self.make_panel()
+        first_id = panel.create_custom_node("text_node", QPointF(700, 500))
+        second_id = panel.create_custom_node("image_node", QPointF(80, 60))
+        outside_id = panel.create_custom_node("video_node", QPointF(1400, 900))
+        panel._positions().setdefault("__workflow_edges__", []).append({
+            "source":first_id, "target":second_id, "type":"workflow"})
+        panel.refresh()
+        outside_before = QPointF(panel._nodes[outside_id].pos())
+        panel.scene.clearSelection()
+        panel._defer_inline_editor_until_pointer_release = True
+        panel._nodes[first_id].setSelected(True)
+        panel._nodes[second_id].setSelected(True)
+        panel._defer_inline_editor_until_pointer_release = False
+        self.assertEqual(2, len([
+            item for item in panel.scene.selectedItems()
+            if isinstance(item, canvas_module.CanvasNodeItem)]))
+
+        panel.auto_layout()
+
+        self.assertEqual(outside_before, panel._nodes[outside_id].pos())
+        self.assertLess(panel._nodes[first_id].pos().x(),
+                        panel._nodes[second_id].pos().x())
+        self.assertTrue(panel._position_undo)
+        panel.close()
+
     def test_selection_toolbar_is_a_persistent_canvas_overlay(self):
         panel = self.make_panel()
         panel.resize(1100, 760)

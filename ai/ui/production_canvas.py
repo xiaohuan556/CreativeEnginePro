@@ -76,7 +76,9 @@ from ai.canvas_registry import (
 )
 from ai.script_workbench import previous_script_version, save_script_version, script_metrics
 from ai.style_presets import STYLE_PRESETS, STYLE_PRESET_BY_ID, compile_style_prompt
-from ai.generation_errors import moderation_failure, transient_gateway_failure
+from ai.generation_errors import (
+    moderation_failure, public_generation_error, transient_gateway_failure,
+)
 from ai.scene_contracts import consolidate_scene_specs, scene_location_key
 from ai.scene_geometry import (
     SCENE_VIEW_SPECS, bind_scene_view, create_edit_region_mask,
@@ -1277,6 +1279,148 @@ class CanvasEdgeItem(QGraphicsPathItem):
         self.setPen(pen)
 
 
+class CanvasGroupFrameItem(QGraphicsObject):
+    """Purely visual node group; it never participates in task execution."""
+
+    HEADER_HEIGHT = 46.0
+    HORIZONTAL_PADDING = 34.0
+    TOP_PADDING = 62.0
+    BOTTOM_PADDING = 34.0
+
+    def __init__(self, owner, record: dict):
+        super().__init__()
+        self.owner = owner
+        self.group_id = str(record.get("id") or "")
+        self.record = record
+        self._rect = QRectF(0, 0, 360, self.HEADER_HEIGHT)
+        self._press_screen_pos = None
+        self._member_origins = {}
+        self._drag_started = False
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
+            QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges)
+        self.setAcceptHoverEvents(True)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setZValue(-18)
+
+    @property
+    def member_ids(self):
+        values = self.record.get("group_nodes") or []
+        return list(dict.fromkeys(str(value) for value in values if value))
+
+    @property
+    def collapsed(self):
+        return bool(self.record.get("collapsed"))
+
+    def boundingRect(self):
+        return QRectF(self._rect)
+
+    def sync_geometry(self):
+        members = [self.owner._nodes.get(node_id) for node_id in self.member_ids]
+        members = [node for node in members if node is not None]
+        if members:
+            bounds = QRectF(members[0].sceneBoundingRect())
+            for member in members[1:]:
+                bounds = bounds.united(member.sceneBoundingRect())
+            left = bounds.left() - self.HORIZONTAL_PADDING
+            top = bounds.top() - self.TOP_PADDING
+            width = max(360.0, bounds.width() + self.HORIZONTAL_PADDING * 2)
+            height = (self.HEADER_HEIGHT if self.collapsed else
+                      max(150.0, bounds.height() + self.TOP_PADDING + self.BOTTOM_PADDING))
+            self.record["x"], self.record["y"] = round(left, 2), round(top, 2)
+        else:
+            left = float(self.record.get("x") or 0.0)
+            top = float(self.record.get("y") or 0.0)
+            width = max(360.0, float(self.record.get("width") or 360.0))
+            height = self.HEADER_HEIGHT
+        self.prepareGeometryChange()
+        self.setPos(QPointF(left, top))
+        self._rect = QRectF(0, 0, width, height)
+        self.record["width"] = round(width, 2)
+        self.update()
+
+    def paint(self, painter: QPainter, option, widget=None):
+        del option, widget
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        selected = self.isSelected()
+        if not self.collapsed:
+            painter.setBrush(QColor(54, 66, 86, 34))
+            painter.setPen(QPen(QColor("#8092b3" if selected else "#4f5f79"),
+                                2.0 if selected else 1.2, Qt.PenStyle.DashLine))
+            painter.drawRoundedRect(self._rect, 14, 14)
+        header = QRectF(0, 0, self._rect.width(), self.HEADER_HEIGHT)
+        painter.setBrush(QColor("#34435a" if selected else "#273348"))
+        painter.setPen(QPen(QColor("#9eb5dd" if selected else "#687b9d"), 1.2))
+        painter.drawRoundedRect(header, 11, 11)
+        painter.setPen(QColor("#f0f3f8"))
+        painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.Weight.DemiBold))
+        name = str(self.record.get("group_name") or self.record.get("title") or "节点分组")
+        branch = str(self.record.get("branch_name") or "")
+        prefix = "▸" if self.collapsed else "▾"
+        painter.drawText(QRectF(16, 0, self._rect.width() - 32, 26),
+                         Qt.AlignmentFlag.AlignVCenter, f"{prefix}  {name}")
+        painter.setPen(QColor("#aab5c8"))
+        painter.setFont(QFont("Microsoft YaHei UI", 7))
+        detail = f"分支：{branch}" if branch else f"{len(self.member_ids)} 个节点 · 不改变执行关系"
+        painter.drawText(QRectF(34, 23, self._rect.width() - 50, 19),
+                         Qt.AlignmentFlag.AlignVCenter, detail)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.owner.hide_inline_editor()
+            self._press_screen_pos = QPoint(event.screenPos())
+            self._drag_started = False
+            self._member_origins = {
+                node_id: QPointF(self.owner._nodes[node_id].pos())
+                for node_id in self.member_ids if node_id in self.owner._nodes}
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if (self._press_screen_pos is not None and
+                event.buttons() & Qt.MouseButton.LeftButton):
+            pixel_delta = QPoint(event.screenPos()) - self._press_screen_pos
+            if (not self._drag_started and
+                    pixel_delta.manhattanLength() < QApplication.startDragDistance()):
+                event.accept()
+                return
+            if not self._drag_started:
+                self._drag_started = True
+                self.owner._move_drag_before = {
+                    node_id: [round(point.x(), 2), round(point.y(), 2)]
+                    for node_id, point in self._member_origins.items()}
+            zoom = max(0.05, abs(float(
+                self.scene().views()[0].transform().m11()))
+                if self.scene() and self.scene().views() else 1.0)
+            delta = QPointF(pixel_delta.x() / zoom, pixel_delta.y() / zoom)
+            for node_id, origin in self._member_origins.items():
+                node = self.owner._nodes.get(node_id)
+                if node is not None:
+                    node.setPos(origin + delta)
+            self.sync_geometry()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        dragged = self._drag_started
+        super().mouseReleaseEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            if dragged:
+                self.owner.end_node_move()
+                self.owner._save_layout_now()
+            self._press_screen_pos = None
+            self._member_origins = {}
+            self._drag_started = False
+
+    def mouseDoubleClickEvent(self, event):
+        self.owner.toggle_canvas_group(self.group_id)
+        event.accept()
+
+    def contextMenuEvent(self, event):
+        self.owner.show_canvas_group_context_menu(self, event.screenPos())
+        event.accept()
+
+
 class CanvasNodeItem(QGraphicsObject):
     """轻量节点；数据操作放在 ProductionCanvasTab，节点只负责呈现和手势。"""
 
@@ -2309,7 +2453,8 @@ class CanvasNavigatorPanel(QFrame):
         ol.addWidget(self.search)
         self.node_list = QListWidget()
         self.node_list.itemClicked.connect(
-            lambda item: owner.focus_node(str(item.data(Qt.ItemDataRole.UserRole) or "")))
+            lambda item: owner.focus_navigator_item(
+                str(item.data(Qt.ItemDataRole.UserRole) or "")))
         ol.addWidget(self.node_list, 1)
         self.count_label = QLabel("0 个节点")
         self.count_label.setStyleSheet("color:#74747e;padding:4px;")
@@ -2333,9 +2478,27 @@ class CanvasNavigatorPanel(QFrame):
             "generation_task": "✦",
         }
         count = 0
+        for group in self.owner._canvas_groups.values():
+            name = str(group.record.get("group_name") or "节点分组")
+            branch = str(group.record.get("branch_name") or "")
+            text = f"{name} {branch}".casefold()
+            if query and not all(term in text for term in query.split()):
+                continue
+            item = QListWidgetItem(
+                f"▱  {name}" + (f" · {branch}" if branch else ""))
+            item.setData(Qt.ItemDataRole.UserRole, group.group_id)
+            item.setToolTip(
+                f"{len(group.member_ids)} 个节点 · 双击画布分组可折叠/展开")
+            self.node_list.addItem(item)
+            if group.group_id == selected_id:
+                self.node_list.setCurrentItem(item)
+            count += 1
         for node in self.owner._nodes.values():
-            text = f"{node.title} {node.subtitle}".casefold()
-            if query and query not in text:
+            payload_text = " ".join(str(node.payload.get(key) or "") for key in (
+                "branch_name", "group_name", "product_name", "product_description",
+                "editor_action", "provider_name", "model", "asset_kind"))
+            text = f"{node.title} {node.subtitle} {payload_text}".casefold()
+            if query and not all(term in text for term in query.split()):
                 continue
             item = QListWidgetItem(
                 f"{labels.get(node.node_type, '•')}  {node.title}")
@@ -2767,6 +2930,8 @@ class ProductionCanvasTab(QWidget):
         self._preview_render_timer.setInterval(500)
         self._preview_render_timer.timeout.connect(self._poll_combined_preview_render)
         self._canvas_clipboard = []
+        self._canvas_groups: dict[str, CanvasGroupFrameItem] = {}
+        self._focused_node_ids: set[str] = set()
         self._delete_undo = []
         self._position_undo = []
         self._position_redo = []
@@ -2805,6 +2970,10 @@ class ProductionCanvasTab(QWidget):
         self._open_project_shortcut.setContext(
             Qt.ShortcutContext.WidgetWithChildrenShortcut)
         self._open_project_shortcut.activated.connect(self.open_canvas_project)
+        self._canvas_search_shortcut = QShortcut(QKeySequence("Ctrl+K"), self)
+        self._canvas_search_shortcut.setContext(
+            Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._canvas_search_shortcut.activated.connect(self.open_canvas_search)
         self._task_timer = QTimer(self)
         self._task_timer.setInterval(650)
         self._task_timer.timeout.connect(self._poll_task_nodes)
@@ -2875,6 +3044,11 @@ class ProductionCanvasTab(QWidget):
             "border:none;}"
             "QLabel#canvasSelectionCount{background:transparent;border:none;"
             "color:#c8cbd4;font-size:11px;padding:2px 3px;}"
+            "QPushButton#canvasSelectionAction{background:rgba(34,39,51,205);"
+            "color:#d9e2f5;border:1px solid #4a5872;border-radius:7px;"
+            "padding:6px 11px;}"
+            "QPushButton#canvasSelectionAction:hover{background:rgba(49,59,78,230);"
+            "border-color:#7f98ca;color:white;}"
             "QPushButton#deleteCanvasSelection{background:rgba(50,31,35,190);color:#ffb0b0;"
             "border:1px solid #61353d;border-radius:7px;padding:6px 12px;}"
             "QPushButton#deleteCanvasSelection:hover{background:rgba(72,37,44,225);"
@@ -2889,6 +3063,24 @@ class ProductionCanvasTab(QWidget):
             Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         selection_row.addWidget(self.selection_count_label)
         selection_row.addStretch()
+        self.selection_focus_button = QPushButton("局部聚焦")
+        self.selection_focus_button.setObjectName("canvasSelectionAction")
+        self.selection_focus_button.clicked.connect(
+            lambda _=False: self.focus_selected_canvas_branch())
+        self.selection_focus_button.hide()
+        selection_row.addWidget(self.selection_focus_button)
+        self.selection_group_button = QPushButton("组成分组")
+        self.selection_group_button.setObjectName("canvasSelectionAction")
+        self.selection_group_button.clicked.connect(
+            lambda _=False: self.create_canvas_group())
+        self.selection_group_button.hide()
+        selection_row.addWidget(self.selection_group_button)
+        self.clear_focus_button = QPushButton("返回完整画布")
+        self.clear_focus_button.setObjectName("canvasSelectionAction")
+        self.clear_focus_button.clicked.connect(
+            lambda _=False: self.clear_canvas_focus())
+        self.clear_focus_button.hide()
+        selection_row.addWidget(self.clear_focus_button)
         self.selection_delete_button = QPushButton("删除")
         self.selection_delete_button.setObjectName("deleteCanvasSelection")
         self.selection_delete_button.setIcon(_trash_icon())
@@ -3130,6 +3322,7 @@ class ProductionCanvasTab(QWidget):
         self._delete_undo.clear()
         self._position_undo.clear()
         self._position_redo.clear()
+        self._focused_node_ids.clear()
         self._move_drag_before = None
         self._workflow_failed_nodes.clear()
         self.refresh()
@@ -3503,6 +3696,9 @@ class ProductionCanvasTab(QWidget):
                     self._inline_editor_node_id == node.node_id):
                 self._inline_editor_proxy.setPos(
                     node.pos() + QPointF(0, node.height + 18))
+            for group in self._canvas_groups.values():
+                if node.node_id in group.member_ids:
+                    group.sync_geometry()
             self._layout_timer.start()
 
     def _next_canvas_action_serial(self):
@@ -3851,8 +4047,10 @@ class ProductionCanvasTab(QWidget):
             self.scene.edges = []
             self.scene.node_edges = {}
             self._nodes.clear()
+            self._canvas_groups.clear()
             self._default_positions.clear()
             self._build_nodes()
+            self._build_canvas_groups()
             self._build_edges()
             self.scene.update_edges()
             self._apply_visibility()
@@ -4008,7 +4206,73 @@ class ProductionCanvasTab(QWidget):
             return False
         return cls._is_video_path(path) if kind == "video_node" else cls._is_image_path(path)
 
+    def _migrate_canvas_group_records(self):
+        """Move Web-compatible visual groups away from executable workflow nodes."""
+        project = self._positions()
+        groups = project.setdefault("__canvas_groups__", [])
+        if not isinstance(groups, list):
+            groups = []
+            project["__canvas_groups__"] = groups
+        custom = project.get("__custom_nodes__", [])
+        migrated = []
+        retained = []
+        known = {str(value.get("id") or "") for value in groups
+                 if isinstance(value, dict)}
+        for value in custom if isinstance(custom, list) else []:
+            if isinstance(value, dict) and value.get("canvas_group"):
+                group_id = str(value.get("id") or "")
+                if group_id and group_id not in known:
+                    position = project.get(group_id)
+                    record = {
+                        "id": group_id,
+                        "canvas_group": True,
+                        "group_name": str(value.get("group_name") or
+                                          value.get("title") or "节点分组"),
+                        "branch_name": str(value.get("branch_name") or ""),
+                        "group_nodes": list(value.get("group_nodes") or []),
+                        "collapsed": bool(value.get("collapsed")),
+                    }
+                    if isinstance(position, (list, tuple)) and len(position) == 2:
+                        record["x"], record["y"] = position
+                    groups.append(record)
+                    known.add(group_id)
+                migrated.append(group_id)
+            else:
+                retained.append(value)
+        if migrated:
+            project["__custom_nodes__"] = retained
+            for group_id in migrated:
+                project.pop(group_id, None)
+        return bool(migrated)
+
+    def _canvas_group_records(self):
+        values = self._positions().setdefault("__canvas_groups__", [])
+        return values if isinstance(values, list) else []
+
+    def _build_canvas_groups(self):
+        valid_ids = set(self._nodes)
+        retained = []
+        for record in self._canvas_group_records():
+            if not isinstance(record, dict):
+                continue
+            members = list(dict.fromkeys(
+                str(value) for value in record.get("group_nodes", [])
+                if str(value) in valid_ids))
+            if len(members) < 2:
+                continue
+            record["group_nodes"] = members
+            record["canvas_group"] = True
+            frame = CanvasGroupFrameItem(self, record)
+            self.scene.addItem(frame)
+            self._canvas_groups[frame.group_id] = frame
+            frame.sync_geometry()
+            retained.append(record)
+        if len(retained) != len(self._canvas_group_records()):
+            self._positions()["__canvas_groups__"] = retained
+
     def _build_nodes(self):
+        if self._migrate_canvas_group_records():
+            self._save_layout_now()
         repaired_composers = False
         for data in self._positions().get("__custom_nodes__", []):
             if not isinstance(data, dict) or not bool(
@@ -4341,11 +4605,26 @@ class ProductionCanvasTab(QWidget):
     def selection_changed(self):
         selected = [item for item in self.scene.selectedItems()
                     if isinstance(item, CanvasNodeItem)]
+        selected_groups = [item for item in self.scene.selectedItems()
+                           if isinstance(item, CanvasGroupFrameItem)]
         if hasattr(self, "selection_toolbar"):
-            self.selection_count_label.setText(
-                f"已选择 {len(selected)} 个节点" if selected else "未选择节点")
-            self.selection_delete_button.setEnabled(bool(selected))
+            if selected_groups:
+                group = selected_groups[0]
+                name = str(group.record.get("group_name") or "节点分组")
+                self.selection_count_label.setText(
+                    f"已选择分组“{name}” · {len(group.member_ids)} 个节点")
+            else:
+                self.selection_count_label.setText(
+                    f"已选择 {len(selected)} 个节点" if selected else "未选择节点")
+            self.selection_delete_button.setEnabled(bool(selected or selected_groups))
+            self.selection_group_button.setVisible(len(selected) > 1 and not selected_groups)
+            self.selection_focus_button.setVisible(
+                bool(selected_groups) or len(selected) == 1)
+            self.clear_focus_button.setVisible(bool(self._focused_node_ids))
         if self._suppress_inline_editor_for_context_menu:
+            return
+        if selected_groups:
+            self.hide_inline_editor()
             return
         # Web 端一致的引用方式：保持多图节点编辑框打开时，Ctrl 点击其他
         # 图片节点会直接把图片加入当前编辑框，不再进入“设置图片用途”流程。
@@ -7953,7 +8232,7 @@ class ProductionCanvasTab(QWidget):
             record["status"] = "Seedance 2.5 视频任务已提交"
             self._save_layout_now(); node.badge = "生成中 0%"; node.update()
         except Exception as error:
-            QMessageBox.warning(self, "提交失败", str(error))
+            QMessageBox.warning(self, "提交失败", public_generation_error(error))
 
     def _upstream_media_path(self, node_id: str, image_only=False):
         node = self._nodes.get(node_id)
@@ -16470,7 +16749,8 @@ class ProductionCanvasTab(QWidget):
                 if failed_record is not None:
                     failed_record["status"] = (
                         "Seedance 已拦截首帧 · 疑似可识别真人"
-                        if privacy_blocked else f"生成失败 · {str(error)[:120]}")
+                        if privacy_blocked else
+                        f"生成失败 · {public_generation_error(error)[:120]}")
                     failed_record["generation_blocked"] = (
                         "real_person_privacy" if privacy_blocked else "provider_error")
                     request = task.get("request")
@@ -16546,7 +16826,8 @@ class ProductionCanvasTab(QWidget):
                             failed_record["last_request_id"] = friendly["request_id"]
                         QMessageBox.warning(self, friendly["title"], friendly["message"])
                     else:
-                        QMessageBox.warning(self, "节点生成失败", str(error))
+                        QMessageBox.warning(
+                            self, "节点生成失败", public_generation_error(error))
         finished_video_groups = []
         finished_qc_sources = []
         finished_qc_groups = []
@@ -17442,6 +17723,12 @@ class ProductionCanvasTab(QWidget):
 
     def delete_canvas_selection(self):
         """画布对象一律可删；只删除项目引用，不删除本地媒体文件。"""
+        selected_groups = [item for item in self.scene.selectedItems()
+                           if isinstance(item, CanvasGroupFrameItem)]
+        if selected_groups:
+            for group in selected_groups:
+                self.dissolve_canvas_group(group.group_id)
+            return
         nodes = [item for item in self.scene.selectedItems()
                  if isinstance(item, CanvasNodeItem)]
         if not nodes:
@@ -17579,6 +17866,15 @@ class ProductionCanvasTab(QWidget):
                 continue
             record["group_nodes"] = [value for value in record.get("group_nodes", [])
                                      if str(value) not in removed_ids]
+        retained_canvas_groups = []
+        for record in positions.get("__canvas_groups__", []):
+            if not isinstance(record, dict):
+                continue
+            record["group_nodes"] = [value for value in record.get("group_nodes", [])
+                                     if str(value) not in removed_ids]
+            if len(record["group_nodes"]) >= 2:
+                retained_canvas_groups.append(record)
+        positions["__canvas_groups__"] = retained_canvas_groups
         positions["__production_batches__"] = [batch for batch in
             positions.get("__production_batches__", []) if not (
                 isinstance(batch, dict) and str(batch.get("group_id") or "") in removed_ids)]
@@ -19649,8 +19945,11 @@ class ProductionCanvasTab(QWidget):
             menu.addAction("打开", lambda: self.activate_node(node))
         selected_nodes = [item for item in self.scene.selectedItems()
                           if isinstance(item, CanvasNodeItem)]
+        menu.addSeparator()
+        menu.addAction("局部聚焦",
+                       lambda _=False, value=node.node_id:
+                       self.focus_canvas_branch(value))
         if len(selected_nodes) >= 2:
-            menu.addSeparator()
             ordered_nodes = [node] + [value for value in selected_nodes if value is not node]
             grouped_paths = self._selected_asset_image_paths(ordered_nodes)
             if len(grouped_paths) >= 2:
@@ -19658,7 +19957,9 @@ class ProductionCanvasTab(QWidget):
                     f"合并保存为一个资产…（{len(grouped_paths)} 张）",
                     lambda _=False, values=ordered_nodes:
                     self.save_selected_images_as_asset(values))
-            menu.addAction("将选中节点建立工作流组", self.create_workflow_group)
+            menu.addAction("组成画布分组（不改变执行关系）",
+                           self.create_canvas_group)
+            menu.addAction("建立可执行工作流组", self.create_workflow_group)
         if node.node_type == "workflow_group":
             menu.addSeparator()
             menu.addAction("整组执行", lambda: self.execute_workflow_group(node))
@@ -20870,6 +21171,268 @@ class ProductionCanvasTab(QWidget):
         node.setSelected(True)
         self.view.centerOn(node)
 
+    def focus_navigator_item(self, item_id):
+        group = self._canvas_groups.get(str(item_id))
+        if group is None:
+            self.focus_node(item_id)
+            return
+        self.scene.clearSelection()
+        group.setSelected(True)
+        self.view.centerOn(group)
+
+    def open_canvas_search(self):
+        self.toggle_asset_library(True)
+        self.navigator_panel.tabs.setCurrentIndex(0)
+        self.navigator_panel.search.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.navigator_panel.search.selectAll()
+
+    def _fit_node_ids(self, node_ids):
+        items = [self._nodes.get(str(node_id)) for node_id in node_ids]
+        items = [item for item in items if item is not None and item.isVisible()]
+        if not items:
+            return
+        rect = QRectF(items[0].sceneBoundingRect())
+        for item in items[1:]:
+            rect = rect.united(item.sceneBoundingRect())
+        rect.adjust(-80, -80, 80, 80)
+        self.view.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
+        if self.view.transform().m11() > 1.0:
+            self.view.set_zoom(1.0, keep_center=True)
+        else:
+            self.view.zoomChanged.emit(int(round(self.view.transform().m11() * 100)))
+
+    def _branch_scope_node_ids(self, node_id):
+        node_id = str(node_id or "")
+        group = self._canvas_groups.get(node_id)
+        if group is not None:
+            return {node_id, *group.member_ids}
+        if node_id not in self._nodes:
+            return set()
+        incoming, outgoing = {}, {}
+        for edge in self.scene.edges:
+            source_id = str(edge.source.node_id)
+            target_id = str(edge.target.node_id)
+            incoming.setdefault(target_id, []).append(source_id)
+            outgoing.setdefault(source_id, []).append(target_id)
+        scope = {node_id}
+        # Walk each direction independently. A shared ancestor must not pull a
+        # sibling branch into the focused view.
+        for adjacency in (incoming, outgoing):
+            queue = [node_id]
+            visited = {node_id}
+            while queue:
+                current = queue.pop(0)
+                for target in adjacency.get(current, []):
+                    if target in visited:
+                        continue
+                    visited.add(target)
+                    scope.add(target)
+                    queue.append(target)
+        for value in self._canvas_groups.values():
+            if any(member_id in scope for member_id in value.member_ids):
+                scope.add(value.group_id)
+        return scope
+
+    def focus_canvas_branch(self, node_id):
+        scope = self._branch_scope_node_ids(node_id)
+        if not scope:
+            return False
+        self._focused_node_ids = set(scope)
+        self._apply_visibility()
+        self.scene.clearSelection()
+        if node_id in self._nodes:
+            self._nodes[node_id].setSelected(True)
+        elif node_id in self._canvas_groups:
+            self._canvas_groups[node_id].setSelected(True)
+        self.clear_focus_button.setVisible(True)
+        group = self._canvas_groups.get(str(node_id))
+        targets = group.member_ids if group and not group.collapsed else [node_id]
+        self._fit_node_ids(targets)
+        return True
+
+    def focus_selected_canvas_branch(self):
+        selected_groups = [item for item in self.scene.selectedItems()
+                           if isinstance(item, CanvasGroupFrameItem)]
+        if selected_groups:
+            return self.focus_canvas_branch(selected_groups[0].group_id)
+        selected = [item for item in self.scene.selectedItems()
+                    if isinstance(item, CanvasNodeItem)]
+        return self.focus_canvas_branch(selected[0].node_id) if len(selected) == 1 else False
+
+    def clear_canvas_focus(self):
+        if not self._focused_node_ids:
+            return
+        self._focused_node_ids.clear()
+        self._apply_visibility()
+        self.clear_focus_button.hide()
+        self.view.fit_nodes()
+
+    def _canvas_group_for_member(self, node_id):
+        return next((group for group in self._canvas_groups.values()
+                     if str(node_id) in group.member_ids), None)
+
+    def create_canvas_group(self):
+        import uuid
+        selected = [item for item in self.scene.selectedItems()
+                    if isinstance(item, CanvasNodeItem)]
+        if len(selected) < 2:
+            QMessageBox.information(self, "创建节点分组", "请先框选至少两个节点。")
+            return False
+        occupied = next((self._canvas_group_for_member(item.node_id)
+                         for item in selected
+                         if self._canvas_group_for_member(item.node_id)), None)
+        if occupied is not None:
+            QMessageBox.information(
+                self, "创建节点分组",
+                f"选中的节点已有属于“{occupied.record.get('group_name') or '节点分组'}”的成员，"
+                "请先解散原分组。")
+            return False
+        default_name = f"分组 {len(self._canvas_group_records()) + 1}"
+        name, accepted = QInputDialog.getText(
+            self, "创建节点分组", "分组名称：", text=default_name)
+        if not accepted or not name.strip():
+            return False
+        branch, accepted = QInputDialog.getText(
+            self, "分支命名", "分支名称（可留空）：")
+        if not accepted:
+            return False
+        group_id = f"canvas-group:{uuid.uuid4().hex[:12]}"
+        self._canvas_group_records().append({
+            "id": group_id,
+            "canvas_group": True,
+            "group_name": name.strip(),
+            "branch_name": branch.strip(),
+            "group_nodes": [item.node_id for item in selected],
+            "collapsed": False,
+        })
+        self._save_layout_now()
+        self.refresh()
+        group = self._canvas_groups.get(group_id)
+        if group is not None:
+            self.scene.clearSelection()
+            group.setSelected(True)
+            self._fit_node_ids(group.member_ids)
+        return True
+
+    def edit_canvas_group(self, group_id):
+        group = self._canvas_groups.get(str(group_id))
+        if group is None:
+            return False
+        record = group.record
+        name, accepted = QInputDialog.getText(
+            self, "分组与分支命名", "分组名称：",
+            text=str(record.get("group_name") or "节点分组"))
+        if not accepted or not name.strip():
+            return False
+        branch, accepted = QInputDialog.getText(
+            self, "分组与分支命名", "分支名称（可留空）：",
+            text=str(record.get("branch_name") or ""))
+        if not accepted:
+            return False
+        record["group_name"] = name.strip()
+        record["branch_name"] = branch.strip()
+        group.update()
+        self._save_layout_now()
+        if hasattr(self, "navigator_panel"):
+            self.navigator_panel.refresh_outline()
+        return True
+
+    def toggle_canvas_group(self, group_id):
+        group = self._canvas_groups.get(str(group_id))
+        if group is None:
+            return False
+        group.record["collapsed"] = not group.collapsed
+        self.scene.clearSelection()
+        self._apply_visibility()
+        group.sync_geometry()
+        group.setSelected(True)
+        self._save_layout_now()
+        if group.collapsed:
+            self.view.centerOn(group)
+        else:
+            self._fit_node_ids(group.member_ids)
+        return True
+
+    def dissolve_canvas_group(self, group_id):
+        group_id = str(group_id or "")
+        groups = self._canvas_group_records()
+        retained = [value for value in groups if not (
+            isinstance(value, dict) and str(value.get("id") or "") == group_id)]
+        if len(retained) == len(groups):
+            return False
+        self._positions()["__canvas_groups__"] = retained
+        self._focused_node_ids.discard(group_id)
+        self._save_layout_now()
+        self.refresh()
+        return True
+
+    def duplicate_canvas_group(self, group_id):
+        import uuid
+        group = self._canvas_groups.get(str(group_id))
+        if group is None:
+            return False
+        originals = [self._nodes.get(node_id) for node_id in group.member_ids]
+        originals = [node for node in originals if node is not None]
+        if not originals or any(not node.payload.get("custom") for node in originals):
+            QMessageBox.information(
+                self, "复制整组",
+                "包含镜头或资产库节点的分组不能复制；这些节点对应工程权威数据。"
+                "纯文本、图片、视频和音频创作节点组成的分组可以整组复制。")
+            return False
+        mapping = {}
+        values = self._positions().setdefault("__custom_nodes__", [])
+        for node in originals:
+            source = self._custom_record(node.node_id)
+            if source is None:
+                continue
+            duplicate = json.loads(json.dumps(source, ensure_ascii=False))
+            new_id = f"custom:{uuid.uuid4().hex[:12]}"
+            duplicate["id"] = new_id
+            duplicate["title"] = f"{source.get('title') or '节点'} 副本"
+            values.append(duplicate)
+            self._positions()[new_id] = [round(node.pos().x() + 62.0, 2),
+                                         round(node.pos().y() + 62.0, 2)]
+            mapping[node.node_id] = new_id
+        for edge in list(self._positions().get("__workflow_edges__", [])):
+            if not isinstance(edge, dict):
+                continue
+            if edge.get("source") in mapping and edge.get("target") in mapping:
+                self._positions().setdefault("__workflow_edges__", []).append({
+                    **edge,
+                    "source": mapping[edge["source"]],
+                    "target": mapping[edge["target"]],
+                })
+        new_group_id = f"canvas-group:{uuid.uuid4().hex[:12]}"
+        self._canvas_group_records().append({
+            **json.loads(json.dumps(group.record, ensure_ascii=False)),
+            "id": new_group_id,
+            "group_name": f"{group.record.get('group_name') or '节点分组'} 副本",
+            "group_nodes": [mapping[value] for value in group.member_ids if value in mapping],
+            "collapsed": False,
+        })
+        self._save_layout_now()
+        self.refresh()
+        clone = self._canvas_groups.get(new_group_id)
+        if clone is not None:
+            clone.setSelected(True)
+            self._fit_node_ids(clone.member_ids)
+        return True
+
+    def show_canvas_group_context_menu(self, group, screen_pos):
+        self.scene.clearSelection()
+        group.setSelected(True)
+        menu = QMenu(self)
+        self._style_popup_menu(menu)
+        menu.addAction("局部聚焦", lambda: self.focus_canvas_branch(group.group_id))
+        menu.addAction("复制整组", lambda: self.duplicate_canvas_group(group.group_id))
+        menu.addAction("分组与分支命名…", lambda: self.edit_canvas_group(group.group_id))
+        menu.addAction("展开成员" if group.collapsed else "折叠成员",
+                       lambda: self.toggle_canvas_group(group.group_id))
+        menu.addSeparator()
+        menu.addAction("解散分组（保留节点和连线）",
+                       lambda: self.dissolve_canvas_group(group.group_id))
+        menu.exec(screen_pos)
+
     def focus_kind(self, kind=""):
         mapping = {"prompt": "all", "": "all"}
         kind = mapping.get(kind, kind)
@@ -20897,18 +21460,180 @@ class ProductionCanvasTab(QWidget):
     def _apply_visibility(self):
         query = self.search_edit.text().strip().casefold() if hasattr(self, "search_edit") else ""
         mode = self._active_filter
+        collapsed_members = {
+            node_id for group in self._canvas_groups.values() if group.collapsed
+            for node_id in group.member_ids}
         for node in self._nodes.values():
             category = ("take" if node.node_type in (
                 "asset_view", "asset_take", "shot_take", "generation_task") else node.node_type)
             type_ok = mode == "all" or category == mode
-            text_ok = not query or query in f"{node.title} {node.subtitle}".casefold()
-            node.setVisible(type_ok and text_ok)
+            payload_text = " ".join(str(node.payload.get(key) or "") for key in (
+                "branch_name", "group_name", "product_name", "product_description",
+                "editor_action", "provider_name", "model", "asset_kind"))
+            haystack = f"{node.title} {node.subtitle} {payload_text}".casefold()
+            text_ok = not query or all(term in haystack for term in query.split())
+            focus_ok = not self._focused_node_ids or node.node_id in self._focused_node_ids
+            node.setVisible(type_ok and text_ok and focus_ok and
+                            node.node_id not in collapsed_members)
+        for group in self._canvas_groups.values():
+            group_text = " ".join(str(group.record.get(key) or "") for key in (
+                "group_name", "branch_name"))
+            text_ok = not query or all(
+                term in group_text.casefold() for term in query.split())
+            focus_ok = (not self._focused_node_ids or
+                        group.group_id in self._focused_node_ids or
+                        any(value in self._focused_node_ids
+                            for value in group.member_ids))
+            group.setVisible(text_ok and focus_ok)
+            if group.isVisible():
+                group.sync_geometry()
         for edge in self.scene.edges:
             edge.setVisible(edge.source.isVisible() and edge.target.isVisible())
 
+    def _auto_layout_selected_region(self, nodes):
+        """Arrange selected workflows without disturbing the rest of the canvas."""
+        nodes = list(nodes)
+        if len(nodes) < 2:
+            return False
+        by_id = {node.node_id: node for node in nodes}
+        outgoing = {node_id: [] for node_id in by_id}
+        incoming = {node_id: [] for node_id in by_id}
+        neighbours = {node_id: set() for node_id in by_id}
+        for edge in self.scene.edges:
+            source_id, target_id = edge.source.node_id, edge.target.node_id
+            if (source_id not in by_id or target_id not in by_id or
+                    source_id == target_id):
+                continue
+            outgoing[source_id].append(target_id)
+            incoming[target_id].append(source_id)
+            neighbours[source_id].add(target_id)
+            neighbours[target_id].add(source_id)
+
+        def canvas_order(node_id):
+            node = by_id[node_id]
+            return node.pos().y(), node.pos().x(), str(node_id)
+
+        unseen = set(by_id)
+        components = []
+        for start in sorted(by_id, key=canvas_order):
+            if start not in unseen:
+                continue
+            unseen.remove(start)
+            component, queue = [], [start]
+            while queue:
+                node_id = queue.pop(0)
+                component.append(node_id)
+                for target_id in sorted(neighbours[node_id], key=canvas_order):
+                    if target_id in unseen:
+                        unseen.remove(target_id)
+                        queue.append(target_id)
+            components.append(component)
+
+        origin_x = min(node.pos().x() for node in nodes)
+        component_y = min(node.pos().y() for node in nodes)
+        column_pitch, horizontal_gap = 390.0, 110.0
+        vertical_gap, component_gap = 90.0, 170.0
+        max_grid_columns = 4
+        positions = {}
+        connected = [value for value in components if len(value) > 1]
+        isolated = [node_id for value in components if len(value) == 1
+                    for node_id in value]
+        for component in connected:
+            component_ids = set(component)
+            indegree = {
+                node_id: len([value for value in incoming[node_id]
+                              if value in component_ids])
+                for node_id in component}
+            layers = {}
+            queue = sorted(
+                [node_id for node_id in component if indegree[node_id] == 0],
+                key=canvas_order)
+            for node_id in queue:
+                layers[node_id] = 0
+            while queue:
+                node_id = queue.pop(0)
+                layer = layers.get(node_id, 0)
+                for target_id in outgoing[node_id]:
+                    if target_id not in component_ids:
+                        continue
+                    layers[target_id] = max(layers.get(target_id, 0), layer + 1)
+                    indegree[target_id] -= 1
+                    if indegree[target_id] == 0:
+                        queue.append(target_id)
+                queue.sort(key=canvas_order)
+            for node_id in sorted(component, key=canvas_order):
+                if node_id not in layers:
+                    predecessor_layers = [layers[value] for value in incoming[node_id]
+                                          if value in layers]
+                    layers[node_id] = (max(predecessor_layers) + 1
+                                       if predecessor_layers else 0)
+            layer_groups = {}
+            for node_id in component:
+                layer_groups.setdefault(layers[node_id], []).append(node_id)
+            packed = []
+            for layer in sorted(layer_groups):
+                ids = sorted(layer_groups[layer], key=canvas_order)
+                columns = min(max_grid_columns, len(ids))
+                rows = (len(ids) + columns - 1) // columns
+                row_heights = []
+                for row in range(rows):
+                    row_ids = ids[row * columns:(row + 1) * columns]
+                    row_heights.append(max(by_id[value].height for value in row_ids))
+                height = sum(row_heights) + vertical_gap * max(0, rows - 1)
+                width = max(330.0, columns * column_pitch - 60.0)
+                packed.append((ids, columns, row_heights, width, height))
+            component_height = max([230.0] + [value[4] for value in packed])
+            layer_x = origin_x
+            for ids, columns, row_heights, width, height in packed:
+                row_y = component_y + (component_height - height) / 2.0
+                for row, row_height in enumerate(row_heights):
+                    row_ids = ids[row * columns:(row + 1) * columns]
+                    row_width = max(330.0, len(row_ids) * column_pitch - 60.0)
+                    row_left = layer_x + (width - row_width) / 2.0
+                    for column, node_id in enumerate(row_ids):
+                        positions[node_id] = [row_left + column * column_pitch, row_y]
+                    row_y += row_height + vertical_gap
+                layer_x += width + horizontal_gap
+            component_y += component_height + component_gap
+        if isolated:
+            isolated.sort(key=canvas_order)
+            columns = min(max_grid_columns, len(isolated))
+            for start in range(0, len(isolated), columns):
+                row_ids = isolated[start:start + columns]
+                row_height = max(by_id[value].height for value in row_ids)
+                for column, node_id in enumerate(row_ids):
+                    positions[node_id] = [origin_x + column * column_pitch, component_y]
+                component_y += row_height + vertical_gap
+        before = {node.node_id: [round(node.pos().x(), 2), round(node.pos().y(), 2)]
+                  for node in nodes}
+        after = {node_id: [round(value[0], 2), round(value[1], 2)]
+                 for node_id, value in positions.items()}
+        if not after or before == after:
+            return False
+        self._apply_node_positions(after)
+        self._position_undo.append({
+            "serial": self._next_canvas_action_serial(),
+            "before": before,
+            "after": after,
+        })
+        self._position_undo = self._position_undo[-100:]
+        self._position_redo.clear()
+        self._save_layout_now()
+        self._fit_node_ids(after)
+        return True
+
     def auto_layout(self):
         self.hide_inline_editor()
-        nodes = list(self._nodes.values())
+        selected = [item for item in self.scene.selectedItems()
+                    if isinstance(item, CanvasNodeItem)]
+        if len(selected) > 1:
+            self._auto_layout_selected_region(selected)
+            return
+        grouped_members = {
+            node_id for group in self._canvas_groups.values()
+            for node_id in group.member_ids}
+        nodes = [node for node in self._nodes.values()
+                 if node.node_id not in grouped_members]
         indegree = {node.node_id: 0 for node in nodes}
         outgoing = {node.node_id: [] for node in nodes}
         for edge in self.scene.edges:

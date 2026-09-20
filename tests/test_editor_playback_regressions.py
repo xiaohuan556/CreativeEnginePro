@@ -1,9 +1,11 @@
 import os
+import array
 import subprocess
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -15,6 +17,7 @@ try:
     from core.edit_engine import (
         EditTimeline,
         FFmpegDirectExportWorker,
+        AudioClip,
         SubtitleBlock,
         VideoClip,
     )
@@ -280,6 +283,20 @@ class ComplexSubtitleAudioExportTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def _assert_export_has_visible_blue_frame(self, ffmpeg, output):
+        decoded_video = subprocess.run([
+            ffmpeg, "-v", "error", "-ss", "0.25", "-i", output,
+            "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+        ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+        self.assertEqual(0, decoded_video.returncode, decoded_video.stderr.decode("utf-8", "replace"))
+        self.assertEqual(160 * 90 * 3, len(decoded_video.stdout))
+        rgb = decoded_video.stdout
+        red = sum(rgb[0::3]) / (160 * 90)
+        green = sum(rgb[1::3]) / (160 * 90)
+        blue = sum(rgb[2::3]) / (160 * 90)
+        self.assertGreater(blue, 80, f"exported video is black: RGB=({red:.1f}, {green:.1f}, {blue:.1f})")
+        self.assertGreater(blue, red * 2)
+
     def test_word_animated_subtitle_export_retains_audio_stream(self):
         ffmpeg = get_ffmpeg_path()
         if not ffmpeg or not os.path.exists(ffmpeg):
@@ -324,6 +341,188 @@ class ComplexSubtitleAudioExportTests(unittest.TestCase):
             self.assertEqual(0, decoded_audio.returncode)
             self.assertTrue(decoded_audio.stdout)
             self.assertTrue(any(decoded_audio.stdout), "exported audio is digital silence")
+
+            self._assert_export_has_visible_blue_frame(ffmpeg, output)
+
+    def test_direct_export_has_visible_video_frame(self):
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg or not os.path.exists(ffmpeg):
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = str(Path(directory) / "source.mp4")
+            output = str(Path(directory) / "output.mp4")
+            generated = subprocess.run([
+                ffmpeg, "-y", "-f", "lavfi", "-i",
+                "color=c=blue:s=160x90:r=12:d=0.6",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", source,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            self.assertEqual(0, generated.returncode)
+
+            timeline = EditTimeline()
+            timeline.add_video_clip(VideoClip(
+                source_path=source, source_duration=0.6,
+                trim_start=0.0, trim_end=0.6, timeline_start=0.0,
+            ))
+            worker = FFmpegDirectExportWorker(
+                timeline, output, (160, 90), fps=12.0)
+            results = []
+            worker.finished.connect(lambda ok, value: results.append((ok, value)))
+
+            worker._do_export()
+
+            self.assertTrue(results, "export worker did not emit a result")
+            self.assertTrue(results[-1][0], results[-1][1])
+            self._assert_export_has_visible_blue_frame(ffmpeg, output)
+
+    def test_compositor_falls_back_to_ffmpeg_when_opencv_decode_fails(self):
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg or not os.path.exists(ffmpeg):
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = str(Path(directory) / "source.mp4")
+            output = str(Path(directory) / "output.mp4")
+            generated = subprocess.run([
+                ffmpeg, "-y", "-f", "lavfi", "-i",
+                "color=c=blue:s=160x90:r=12:d=0.6",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", source,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            self.assertEqual(0, generated.returncode)
+
+            timeline = EditTimeline()
+            timeline.add_video_clip(VideoClip(
+                source_path=source, source_duration=0.6,
+                trim_start=0.0, trim_end=0.6, timeline_start=0.0,
+            ))
+            # 复杂字幕强制进入 compositor；模拟连续导出多条 HEVC 后 OpenCV
+            # 无法再分配解码器，画面应由 FFmpeg 管道兜底而不是写入黑帧。
+            timeline.add_subtitle(SubtitleBlock(
+                text="描边字幕", timeline_start=0.0, timeline_end=0.6,
+                outline_width=2,
+            ))
+            worker = FFmpegDirectExportWorker(
+                timeline, output, (160, 90), fps=12.0)
+            results = []
+            worker.finished.connect(lambda ok, value: results.append((ok, value)))
+
+            with patch("core.clip_decoder.DecoderManager.get", return_value=None):
+                worker._do_export()
+
+            self.assertTrue(results, "export worker did not emit a result")
+            self.assertTrue(results[-1][0], results[-1][1])
+            self._assert_export_has_visible_blue_frame(ffmpeg, output)
+
+    def test_video_export_rejects_timeline_without_visible_video(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = str(Path(directory) / "should_not_exist.mp4")
+            timeline = EditTimeline()
+            timeline.add_subtitle(SubtitleBlock(
+                text="only subtitle", timeline_start=0.0, timeline_end=1.0,
+            ))
+            worker = FFmpegDirectExportWorker(
+                timeline, output, (160, 90), fps=12.0)
+            results = []
+            worker.finished.connect(lambda ok, value: results.append((ok, value)))
+
+            worker._do_export()
+
+            self.assertTrue(results)
+            self.assertFalse(results[-1][0])
+            self.assertIn("没有可导出的视频画面", results[-1][1])
+            self.assertFalse(os.path.exists(output))
+
+    def test_audio_mix_keeps_requested_gain_and_repeated_source_clips(self):
+        timeline = EditTimeline()
+        first = AudioClip(
+            source_path="same.wav", source_duration=1.0,
+            trim_start=0.0, trim_end=1.0, timeline_start=0.0,
+            volume=1.8,
+        )
+        second = AudioClip(
+            source_path="same.wav", source_duration=1.0,
+            trim_start=0.0, trim_end=1.0, timeline_start=1.0,
+            volume=1.8,
+        )
+        worker = FFmpegDirectExportWorker(
+            timeline, "unused.mp4", (160, 90), fps=12.0)
+        parts, label = worker._build_audio_graph([
+            {"input_idx": 0, "clip": first, "from_video": False,
+             "playback_dur": 1.0},
+            {"input_idx": 0, "clip": second, "from_video": False,
+             "playback_dur": 1.0},
+        ], 2.0)
+        graph = ";".join(parts)
+
+        self.assertEqual("aout", label)
+        self.assertIn("[0:a]asplit=2[asrc0_0][asrc0_1]", graph)
+        self.assertEqual(2, graph.count("volume=1.8000"))
+        self.assertIn("normalize=0", graph)
+        self.assertIn("dropout_transition=0", graph)
+
+    def test_exported_sequential_audio_clips_keep_even_loudness(self):
+        ffmpeg = get_ffmpeg_path()
+        if not ffmpeg or not os.path.exists(ffmpeg):
+            self.skipTest("FFmpeg is not available")
+
+        with tempfile.TemporaryDirectory() as directory:
+            source_video = str(Path(directory) / "video.mp4")
+            source_audio = str(Path(directory) / "tone.wav")
+            output = str(Path(directory) / "output.mp4")
+            video_result = subprocess.run([
+                ffmpeg, "-y", "-f", "lavfi", "-i",
+                "color=c=blue:s=160x90:r=12:d=1.2",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", source_video,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            audio_result = subprocess.run([
+                ffmpeg, "-y", "-f", "lavfi", "-i",
+                "sine=frequency=660:sample_rate=44100:duration=0.6",
+                "-c:a", "pcm_s16le", source_audio,
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=30)
+            self.assertEqual(0, video_result.returncode)
+            self.assertEqual(0, audio_result.returncode)
+
+            timeline = EditTimeline()
+            timeline.add_video_clip(VideoClip(
+                source_path=source_video, source_duration=1.2,
+                trim_start=0.0, trim_end=1.2, timeline_start=0.0,
+            ))
+            for start in (0.0, 0.6):
+                timeline.add_audio_clip(AudioClip(
+                    source_path=source_audio, source_duration=0.6,
+                    trim_start=0.0, trim_end=0.6, timeline_start=start,
+                    volume=1.5,
+                ))
+            worker = FFmpegDirectExportWorker(
+                timeline, output, (160, 90), fps=12.0)
+            results = []
+            worker.finished.connect(lambda ok, value: results.append((ok, value)))
+
+            worker._do_export()
+
+            self.assertTrue(results)
+            self.assertTrue(results[-1][0], results[-1][1])
+            decoded = subprocess.run([
+                ffmpeg, "-v", "error", "-i", output,
+                "-map", "0:a:0", "-ac", "1", "-ar", "44100",
+                "-f", "s16le", "-",
+            ], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            self.assertEqual(0, decoded.returncode)
+            samples = array.array("h")
+            samples.frombytes(decoded.stdout)
+
+            def mean_abs(start_sec, end_sec):
+                start = int(start_sec * 44100)
+                end = min(len(samples), int(end_sec * 44100))
+                return sum(abs(value) for value in samples[start:end]) / max(1, end - start)
+
+            first_level = mean_abs(0.15, 0.45)
+            second_level = mean_abs(0.75, 1.05)
+            self.assertGreater(first_level, 500)
+            self.assertGreater(second_level, 500)
+            ratio = max(first_level, second_level) / min(first_level, second_level)
+            self.assertLess(ratio, 1.15,
+                            f"audio level changes near the end: {first_level:.1f} vs {second_level:.1f}")
 
 
 if __name__ == "__main__":

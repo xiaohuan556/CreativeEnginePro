@@ -1,7 +1,9 @@
 param(
     [ValidateSet("Start", "Stop", "Status")]
     [string]$Action = "Start",
-    [string]$PythonExe = ""
+    [string]$PythonExe = "",
+    [ValidateRange(0, 65535)]
+    [int]$Port = 0
 )
 
 $ErrorActionPreference = "Stop"
@@ -10,6 +12,27 @@ $runtimeDir = Join-Path $projectRoot "local_server_data"
 $logDir = Join-Path $runtimeDir "logs"
 $mediaDir = Join-Path $runtimeDir "media"
 $pidFile = Join-Path $runtimeDir "processes.json"
+
+function Resolve-ServerPort {
+    if ($Port -gt 0) { return $Port }
+    $configPath = Join-Path $projectRoot "packaging.config.json"
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        $configName = [string]([char]0x6253) + [char]0x5305 + [char]0x914D + [char]0x7F6E + ".json"
+        $configPath = Get-ChildItem -LiteralPath $projectRoot -Filter "*.json" |
+            Where-Object { $_.Name -eq $configName } |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+    if ($configPath -and (Test-Path -LiteralPath $configPath)) {
+        try {
+            $value = (Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 |
+                ConvertFrom-Json).server_port
+            if ([int]$value -ge 1 -and [int]$value -le 65535) { return [int]$value }
+        } catch { }
+    }
+    return 8765
+}
+
+$serverPort = Resolve-ServerPort
 
 function Find-Python {
     if ($PythonExe) { return (Resolve-Path -LiteralPath $PythonExe).Path }
@@ -90,12 +113,12 @@ if ($python -eq (Join-Path $venvRoot "Scripts\python.exe")) {
 }
 $databasePath = (Join-Path $runtimeDir "creative_engine_server.db").Replace("\", "/")
 $env:CEP_DATABASE_URL = "sqlite:///$databasePath"
-$env:CEP_PUBLIC_ORIGIN = "http://127.0.0.1:8000"
+$env:CEP_PUBLIC_ORIGIN = "http://127.0.0.1:$serverPort"
 $env:CEP_STORAGE_DIR = $mediaDir
 if (-not $env:PYTHONPATH) { $env:PYTHONPATH = "$projectRoot;$projectRoot\server" }
 
 $api = Start-Process -FilePath $python -ArgumentList @(
-    "-m", "uvicorn", "creative_server.main:app", "--host", "0.0.0.0", "--port", "8000"
+    "-m", "uvicorn", "creative_server.main:app", "--host", "0.0.0.0", "--port", "$serverPort"
 ) -WorkingDirectory $projectRoot -PassThru -WindowStyle Hidden `
     -RedirectStandardOutput (Join-Path $logDir "api.out.log") `
     -RedirectStandardError (Join-Path $logDir "api.err.log")
@@ -112,7 +135,7 @@ do {
     Start-Sleep -Milliseconds 500
     try {
         $socket = New-Object Net.Sockets.TcpClient
-        $attempt = $socket.BeginConnect("127.0.0.1", 8000, $null, $null)
+        $attempt = $socket.BeginConnect("127.0.0.1", $serverPort, $null, $null)
         if ($attempt.AsyncWaitHandle.WaitOne(1500)) {
             $socket.EndConnect($attempt)
             $ready = $socket.Connected
@@ -134,6 +157,6 @@ $state = [ordered]@{
 [IO.File]::WriteAllText($pidFile, ($state | ConvertTo-Json), (New-Object Text.UTF8Encoding($false)))
 
 Write-Host "Local account and task server started." -ForegroundColor Green
-Write-Host "Local API: http://127.0.0.1:8000"
-Write-Host "LAN API: http://10.13.12.67:8000"
+Write-Host "Local API: http://127.0.0.1:$serverPort"
+Write-Host "LAN API port: $serverPort"
 Write-Host "Data: $runtimeDir"

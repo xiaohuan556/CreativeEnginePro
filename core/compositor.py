@@ -59,6 +59,9 @@ class VideoCompositor:
         # 叠加轨独立解码器池：id(clip) -> ClipDecoder（同文件多轨道分离 cap）
         self._overlay_decoders: dict = {}
         self._clip_src_cache: dict = {}
+        # OpenCV 在连续处理多条 HEVC 时间线时可能因解码器资源不足而返回空帧。
+        # 导出不能把空帧静默替换成黑色，因此为每个片段准备独立 FFmpeg 连续管道兜底。
+        self._ffmpeg_fallback_readers: dict = {}
 
     def _clip_opacity(self, clip, sec: float, default: float = 1.0) -> float:
         """返回片段不透明度（含关键帧插值）。
@@ -412,24 +415,45 @@ class VideoCompositor:
 
     def _extract_with_decoder(self, clip, sec: float) -> Optional[QImage]:
         """使用状态机解码器提取帧（连续 read，无逐帧 seek）。"""
-        import cv2
         src_sec = clip.trim_start + (sec - clip.timeline_start) * clip.speed
         dec = self._decoders.get(clip)
-        if dec is None:
-            return None
-        res = dec.request(src_sec, "playing", ahead_frames=0)
-        if res is None:
-            return None
-        frame_rgb, w, h = res
-        # frame_rgb 可能是 RGB 或 RGBA
-        if frame_rgb.shape[2] == 4:
-            bytes_per_line = 4 * w
-            return QImage(frame_rgb.data, w, h, bytes_per_line,
+        if dec is not None:
+            res = dec.request(src_sec, "playing", ahead_frames=0)
+            if res is not None:
+                frame_rgb, w, h = res
+                # frame_rgb 可能是 RGB 或 RGBA
+                if frame_rgb.shape[2] == 4:
+                    bytes_per_line = 4 * w
+                    return QImage(frame_rgb.data, w, h, bytes_per_line,
+                                  QImage.Format.Format_RGBA8888).copy()
+                bytes_per_line = 3 * w
+                return QImage(frame_rgb.data, w, h, bytes_per_line,
+                              QImage.Format.Format_RGB888).copy()
+
+        # OpenCV 无法打开/读取（常见于连续多条 HEVC 时间线）时，改走 FFmpeg
+        # 持久 rawvideo 管道。每个 clip 独立 reader，重复素材的不同时间位置不会互相 seek。
+        try:
+            import cv2
+            from utils.alpha_video import AlphaVideoPipeReader
+            clip_id = id(clip)
+            reader = self._ffmpeg_fallback_readers.get(clip_id)
+            if reader is None:
+                reader = AlphaVideoPipeReader(clip.source_path)
+                if reader._w <= 0 or reader._h <= 0:
+                    reader.close()
+                    return None
+                self._ffmpeg_fallback_readers[clip_id] = reader
+            bgra = reader.read_frame(src_sec)
+            if bgra is None:
+                return None
+            rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+            h, w = rgba.shape[:2]
+            return QImage(rgba.data, w, h, w * 4,
                           QImage.Format.Format_RGBA8888).copy()
-        else:
-            bytes_per_line = 3 * w
-            return QImage(frame_rgb.data, w, h, bytes_per_line,
-                          QImage.Format.Format_RGB888).copy()
+        except Exception:
+            logging.warning("FFmpeg fallback decoder failed: %s @ %.3f",
+                            clip.source_path, src_sec, exc_info=True)
+            return None
 
     def _release_decoders(self):
         """释放所有解码器。"""
@@ -447,13 +471,12 @@ class VideoCompositor:
     def close(self):
         """释放所有资源"""
         self._release_decoders()
-        for cap in list(self._cap_cache.values()):
+        for reader in list(self._ffmpeg_fallback_readers.values()):
             try:
-                cap.release()
+                reader.close()
             except Exception:
                 pass
-        self._cap_cache.clear()
-        self._cap_cache_order.clear()
+        self._ffmpeg_fallback_readers.clear()
 
     def _load_image_frame(self, path: str) -> Optional[QImage]:
         """加载图片帧（保留 alpha 通道）"""

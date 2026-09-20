@@ -97,7 +97,8 @@ if ($splashSource -notmatch "font actual TkDefaultFont" -or
         $splashSource -notmatch "wm overrideredirect \. 1" -or
         $splashSource -notmatch "progress_fill" -or
         $splashSource -notmatch "__CEP_READY__" -or
-        $splashSource -notmatch "splash_monitor_x" -or
+        $splashSource -notmatch "splash_primary_center" -or
+        $splashSource -match "winfo pointerx" -or
         $splashSource -match 'itemconfigure \$tag -text \$var') {
     throw "Startup splash validation failed; refusing to publish a blank Tk window."
 }

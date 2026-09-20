@@ -1012,8 +1012,8 @@ class EditTimeline(QObject):
     # ─── 关闭删除后空隙 ───
     def _close_gap_on_track(self, kind: str, track_idx: int,
                             removed_start: float, removed_end: float):
-        """删除片段后收缩轨道：removed_start 之后的所有片段左移"""
-        if not self.auto_align:
+        """删除片段后收缩视频轨；音频和字幕不受自动磁吸影响。"""
+        if not self.auto_align or kind != "video":
             return
         gap = removed_end - removed_start
         if gap <= 0.001:
@@ -1026,14 +1026,15 @@ class EditTimeline(QObject):
         """
         在指定轨道的 start 位置插入一段时长 duration 的片段。
         - 如果该位置无重叠 → 直接返回 start
-        - 如果 auto_align=ON → 将后段右移 duration，返回 start
+        - 视频且 auto_align=ON → 将后段右移 duration，返回 start
+        - 音频/字幕不受 auto_align 影响
         - 如果 auto_align=OFF → 返回 start 后的第一个可用空隙
         返回实际可用的 timeline_start
         """
         clips = self._get_track_clips(kind, track_idx)
         if not self._overlap_idx(clips, start, start + duration):
             return start  # 空闲，直接用
-        if self.auto_align:
+        if self.auto_align and kind == "video":
             self._shift_clips_after(kind, track_idx, start, duration)
             return start
         # 自动对齐关 → 找空隙
@@ -1971,10 +1972,13 @@ class FFmpegDirectExportWorker(QThread):
         pip = [p for p in processed if p[1] != 0]
         bg_sorted = sorted(bg, key=lambda x: x[2])
 
-        # 仅当背景轨片段连续（无缝隙）时才走 xfade 链；否则回退原 overlay（硬切）
-        contiguous = True
+        # 仅当背景轨从 0 秒开始、片段严格首尾相接（无间隙、无重叠）时
+        # 才走 xfade 链。xfade/concat 会重新建立自己的时间轴，若首片段被
+        # 拖到非 0 秒，或片段发生重叠，继续走该分支就会丢掉用户调整后的
+        # timeline_start；此时必须回退到带绝对时间戳的 overlay 画布。
+        contiguous = bool(bg_sorted) and abs(bg_sorted[0][2]) <= 0.05
         for i in range(1, len(bg_sorted)):
-            if bg_sorted[i][2] - bg_sorted[i - 1][3] > 0.05:
+            if abs(bg_sorted[i][2] - bg_sorted[i - 1][3]) > 0.05:
                 contiguous = False
                 break
 
@@ -2201,17 +2205,31 @@ class FFmpegDirectExportWorker(QThread):
                 b_to_a[id(B)] = (A, d, A_end)
                 bg_overlap += d
 
-        # ── 2) 去重：同一素材同一区间不要重复处理 ──
+        # ── 2) 去重：只过滤同一个片段对象的意外重复收集 ──
+        # 同一素材可以被用户多次放到不同时间点；旧 key 没有 timeline_start，
+        # 会把后面的重复片段直接丢掉，导致前段/后段音量或声音缺失。
         seen = set()
         unique = []
         for ac in audio_clips:
-            key = (ac["input_idx"], ac["clip"].trim_start, ac["clip"].trim_end)
+            key = id(ac["clip"])
             if key not in seen:
                 seen.add(key)
                 unique.append(ac)
 
         if not unique:
             return [], ""
+
+        # 一个导入文件可在时间线上重复使用。filter_complex 中同一个输入音频 pad
+        # 不能可靠地被多个 trim 链重复消费，先 asplit 成独立分支。
+        input_use_counts = {}
+        for ac in unique:
+            idx = ac["input_idx"]
+            input_use_counts[idx] = input_use_counts.get(idx, 0) + 1
+        input_use_offsets = {idx: 0 for idx in input_use_counts}
+        for idx, count in input_use_counts.items():
+            if count > 1:
+                labels = "".join(f"[asrc{idx}_{n}]" for n in range(count))
+                parts.append(f"[{idx}:a]asplit={count}{labels}")
 
         for i, ac in enumerate(unique):
             c = ac["clip"]
@@ -2221,14 +2239,21 @@ class FFmpegDirectExportWorker(QThread):
             ts = c.timeline_start
             speed = getattr(c, 'speed', 1.0) or 1.0
             delay_ms = int(ts * 1000)
-            vol = getattr(c, 'volume', 1.0) or 1.0
+            vol = getattr(c, 'volume', 1.0)
+            if not isinstance(vol, (int, float)):
+                vol = 1.0
             playback_dur = src_dur / max(speed, 0.01)
 
             cid = id(c)
             fade_out_d = a_to_b.get(cid, (None, 0.0, 0.0))[1]   # A：尾音淡出量
             b_info = b_to_a.get(cid)                            # B：(A, d, A_end)
 
-            stream = f"[{idx}:a]"
+            if input_use_counts[idx] > 1:
+                branch = input_use_offsets[idx]
+                input_use_offsets[idx] += 1
+                stream = f"[asrc{idx}_{branch}]"
+            else:
+                stream = f"[{idx}:a]"
             filters = []
 
             # trim
@@ -2274,15 +2299,20 @@ class FFmpegDirectExportWorker(QThread):
         # 音频总时长按背景轨转场重叠量缩短，与视频 xfade 输出长度对齐
         audio_total = max(0.01, total_dur - bg_overlap)
 
-        if len(parts) == 1:
+        n_inputs = len(unique)
+        if n_inputs == 1:
             # 单音频：加 apad 保证与视频等长
-            n_inputs = 1
             parts.append(f"[a0]apad=whole_dur={audio_total:.3f}[aout]")
         else:
-            n_inputs = len(parts)
             mix_labels = "".join(f"[a{i}]" for i in range(n_inputs))
             parts.append(
-                f"{mix_labels}amix=inputs={n_inputs}:duration=longest:dropout_transition=3,"
+                # amix 默认 normalize=1，会按仍存活的输入数自动压低音量；由于后段
+                # 输入包含 adelay 静音，前面会被无声轨一起除低，等前轨结束后又在
+                # dropout_transition 的最后几秒逐渐变大。关闭自动归一化后，每个
+                # 片段设置的 volume 才能从头到尾保持一致；限制器只负责防止叠加削波。
+                f"{mix_labels}amix=inputs={n_inputs}:duration=longest:"
+                f"dropout_transition=0:normalize=0,"
+                f"alimiter=limit=0.98:attack=5:release=50:latency=1,"
                 f"apad=whole_dur={audio_total:.3f}[aout]"
             )
 
@@ -2312,18 +2342,54 @@ class FFmpegDirectExportWorker(QThread):
            字幕继续走 FFmpeg 原生 drawtext；带样式字幕使用与预览同源的 Qt
            绘制，避免颜色、透明度、圆角和描边发生变化。
 
-        注意：alpha 视频（MOV ProRes 4444 / WebM VP9 alpha 等）「不再」强制走
-        compositor —— filter_complex 路径已通过 `format=rgba` + `overlay=format=auto`
-        正确完成透明叠加，最终 yuv420p 输出会压平透明通道。逐帧 compositor 在
-        1080p 下约 8MB/帧经 Python 管道喂给 ffmpeg，速度慢一个数量级以上，
-        因此仅在转场 / 绿幕 / 蒙版这类 filter_complex 无法精确复现时才启用。
+        5. 存在叠加视频轨或视频变换（位置/缩放/旋转/透明度/关键帧）。快速
+           filter_complex 路径的片段预处理是全画布帧，非透明 MP4 放在叠加轨
+           时会把整张黑色画布盖到背景上；同时它无法可靠复现动态变换。交给
+           compositor 后，叠加轨和预览都使用同一套按源帧绘制逻辑。
+
+        注意：单独的 alpha 视频（MOV ProRes 4444 / WebM VP9 alpha 等）仍可走
+        快速路径，filter_complex 已通过 `format=rgba` + `overlay=format=auto`
+        正确处理透明通道；但叠加轨和视频变换按上面的规则统一走 compositor。
+        逐帧 compositor 在 1080p 下约 8MB/帧经 Python 管道喂给 ffmpeg，速度慢
+        一个数量级以上，因此无叠加/变换的普通主轨仍保留快速路径。
         """
         if self._bg_has_transition(video_clips):
             return True
         for vc in video_clips:
-            if getattr(vc["clip"], "chroma_key_enabled", False):
+            clip = vc["clip"]
+            # 叠加轨必须保留源帧之外的透明区域。直接 FFmpeg 路径会把普通
+            # MP4 先 pad 成整张不透明画布，随后 overlay 时覆盖背景，导致
+            # “视频1轨道”导出黑屏/失败。compositor 使用 QPainter SourceOver，
+            # 与预览的 PiP 合成保持一致。
+            if vc["track"] > 0:
                 return True
-            if getattr(vc["clip"], "mask_enabled", False):
+            if getattr(clip, "chroma_key_enabled", False):
+                return True
+            if getattr(clip, "mask_enabled", False):
+                return True
+            # 快速路径只支持静态的基础布局；这些属性一旦被编辑，就必须
+            # 走同源渲染，否则导出画面会继续使用旧的全画布滤镜结果。
+            try:
+                if abs(float(getattr(clip, "pos_x", 0.0) or 0.0)) > 0.001:
+                    return True
+                if abs(float(getattr(clip, "pos_y", 0.0) or 0.0)) > 0.001:
+                    return True
+                if abs(float(getattr(clip, "scale", 1.0) or 1.0) - 1.0) > 0.001:
+                    return True
+                if abs(float(getattr(clip, "rotation", 0.0) or 0.0)) > 0.001:
+                    return True
+                opacity = getattr(clip, "opacity", 1.0)
+                # 0 是合法值（完全透明），不能用 ``or 1.0`` 把它还原成
+                # 不透明，否则快速路径会漏掉这次变换。
+                if abs(float(opacity) - 1.0) > 0.001:
+                    return True
+            except (TypeError, ValueError):
+                # 非法的旧工程值交给 compositor 的安全回退处理，不让导出
+                # 静默采用与预览不同的结果。
+                return True
+            kf = getattr(clip, "keyframes", None) or {}
+            if any(key in kf for key in
+                   ("pos_x", "pos_y", "scale", "rotation", "opacity", "blur_radius")):
                 return True
         for track_idx, track in enumerate(getattr(self.tl, "subtitle_tracks", []) or []):
             info_list = getattr(self.tl, "subtitle_track_info", []) or []
@@ -2654,6 +2720,13 @@ class FFmpegDirectExportWorker(QThread):
         if total_dur <= 0:
             self.finished.emit(False, "时间线上没有可导出的内容")
             return
+        if not video_clips:
+            self.finished.emit(
+                False,
+                "当前时间线没有可导出的视频画面。请检查视频片段是否被隐藏、"
+                "视频轨是否静音，或源文件是否已移动。",
+            )
+            return
 
         # 检测每个输入文件是否含 alpha 通道（MOV 透明背景等）
         self._input_alpha = []
@@ -2803,4 +2876,12 @@ class FFmpegDirectExportWorker(QThread):
         except Exception as e:
             self.finished.emit(False, f"导出失败：{e}")
         finally:
+            proc = self._proc
+            if proc is not None:
+                for stream in (proc.stdout, proc.stderr):
+                    try:
+                        if stream is not None:
+                            stream.close()
+                    except Exception:
+                        pass
             self._proc = None

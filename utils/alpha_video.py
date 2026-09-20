@@ -250,6 +250,7 @@ class AlphaVideoPipeReader:
         self._frame_bytes = w * h * 4  # BGRA = 4 bytes/pixel
         self._proc = None
         self._cur_sec = -1.0
+        self._last_frame = None
         self._lock = threading.Lock()
 
     def _start(self, start_sec: float):
@@ -286,6 +287,7 @@ class AlphaVideoPipeReader:
                 creationflags=_NO_WINDOW,
             )
             self._cur_sec = max(0.0, start_sec)
+            self._last_frame = None
         except Exception:
             logging.debug("AlphaVideoPipeReader._start failed: %s", self.path, exc_info=True)
             self._proc = None
@@ -293,12 +295,23 @@ class AlphaVideoPipeReader:
     def _stop(self):
         """终止 FFmpeg 进程"""
         if self._proc:
+            proc = self._proc
+            self._proc = None
             try:
-                self._proc.kill()
-                self._proc.wait(timeout=1)
+                if proc.stdout is not None:
+                    proc.stdout.close()
             except Exception:
                 pass
-            self._proc = None
+            try:
+                if proc.poll() is None:
+                    proc.kill()
+                proc.wait(timeout=2)
+            except Exception:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
 
     def _read_raw(self) -> bytes | None:
         """从管道读取一帧 raw BGRA 数据"""
@@ -321,11 +334,18 @@ class AlphaVideoPipeReader:
         with self._lock:
             src_sec = max(0.0, src_sec)
 
+            # 同一时间点可能被字幕/转场逻辑重复请求；不能继续从管道多读一帧。
+            if (self._last_frame is not None and self._cur_sec >= 0
+                    and abs(src_sec - self._cur_sec) < self._frame_dt * 0.45):
+                return self._last_frame
+
             # ── 判断是否需要重启 ──
+            delta = src_sec - self._cur_sec if self._cur_sec >= 0 else 0.0
             need_restart = (
                 self._proc is None
                 or self._cur_sec < 0
-                or abs(src_sec - self._cur_sec) > self._SEEK_THRESHOLD
+                or delta < -self._frame_dt * 0.45
+                or delta > self._SEEK_THRESHOLD
             )
 
             if need_restart:
@@ -336,12 +356,16 @@ class AlphaVideoPipeReader:
                 if data is None:
                     return None
                 self._cur_sec = src_sec
-                return np.frombuffer(data, dtype=np.uint8).reshape(
+                self._last_frame = np.frombuffer(data, dtype=np.uint8).reshape(
                     (self._h, self._w, 4))
+                return self._last_frame
 
-            # ── 顺序读取：跳过中间帧 ──
-            frames_to_skip = max(0, int(
-                (src_sec - self._cur_sec) / self._frame_dt + 0.5))
+            # ── 顺序读取：管道当前位于“上一已返回帧的下一帧”。
+            # 目标相差 N 帧时只丢弃 N-1 帧，再读取的才是目标帧；旧逻辑丢弃
+            # N 帧后又多读一帧，会令导出画面以约 2 倍速度前进并提前读到 EOF。
+            frame_steps = max(1, int(round(
+                (src_sec - self._cur_sec) / self._frame_dt)))
+            frames_to_skip = max(0, frame_steps - 1)
             for _ in range(frames_to_skip):
                 if self._read_raw() is None:
                     # 管道断了（可能到达文件尾），重启
@@ -349,7 +373,6 @@ class AlphaVideoPipeReader:
                     if not self._proc:
                         return None
                     break
-                self._cur_sec += self._frame_dt
 
             # 读取目标帧
             data = self._read_raw()
@@ -363,14 +386,16 @@ class AlphaVideoPipeReader:
                     return None
 
             self._cur_sec = src_sec
-            return np.frombuffer(data, dtype=np.uint8).reshape(
+            self._last_frame = np.frombuffer(data, dtype=np.uint8).reshape(
                 (self._h, self._w, 4))
+            return self._last_frame
 
     def close(self):
         """终止进程，释放资源"""
         with self._lock:
             self._stop()
             self._cur_sec = -1.0
+            self._last_frame = None
         # 清理中文路径的临时副本
         if self._src_tmp and os.path.exists(self._src_tmp):
             try:

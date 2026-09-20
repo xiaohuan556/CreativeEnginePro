@@ -90,6 +90,60 @@ class ClipPropertiesTabsTests(unittest.TestCase):
         for index in range(self.panel._TAB_MASK, self.panel._TAB_TRANSITION + 1):
             self.assertFalse(self.panel._tabs.isTabVisible(index))
 
+    def test_selected_subtitles_receive_style_changes_together(self):
+        first = SubtitleBlock(text="一", timeline_start=0.0, timeline_end=1.0)
+        second = SubtitleBlock(text="二", timeline_start=1.0, timeline_end=2.0)
+        audio = AudioClip(source_path="other.wav", source_duration=1.0,
+                          trim_start=0.0, trim_end=1.0)
+        panel = ClipPropertiesPanel(
+            EditTimeline(),
+            get_selected_clips_cb=lambda: [
+                (first, "subtitle", 0),
+                (second, "subtitle", 0),
+                (audio, "audio", 0),
+            ],
+        )
+        try:
+            panel.set_selection(first, "subtitle")
+            panel._set(first, "font_size", 48)
+            panel._set(first, "outline_width", 5)
+            panel._set(first, "pos_y", 0.25)
+            panel._set(first, "scale", 1.4)
+            panel._set(first, "text", "只修改第一句")
+
+            for subtitle in (first, second):
+                self.assertEqual(48, subtitle.font_size)
+                self.assertEqual(5, subtitle.outline_width)
+                self.assertEqual(0.25, subtitle.pos_y)
+                self.assertEqual(1.4, subtitle.scale)
+            self.assertEqual("只修改第一句", first.text)
+            self.assertEqual("二", second.text)
+            self.assertEqual(1.0, audio.volume)
+        finally:
+            panel.close()
+            panel.deleteLater()
+
+    def test_selected_audio_clips_receive_volume_change_together(self):
+        first = AudioClip(source_path="one.wav", source_duration=2.0,
+                          trim_start=0.0, trim_end=2.0)
+        second = AudioClip(source_path="two.wav", source_duration=2.0,
+                           trim_start=0.0, trim_end=2.0)
+        panel = ClipPropertiesPanel(
+            EditTimeline(),
+            get_selected_clips_cb=lambda: [
+                (first, "audio", 0), (second, "audio", 1),
+            ],
+        )
+        try:
+            panel.set_selection(first, "audio")
+            panel._set(first, "volume", 0.35)
+
+            self.assertEqual(0.35, first.volume)
+            self.assertEqual(0.35, second.volume)
+        finally:
+            panel.close()
+            panel.deleteLater()
+
 
 if __name__ == "__main__":
     unittest.main()

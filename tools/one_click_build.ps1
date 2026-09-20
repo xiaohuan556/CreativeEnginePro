@@ -83,6 +83,19 @@ function Test-TcpPort([string]$HostName, [int]$Port) {
     }
 }
 
+function Test-LocalPortBindable([int]$Port) {
+    $listener = $null
+    try {
+        $listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Any, $Port)
+        $listener.Start()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if ($listener) { try { $listener.Stop() } catch { } }
+    }
+}
+
 $configuredIp = [string]$config.server_ip
 $serverIp = if (-not $configuredIp -or $configuredIp.Trim().ToLowerInvariant() -eq "auto") {
     Find-LanIpv4
@@ -91,6 +104,10 @@ $serverIp = if (-not $configuredIp -or $configuredIp.Trim().ToLowerInvariant() -
 }
 if (-not (Test-PrivateIpv4 $serverIp)) {
     throw "Configured server_ip is not a private LAN IPv4 address: $serverIp"
+}
+$serverPort = [int]$config.server_port
+if ($serverPort -lt 1 -or $serverPort -gt 65535) {
+    throw "Configured server_port is invalid: $serverPort"
 }
 
 $expiresAt = [DateTimeOffset]::Parse([string]$config.expires_at)
@@ -103,7 +120,10 @@ $version = "$versionPrefix-$(Get-Date -Format 'yyyyMMdd-HHmm')"
 $distPath = ([string]$config.output_dir).Trim()
 if (-not $distPath) { $distPath = "build\release-local" }
 $pythonExe = Find-DesktopPython
-$serverReady = Test-TcpPort $serverIp 8000
+$serverReady = Test-TcpPort $serverIp $serverPort
+if (-not $serverReady -and -not (Test-LocalPortBindable $serverPort)) {
+    throw "Configured server_port cannot be bound on this computer: $serverPort"
+}
 
 # A running one-file EXE locks itself on Windows.  Do not waste a full build
 # only to fail at the final write; automatically select a timestamped sibling
@@ -128,7 +148,7 @@ if (Test-Path -LiteralPath $configuredExe) {
 
 Write-Host ""
 Write-Host "One-click package configuration" -ForegroundColor Cyan
-Write-Host "  Server:  http://${serverIp}:8000"
+Write-Host "  Server:  http://${serverIp}:$serverPort"
 Write-Host "  Version: $version"
 Write-Host "  Expires: $($expiresAt.ToString('yyyy-MM-ddTHH:mm:sszzz'))"
 Write-Host "  Python:  $pythonExe"
@@ -156,6 +176,7 @@ try {
 
     & (Join-Path $PSScriptRoot "build_local_release.ps1") `
         -ServerIp $serverIp `
+        -ServerPort $serverPort `
         -PythonExe $pythonExe `
         -Version $version `
         -ExpiresAfter $expiresAt `

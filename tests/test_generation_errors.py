@@ -1,6 +1,8 @@
 import unittest
 
-from ai.generation_errors import moderation_failure, transient_gateway_failure
+from ai.generation_errors import (
+    moderation_failure, public_generation_error, transient_gateway_failure,
+)
 
 
 class GenerationErrorTest(unittest.TestCase):
@@ -21,6 +23,19 @@ class GenerationErrorTest(unittest.TestCase):
         self.assertEqual("UPSTREAM_504", value["code"])
         self.assertEqual("abc_DEF-123456", value["request_id"])
         self.assertNotIn("CloudFront", value["message"])
+
+    def test_rate_limit_payload_becomes_plain_chinese(self):
+        value = public_generation_error(
+            "Ark HTTP 429 RateLimitReached: request ID abcdef12-3456")
+        self.assertIn("请求过于频繁", value)
+        self.assertIn("abcdef12-3456", value)
+        self.assertNotIn("RateLimitReached", value)
+
+    def test_invalid_provider_json_is_not_shown_verbatim(self):
+        value = public_generation_error(
+            "Ark HTTP 400 InvalidParameter: content[0].video_url invalid")
+        self.assertIn("参数不符合模型要求", value)
+        self.assertNotIn("content[0]", value)
 
 
 if __name__ == "__main__":

@@ -111,6 +111,18 @@ class VeoProviderTests(unittest.TestCase):
         self.assertIn("仅支持 4–15 秒", handle.result.error)
         mock_post.assert_not_called()
 
+    def test_seedance_rejects_square_ratio_before_paid_submit(self):
+        provider = SeedanceProvider(api_key="ark-test", model=SEEDANCE_25_MODEL)
+        request = TaskRequest(
+            operation="text_to_video", inputs={"prompt": "测试"},
+            params={"model": SEEDANCE_25_MODEL, "duration": 5,
+                    "ratio": "1:1", "resolution": "720p"})
+        with patch("ai.providers.video.veo.ark_post") as mock_post:
+            handle = provider.execute(request)
+        self.assertFalse(handle.is_success)
+        self.assertIn("不支持画面比例 1:1", handle.result.error)
+        mock_post.assert_not_called()
+
     def test_seedance_local_reference_video_is_submitted_as_web_url(self):
         source = Path(self.temp_dir.name) / "reference.mp4"
         source.write_bytes(b"local-video-bytes")
