@@ -178,7 +178,6 @@ class ReplaceVideoDialog(QDialog):
             "QPushButton#choose { background:#2a2a2a; color:#ccc; border:1px solid #444; }"
             "QPushButton#choose:hover { background:#333; }"
             "QCheckBox { color:#ccc; font-size:12px; }"
-            "QCheckBox::indicator { width:16px; height:16px; }"
             "QSlider::groove:horizontal { height:4px; background:#333; border-radius:2px; }"
             "QSlider::handle:horizontal { width:12px; background:#00eaff; border-radius:6px; margin:-4px 0; }"
             "QSlider::sub-page:horizontal { background:#00eaff; border-radius:2px; }"

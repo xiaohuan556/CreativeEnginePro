@@ -12,9 +12,10 @@ import logging
 import subprocess
 import tempfile
 import dataclasses
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-from PyQt6.QtCore import QObject, pyqtSignal, QThread
+from typing import Any, Callable, List, Optional, Tuple
+from PyQt6.QtCore import QObject, pyqtSignal, QThread, Qt
 from PyQt6.QtGui import QImage, QColor, QPainter
 
 
@@ -54,6 +55,50 @@ def normalize_out_transition(value) -> Optional[dict]:
     except (TypeError, ValueError):
         duration = 0.5
     return {"type": transition_type, "duration": duration}
+
+
+class TimelineCommand:
+    """Small command facade over the timeline's snapshot history.
+
+    Existing editing APIs remain source-compatible, while new operations can
+    be introduced through one consistent execute/undo/redo contract.  The
+    command captures a single pre/post state and invalidates the normal model
+    signal exactly once for direct command users.
+    """
+
+    def __init__(self, timeline, name: str, mutate: Callable[[], Any]):
+        self.timeline = timeline
+        self.name = name
+        self.mutate = mutate
+        self.before = None
+        self.after = None
+        self.result = None
+
+    def execute(self):
+        before_data = self.timeline.to_dict()
+        self.before = self.timeline._snapshot()
+        with self.timeline.edit_transaction(self.name, record=False):
+            self.result = self.mutate()
+        after_data = self.timeline.to_dict()
+        self.after = self.timeline._snapshot()
+        if after_data != before_data:
+            self.timeline._append_history_snapshot(self.before, self.name)
+        self.timeline._last_command_name = self.name
+        return self.result
+
+    def undo(self) -> bool:
+        if self.before is None:
+            return False
+        self.timeline._restore(self.before)
+        self.timeline.changed.emit()
+        return True
+
+    def redo(self) -> bool:
+        if self.after is None:
+            return False
+        self.timeline._restore(self.after)
+        self.timeline.changed.emit()
+        return True
 
 @dataclass
 class VideoClip:
@@ -100,6 +145,9 @@ class VideoClip:
     # 转场：本片段「淡出到下一片段」的配置（None 或 {"type": "fade", "duration": 0.5}）
     # type 取值见 core.slideshow_engine.TRANSITIONS 的 value（如 fade/wipe_left/...）
     out_transition: Optional[dict] = None
+    # Timeline 2 style relationships; absent in older project files.
+    group_id: Optional[str] = None
+    link_id: Optional[str] = None
 
     def __post_init__(self):
         self.out_transition = normalize_out_transition(self.out_transition)
@@ -161,6 +209,8 @@ class VideoClip:
             "mask_feather": self.mask_feather,
             "mask_inverted": self.mask_inverted,
             "out_transition": self.out_transition,
+            "group_id": self.group_id,
+            "link_id": self.link_id,
         }
 
     @staticmethod
@@ -194,6 +244,7 @@ class VideoClip:
             mask_feather=d.get("mask_feather", 0.0),
             mask_inverted=d.get("mask_inverted", False),
             out_transition=d.get("out_transition", None),
+            group_id=d.get("group_id"), link_id=d.get("link_id"),
         )
 
 
@@ -214,6 +265,8 @@ class AudioClip:
     # 关键帧：{"volume": [(t,v),...]}
     keyframes: dict = field(default_factory=dict)
     visible: bool = True            # 是否在时间线/预览中可见
+    group_id: Optional[str] = None
+    link_id: Optional[str] = None
 
     @property
     def duration(self) -> float:
@@ -235,6 +288,7 @@ class AudioClip:
             "volume": self.volume, "fade_in": self.fade_in,
             "fade_out": self.fade_out, "mute": self.mute,
             "label": self.label, "keyframes": kf, "visible": self.visible,
+            "group_id": self.group_id, "link_id": self.link_id,
         }
 
     @staticmethod
@@ -250,6 +304,7 @@ class AudioClip:
             volume=d.get("volume", 1.0), fade_in=d.get("fade_in", 0.0),
             fade_out=d.get("fade_out", 0.0), mute=d.get("mute", False),
             label=d.get("label", ""), keyframes=kf, visible=d.get("visible", True),
+            group_id=d.get("group_id"), link_id=d.get("link_id"),
         )
 
 
@@ -296,6 +351,7 @@ class SubtitleBlock:
     visible: bool = True            # 是否在时间线/预览中可见
     # 透明度
     opacity: float = 1.0            # 整体不透明度（0.0=完全透明，1.0=完全不透明）
+    group_id: Optional[str] = None
 
     @property
     def duration(self) -> float:
@@ -332,6 +388,7 @@ class SubtitleBlock:
             "word_timings": self.word_timings,
             "visible": self.visible,
             "opacity": self.opacity,
+            "group_id": self.group_id,
         }
 
     @staticmethod
@@ -370,6 +427,7 @@ class SubtitleBlock:
             word_timings=d.get("word_timings", []),
             visible=d.get("visible", True),
             opacity=d.get("opacity", 1.0),
+            group_id=d.get("group_id"),
         )
 
 
@@ -535,6 +593,7 @@ class EditTimeline(QObject):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.name: str = ""  # 用户可自定义的时间线名称
+        self.canvas_bg_color: str = "#000000"
         # 多轨道：每条轨道是一个 List[Clip]
         self.video_tracks: List[List[VideoClip]] = [[] for _ in range(self.DEFAULT_VIDEO_TRACKS)]
         self.audio_tracks: List[List[AudioClip]] = [[] for _ in range(self.DEFAULT_AUDIO_TRACKS)]
@@ -547,10 +606,17 @@ class EditTimeline(QObject):
         self.subtitle_track_info: List[TrackInfo] = []  # 有字幕轨时才添加
 
         self._history: List[dict] = []  # 用于 undo
+        self._history_labels: List[str] = []
         self._undo_index: int = -1
+        self._last_command_name: str = ""
         # 撤回状态机标志：是否正处于「已撤回、尚未新操作」的浏览态。
         # 用于首次数撤回时把当前实时状态补入历史，使 redo 能回到最新状态。
         self._undo_active: bool = False
+        # Composite UI operations (multi-delete, batch paste, ripple edits)
+        # share one pre-state instead of polluting undo with one entry per
+        # child clip.
+        self._history_transaction_depth: int = 0
+        self._history_transaction_snapshot = None
 
     # ─── 向后兼容属性 ───
     @property
@@ -584,6 +650,55 @@ class EditTimeline(QObject):
         self.audio_track_info.append(TrackInfo(f"音频{len(self.audio_tracks)}"))
         self.changed.emit()
         return len(self.audio_tracks) - 1
+
+    def _track_arrays(self, kind: str):
+        if kind == "video":
+            return self.video_tracks, self.video_track_info
+        if kind == "audio":
+            return self.audio_tracks, self.audio_track_info
+        if kind == "subtitle":
+            return self.subtitle_tracks, self.subtitle_track_info
+        raise ValueError(f"unknown track kind: {kind}")
+
+    def move_track(self, kind: str, track_idx: int, delta: int) -> bool:
+        """Move a track within its media family, preserving its metadata."""
+        tracks, infos = self._track_arrays(kind)
+        source = int(track_idx)
+        target = source + int(delta)
+        if not (0 <= source < len(tracks) and 0 <= target < len(tracks)):
+            return False
+        # Our compositor treats video track 0 as the background track. Keep it
+        # stable until the compositor itself gains explicit target-track IDs.
+        if kind == "video" and (source == 0 or target == 0):
+            return False
+        if (source < len(infos) and infos[source].locked) or \
+                (target < len(infos) and infos[target].locked):
+            return False
+        self._save_history("移动轨道")
+        tracks[source], tracks[target] = tracks[target], tracks[source]
+        if source < len(infos) and target < len(infos):
+            infos[source], infos[target] = infos[target], infos[source]
+        self.changed.emit()
+        return True
+
+    def remove_empty_track(self, kind: str, track_idx: int) -> bool:
+        """Remove an empty non-primary track; never silently deletes clips."""
+        tracks, infos = self._track_arrays(kind)
+        idx = int(track_idx)
+        if not (0 <= idx < len(tracks)) or tracks[idx]:
+            return False
+        if kind in ("video", "audio") and len(tracks) <= 1:
+            return False
+        if kind == "video" and idx == 0:
+            return False
+        if idx < len(infos) and infos[idx].locked:
+            return False
+        self._save_history("删除空轨道")
+        tracks.pop(idx)
+        if idx < len(infos):
+            infos.pop(idx)
+        self.changed.emit()
+        return True
 
     # ─── 总时长 ───
     @property
@@ -629,16 +744,22 @@ class EditTimeline(QObject):
                        skip_overlap: bool = False):
         """添加视频片段。同轨防重叠：从 track_idx 向上寻找不重叠轨道，
         若全部冲突则在顶部新建叠加轨。skip_overlap=True 强制放置在指定轨。"""
-        self._save_history()
         if skip_overlap:
             while track_idx >= len(self.video_tracks):
                 self.add_video_track()
+            if (track_idx < len(self.video_track_info)
+                    and self.video_track_info[track_idx].locked):
+                return False
+            self._save_history()
             self.video_tracks[track_idx].append(clip)
             self.changed.emit()
-            return
+            return True
+        self._save_history()
         c_end = clip.timeline_start + clip.duration
         chosen = -1
         for i in range(track_idx, len(self.video_tracks)):
+            if i < len(self.video_track_info) and self.video_track_info[i].locked:
+                continue
             conflict = any(
                 c.timeline_start < c_end and (c.timeline_start + c.duration) > clip.timeline_start
                 for c in self.video_tracks[i]
@@ -652,21 +773,28 @@ class EditTimeline(QObject):
             new_idx = self.add_video_track()
             self.video_tracks[new_idx].append(clip)
         self.changed.emit()
+        return True
 
     def add_audio_clip(self, clip: AudioClip, track_idx: int = 0,
                        skip_overlap: bool = False):
         """添加音频片段。同轨防重叠：从 track_idx 向上寻找不重叠轨道，
         若全部冲突则在顶部新建轨道。skip_overlap=True 强制放置在指定轨。"""
-        self._save_history()
         if skip_overlap:
             while track_idx >= len(self.audio_tracks):
                 self.add_audio_track()
+            if (track_idx < len(self.audio_track_info)
+                    and self.audio_track_info[track_idx].locked):
+                return False
+            self._save_history()
             self.audio_tracks[track_idx].append(clip)
             self.changed.emit()
-            return
+            return True
+        self._save_history()
         c_end = clip.timeline_start + clip.duration
         chosen = -1
         for i in range(track_idx, len(self.audio_tracks)):
+            if i < len(self.audio_track_info) and self.audio_track_info[i].locked:
+                continue
             conflict = any(
                 c.timeline_start < c_end and (c.timeline_start + c.duration) > clip.timeline_start
                 for c in self.audio_tracks[i]
@@ -680,21 +808,211 @@ class EditTimeline(QObject):
             new_idx = self.add_audio_track()
             self.audio_tracks[new_idx].append(clip)
         self.changed.emit()
+        return True
+
+    # ─── 非破坏式时间线编辑 ───
+    @staticmethod
+    def _clip_source_at(clip, timeline_pos: float) -> float:
+        """Return the source position corresponding to a timeline position."""
+        rate = max(0.01, float(getattr(clip, "speed", 1.0)))
+        return float(clip.trim_start) + max(0.0, timeline_pos - clip.timeline_start) * rate
+
+    @staticmethod
+    def _new_clip_tail(clip, split_pos: float, new_start: float):
+        """Clone the right side of a media clip without touching history."""
+        right = copy.deepcopy(clip)
+        right.id = str(uuid.uuid4())[:8]
+        src_split = EditTimeline._clip_source_at(clip, split_pos)
+        right.trim_start = src_split
+        right.timeline_start = new_start
+        clip.trim_end = src_split
+
+        # Keyframe times are relative to the clip's source/timeline origin.
+        # Keep the left side on the original and rebase the tail to zero.
+        original_kfs = getattr(clip, "keyframes", None)
+        if original_kfs:
+            tail_kfs = {}
+            offset = src_split - float(clip.trim_start)
+            for prop, values in original_kfs.items():
+                tail_values = [(t - offset, v) for t, v in values
+                               if t > offset + 0.001]
+                if tail_values:
+                    tail_kfs[prop] = tail_values
+                original_kfs[prop] = [(t, v) for t, v in values
+                                      if t <= offset]
+            right.keyframes = tail_kfs
+        return right
+
+    def _ensure_media_track(self, kind: str, track_idx: int) -> tuple:
+        """Return (tracks, infos) and grow the requested media track list."""
+        if kind == "video":
+            tracks, infos = self.video_tracks, self.video_track_info
+            maker = lambda i: TrackInfo("主轨道" if i == 0 else f"视频{i}")
+        else:
+            tracks, infos = self.audio_tracks, self.audio_track_info
+            maker = lambda i: TrackInfo(f"音频{i + 1}")
+        while track_idx >= len(tracks):
+            tracks.append([])
+            infos.append(maker(len(tracks) - 1))
+        return tracks, infos
+
+    def insert_video_clip(self, clip: VideoClip, track_idx: int = 0,
+                          timeline_start: Optional[float] = None) -> bool:
+        """Insert a clip and ripple the target video track to the right.
+
+        The operation is intentionally model-level: every entry point (drop,
+        media-library add, keyboard shortcut) gets identical ripple semantics.
+        If the insertion point cuts through an existing clip, that clip is
+        split into a left and right part before the gap is inserted.
+        """
+        tracks, infos = self._ensure_media_track("video", max(0, int(track_idx)))
+        track_idx = max(0, int(track_idx))
+        if infos[track_idx].locked:
+            return False
+        start = max(0.0, float(clip.timeline_start if timeline_start is None
+                               else timeline_start))
+        duration = max(0.001, float(clip.duration))
+        self._save_history()
+        track = tracks[track_idx]
+        new_track = []
+        for existing in track:
+            if existing.timeline_start >= start - 0.0001:
+                existing.timeline_start += duration
+                new_track.append(existing)
+            elif existing.timeline_start < start < existing.timeline_end - 0.0001:
+                tail = self._new_clip_tail(existing, start, start + duration)
+                new_track.extend((existing, tail))
+            else:
+                new_track.append(existing)
+        clip.timeline_start = start
+        new_track.append(clip)
+        track[:] = sorted(new_track, key=lambda c: c.timeline_start)
+        self.changed.emit()
+        return True
+
+    def _overwrite_track_range(self, track: list, start: float, end: float):
+        """Remove/trim every media clip intersecting [start, end)."""
+        kept = []
+        for clip in track:
+            c_start, c_end = float(clip.timeline_start), float(clip.timeline_end)
+            if c_end <= start + 0.0001 or c_start >= end - 0.0001:
+                kept.append(clip)
+                continue
+            left = c_start < start - 0.0001
+            right = c_end > end + 0.0001
+            if left:
+                clip.trim_end = self._clip_source_at(clip, start)
+                clip.timeline_start = c_start
+                kept.append(clip)
+            if right:
+                tail_start = end if not left else end
+                if left:
+                    tail = copy.deepcopy(clip)
+                    tail.id = str(uuid.uuid4())[:8]
+                    # Rebuild the right half from the original source range.
+                    tail.trim_start = self._clip_source_at(
+                        clip, end)
+                    tail.trim_end = float(getattr(clip, "trim_end", tail.trim_end))
+                    # clip.trim_end was changed above; recover original source end
+                    # from the pre-edit duration and rate.
+                    rate = max(0.01, float(getattr(clip, "speed", 1.0)))
+                    original_end = self._clip_source_at(clip, c_end)
+                    tail.trim_end = original_end
+                    tail.timeline_start = tail_start
+                    kept.append(tail)
+                else:
+                    clip.trim_start = self._clip_source_at(clip, end)
+                    clip.timeline_start = tail_start
+                    kept.append(clip)
+            # A clip fully covered by the overwrite range is intentionally dropped.
+        track[:] = sorted(
+            [c for c in kept if c.timeline_end - c.timeline_start > 0.01],
+            key=lambda c: c.timeline_start)
+
+    def overwrite_video_clip(self, clip: VideoClip, track_idx: int = 0,
+                             timeline_start: Optional[float] = None) -> bool:
+        """Place a clip at a time and replace only the covered media range."""
+        tracks, infos = self._ensure_media_track("video", max(0, int(track_idx)))
+        track_idx = max(0, int(track_idx))
+        if infos[track_idx].locked:
+            return False
+        start = max(0.0, float(clip.timeline_start if timeline_start is None
+                               else timeline_start))
+        end = start + max(0.001, float(clip.duration))
+        self._save_history()
+        self._overwrite_track_range(tracks[track_idx], start, end)
+        clip.timeline_start = start
+        tracks[track_idx].append(clip)
+        tracks[track_idx].sort(key=lambda c: c.timeline_start)
+        self.changed.emit()
+        return True
+
+    def insert_audio_clip(self, clip: AudioClip, track_idx: int = 0,
+                          timeline_start: Optional[float] = None) -> bool:
+        """Audio counterpart to :meth:`insert_video_clip`."""
+        tracks, infos = self._ensure_media_track("audio", max(0, int(track_idx)))
+        track_idx = max(0, int(track_idx))
+        if infos[track_idx].locked:
+            return False
+        start = max(0.0, float(clip.timeline_start if timeline_start is None
+                               else timeline_start))
+        duration = max(0.001, float(clip.duration))
+        self._save_history()
+        track = tracks[track_idx]
+        new_track = []
+        for existing in track:
+            if existing.timeline_start >= start - 0.0001:
+                existing.timeline_start += duration
+                new_track.append(existing)
+            elif existing.timeline_start < start < existing.timeline_end - 0.0001:
+                tail = self._new_clip_tail(existing, start, start + duration)
+                new_track.extend((existing, tail))
+            else:
+                new_track.append(existing)
+        clip.timeline_start = start
+        new_track.append(clip)
+        track[:] = sorted(new_track, key=lambda c: c.timeline_start)
+        self.changed.emit()
+        return True
+
+    def overwrite_audio_clip(self, clip: AudioClip, track_idx: int = 0,
+                             timeline_start: Optional[float] = None) -> bool:
+        """Audio counterpart to :meth:`overwrite_video_clip`."""
+        tracks, infos = self._ensure_media_track("audio", max(0, int(track_idx)))
+        track_idx = max(0, int(track_idx))
+        if infos[track_idx].locked:
+            return False
+        start = max(0.0, float(clip.timeline_start if timeline_start is None
+                               else timeline_start))
+        end = start + max(0.001, float(clip.duration))
+        self._save_history()
+        self._overwrite_track_range(tracks[track_idx], start, end)
+        clip.timeline_start = start
+        tracks[track_idx].append(clip)
+        tracks[track_idx].sort(key=lambda c: c.timeline_start)
+        self.changed.emit()
+        return True
 
     def add_subtitle(self, block: SubtitleBlock, track_idx: int = -1):
         """添加字幕块。track_idx=-1 时自动选择不重叠的轨道；
         若所有轨道均有重叠，自动在顶部创建新轨道。
         同轨道内不推时间，同时间字幕自动堆叠到上层轨道。"""
-        self._save_history()
         dur = block.duration
         start = block.timeline_start
         end = block.timeline_end
+        if (track_idx >= 0 and track_idx < len(self.subtitle_track_info)
+                and self.subtitle_track_info[track_idx].locked):
+            return False
+        self._save_history()
 
         if track_idx >= 0:
             # 指定轨道：确保轨道存在
             while track_idx >= len(self.subtitle_tracks):
                 self.subtitle_tracks.append([])
                 self.subtitle_track_info.append(TrackInfo(f"字幕{len(self.subtitle_tracks)}"))
+            if (track_idx < len(self.subtitle_track_info)
+                    and self.subtitle_track_info[track_idx].locked):
+                return False
             # 指定轨同轨防重叠（向后推移）
             block.timeline_start = self._avoid_overlap(
                 self.subtitle_tracks[track_idx], block, dur)
@@ -704,6 +1022,8 @@ class EditTimeline(QObject):
             # 自动轨：找第一条无重叠的轨道，否则创建新轨道在顶部
             chosen = -1
             for i, track in enumerate(self.subtitle_tracks):
+                if i < len(self.subtitle_track_info) and self.subtitle_track_info[i].locked:
+                    continue
                 conflict = False
                 for existing in track:
                     if existing is block:
@@ -730,6 +1050,136 @@ class EditTimeline(QObject):
                     self.subtitle_track_info[0].name = "字幕1"
 
         self.changed.emit()
+        return True
+
+    def subtitle_free_start(self, track_idx: int, start: float, duration: float,
+                            exclude=None) -> float:
+        """Return the first non-overlapping start on a subtitle track.
+
+        The previous UI resolver only compared two candidate positions, which
+        could still leave a subtitle intersecting a third block.  Walking the
+        sorted intervals makes the result deterministic and handles dense ASR
+        tracks correctly.
+        """
+        if track_idx < 0 or track_idx >= len(self.subtitle_tracks):
+            return max(0.0, float(start))
+        cursor = max(0.0, float(start))
+        length = max(0.05, float(duration))
+        for other in sorted(self.subtitle_tracks[track_idx],
+                            key=lambda b: b.timeline_start):
+            if other is exclude:
+                continue
+            if cursor + length <= other.timeline_start + 0.0001:
+                break
+            if cursor < other.timeline_end - 0.0001:
+                cursor = other.timeline_end
+        return cursor
+
+    # ─── 分组 / 音视频链接 ───
+    def iter_items(self):
+        """Yield ``(kind, track_idx, item)`` for every timeline item."""
+        for kind, tracks in (("video", self.video_tracks),
+                             ("audio", self.audio_tracks),
+                             ("subtitle", self.subtitle_tracks)):
+            for track_idx, track in enumerate(tracks):
+                for item in track:
+                    yield kind, track_idx, item
+
+    def find_item(self, item_id: str):
+        """Find an item by stable id, returning ``(kind, track, item)``."""
+        for kind, track_idx, item in self.iter_items():
+            if getattr(item, "id", None) == item_id:
+                return kind, track_idx, item
+        return None
+
+    def get_group_items(self, group_id: str) -> list:
+        if not group_id:
+            return []
+        return [(kind, track_idx, item)
+                for kind, track_idx, item in self.iter_items()
+                if getattr(item, "group_id", None) == group_id]
+
+    def get_linked_items(self, link_id: str) -> list:
+        if not link_id:
+            return []
+        return [(kind, track_idx, item)
+                for kind, track_idx, item in self.iter_items()
+                if getattr(item, "link_id", None) == link_id]
+
+    def group_items(self, item_ids: list, group_id: Optional[str] = None) -> Optional[str]:
+        """Group selected timeline items without changing their positions."""
+        found = [self.find_item(item_id) for item_id in (item_ids or [])]
+        found = [entry for entry in found if entry is not None]
+        if len(found) < 2:
+            return None
+        if any(self._track_info_for(kind, track_idx).locked
+               for kind, track_idx, _item in found
+               if self._track_info_for(kind, track_idx) is not None):
+            return None
+        gid = group_id or str(uuid.uuid4())[:8]
+        self._save_history("编组")
+        for _kind, _track_idx, item in found:
+            item.group_id = gid
+        self.changed.emit()
+        return gid
+
+    def ungroup_items(self, item_ids: list) -> bool:
+        """Remove group membership from selected items and their full groups."""
+        groups = set()
+        for item_id in (item_ids or []):
+            entry = self.find_item(item_id)
+            if entry and getattr(entry[2], "group_id", None):
+                groups.add(entry[2].group_id)
+        if not groups:
+            return False
+        members = [entry for gid in groups for entry in self.get_group_items(gid)]
+        if any(self._track_info_for(kind, track_idx).locked
+               for kind, track_idx, _item in members
+               if self._track_info_for(kind, track_idx) is not None):
+            return False
+        self._save_history("解组")
+        for _kind, _track_idx, item in members:
+            item.group_id = None
+        self.changed.emit()
+        return True
+
+    def link_media_items(self, item_ids: list, link_id: Optional[str] = None) -> Optional[str]:
+        """Link selected video/audio items for later coordinated editing."""
+        found = [self.find_item(item_id) for item_id in (item_ids or [])]
+        found = [entry for entry in found if entry and entry[0] in ("video", "audio")]
+        if len(found) < 2 or len({entry[0] for entry in found}) < 2:
+            return None
+        if any(self._track_info_for(kind, track_idx).locked
+               for kind, track_idx, _item in found
+               if self._track_info_for(kind, track_idx) is not None):
+            return None
+        lid = link_id or str(uuid.uuid4())[:8]
+        self._save_history("链接音视频")
+        for _kind, _track_idx, item in found:
+            item.link_id = lid
+        self.changed.emit()
+        return lid
+
+    def unlink_media_items(self, item_ids: list) -> bool:
+        links = set()
+        for item_id in (item_ids or []):
+            entry = self.find_item(item_id)
+            if entry and getattr(entry[2], "link_id", None):
+                links.add(entry[2].link_id)
+        members = [entry for lid in links for entry in self.get_linked_items(lid)]
+        if not members:
+            return False
+        self._save_history("取消音视频链接")
+        for _kind, _track_idx, item in members:
+            item.link_id = None
+        self.changed.emit()
+        return True
+
+    def _track_info_for(self, kind: str, track_idx: int):
+        infos = (self.video_track_info if kind == "video" else
+                 self.audio_track_info if kind == "audio" else
+                 self.subtitle_track_info)
+        return infos[track_idx] if 0 <= track_idx < len(infos) else None
 
     def add_subtitle_track(self, name: str = "", insert_top: bool = True) -> int:
         """新建字幕轨，返回轨道索引。
@@ -790,6 +1240,12 @@ class EditTimeline(QObject):
             for item in sorted(group, key=lambda x: float(x.get("offset", 0.0))):
                 clone = copy.deepcopy(item["clip"])
                 clone.id = str(uuid.uuid4())[:8]
+                # A paste creates independent timeline items; never keep the
+                # source clip's group/link relationship by accident.
+                if hasattr(clone, "group_id"):
+                    clone.group_id = None
+                if hasattr(clone, "link_id"):
+                    clone.link_id = None
                 new_start = anchor + float(item.get("offset", 0.0))
                 duration = max(0.0, float(getattr(clone, "duration", 0.0)))
                 clone.timeline_start = new_start
@@ -801,6 +1257,8 @@ class EditTimeline(QObject):
             preferred = min(source_track_idx, max(0, len(tracks) - 1))
             chosen = -1
             for idx in range(preferred, len(tracks)):
+                if idx < len(infos) and infos[idx].locked:
+                    continue
                 conflict = any(
                     existing.timeline_start < end
                     and existing.timeline_end > start
@@ -833,6 +1291,9 @@ class EditTimeline(QObject):
         save_history=False 用于组合操作（如分割/删除），避免重复入栈撤回历史。"""
         if not self.auto_align or not self.video_tracks:
             return
+        if (self.video_track_info
+                and self.video_track_info[0].locked):
+            return
         track = self.video_tracks[0]
         if not track:
             return
@@ -851,25 +1312,33 @@ class EditTimeline(QObject):
 
     # ─── 删除 ───
     def remove_video_clip(self, clip_id: str):
-        self._save_history()
         removed_start = 0.0
         removed_end = 0.0
         found_track = -1
+        found_clip = None
         for track_idx, track in enumerate(self.video_tracks):
             for c in track:
                 if c.id == clip_id:
                     removed_start = c.timeline_start
                     removed_end = c.timeline_end
-                    track.remove(c)
                     found_track = track_idx
+                    found_clip = c
                     break
             if found_track >= 0:
                 break
+        if found_track < 0:
+            return False
+        if (found_track < len(self.video_track_info)
+                and self.video_track_info[found_track].locked):
+            return False
+        self._save_history()
+        self.video_tracks[found_track].remove(found_clip)
         if found_track >= 0:
             self._close_gap_on_track("video", found_track, removed_start, removed_end)
         # 清理空叠加轨（idx>0 且无片段）；主轨道 idx=0 永远保留
         self._prune_empty_video_tracks()
         self.changed.emit()
+        return True
 
     def _prune_empty_video_tracks(self):
         """删除末尾所有空叠加轨（保留主轨 idx=0 + 所有有内容的轨道）"""
@@ -895,25 +1364,43 @@ class EditTimeline(QObject):
         self.video_track_info = new_infos
 
     def remove_audio_clip(self, clip_id: str):
-        self._save_history()
         removed_start = 0.0
         removed_end = 0.0
         found_track = -1
+        found_clip = None
         for track_idx, track in enumerate(self.audio_tracks):
             for c in track:
                 if c.id == clip_id:
                     removed_start = c.timeline_start
                     removed_end = c.timeline_end
-                    track.remove(c)
                     found_track = track_idx
+                    found_clip = c
                     break
             if found_track >= 0:
                 break
+        if found_track < 0:
+            return False
+        if (found_track < len(self.audio_track_info)
+                and self.audio_track_info[found_track].locked):
+            return False
+        self._save_history()
+        self.audio_tracks[found_track].remove(found_clip)
         if found_track >= 0:
             self._close_gap_on_track("audio", found_track, removed_start, removed_end)
         self.changed.emit()
+        return True
 
     def remove_subtitle(self, block_id: str):
+        found = None
+        for idx, track in enumerate(self.subtitle_tracks):
+            if any(b.id == block_id for b in track):
+                found = idx
+                break
+        if found is None:
+            return False
+        if (found < len(self.subtitle_track_info)
+                and self.subtitle_track_info[found].locked):
+            return False
         self._save_history()
         for track in self.subtitle_tracks:
             if any(b.id == block_id for b in track):
@@ -922,6 +1409,7 @@ class EditTimeline(QObject):
         # 清理空轨并重新编号
         self._clean_subtitle_tracks()
         self.changed.emit()
+        return True
 
     def _clean_subtitle_tracks(self):
         """删除空字幕轨并重新编号剩余轨道"""
@@ -1042,9 +1530,12 @@ class EditTimeline(QObject):
 
     # ─── 分割视频片段 ───
     def split_video_clip(self, clip_id: str, split_pos: float) -> bool:
-        for track in self.video_tracks:
+        for track_idx, track in enumerate(self.video_tracks):
             for i, clip in enumerate(track):
                 if clip.id == clip_id and clip.timeline_start < split_pos < clip.timeline_end:
+                    if (track_idx < len(self.video_track_info)
+                            and self.video_track_info[track_idx].locked):
+                        return False
                     ratio = (split_pos - clip.timeline_start) / clip.duration
                     src_split = clip.trim_start + ratio * (clip.trim_end - clip.trim_start)
                     # 左右片段至少 0.15 秒，避免生成几乎看不见的蓝色碎屑
@@ -1094,9 +1585,12 @@ class EditTimeline(QObject):
 
     # ─── 分割音频片段 ───
     def split_audio_clip(self, clip_id: str, split_pos: float) -> bool:
-        for track in self.audio_tracks:
+        for track_idx, track in enumerate(self.audio_tracks):
             for i, clip in enumerate(track):
                 if clip.id == clip_id and clip.timeline_start < split_pos < clip.timeline_end:
+                    if (track_idx < len(self.audio_track_info)
+                            and self.audio_track_info[track_idx].locked):
+                        return False
                     ratio = (split_pos - clip.timeline_start) / clip.duration
                     src_split = clip.trim_start + ratio * (clip.trim_end - clip.trim_start)
                     # 左右片段至少 0.15 秒
@@ -1146,29 +1640,38 @@ class EditTimeline(QObject):
         for track_idx, track in enumerate(self.subtitle_tracks):
             for i, b in enumerate(track):
                 if b.id == block_id and b.timeline_start < split_pos < b.timeline_end:
+                    if (track_idx < len(self.subtitle_track_info)
+                            and self.subtitle_track_info[track_idx].locked):
+                        return False
                     self._save_history()
-                    right = SubtitleBlock(
-                        text=b.text,
-                        timeline_start=split_pos,
-                        timeline_end=b.timeline_end,
-                        font_family=b.font_family,
-                        font_size=b.font_size,
-                        font_bold=b.font_bold,
-                        font_italic=b.font_italic,
-                        font_underline=b.font_underline,
-                        color=b.color,
-                        outline_color=b.outline_color,
-                        outline_width=b.outline_width,
-                        background_color=b.background_color,
-                        position=b.position,
-                        margin_v=b.margin_v,
-                        align=b.align,
-                        letter_spacing=b.letter_spacing,
-                        line_spacing=b.line_spacing,
-                        pos_x=b.pos_x,
-                        pos_y=b.pos_y,
-                    )
+                    # Clone through the canonical serializer so newer
+                    # subtitle fields (fill, custom size, word timing,
+                    # keyframes, opacity, visibility) survive a split too.
+                    right = SubtitleBlock.from_dict(b.to_dict())
+                    right.id = str(uuid.uuid4())[:8]
+                    right.timeline_start = split_pos
                     b.timeline_end = split_pos
+                    offset = split_pos - b.timeline_start
+                    if b.keyframes:
+                        source_kfs = {prop: list(values)
+                                      for prop, values in b.keyframes.items()}
+                        right.keyframes = {
+                            prop: [(t - offset, value) for t, value in values
+                                   if t > offset + 0.001]
+                            for prop, values in source_kfs.items()
+                            if any(t > offset + 0.001 for t, _ in values)
+                        }
+                        b.keyframes = {
+                            prop: [(t, value) for t, value in values
+                                   if t <= offset]
+                            for prop, values in source_kfs.items()
+                            if any(t <= offset for t, _ in values)
+                        }
+                    if b.word_timings:
+                        right.word_timings = [t - offset for t in b.word_timings
+                                              if t > offset + 0.001]
+                        b.word_timings = [t for t in b.word_timings
+                                          if t <= offset]
                     track.insert(i + 1, right)
                     self.changed.emit()
                     return True
@@ -1192,15 +1695,45 @@ class EditTimeline(QObject):
     #   - redo  → 恢复到 history[index+1]（即下一步操作后的状态），index 加 1
     # 首次 undo 时把「当前实时状态（最后一次操作后的状态）」补入历史，
     # 保证后续 redo 能一路回到最新状态。
-    def _save_history(self):
-        state = self._snapshot()
+    def _append_history_snapshot(self, state: dict, label: str = ""):
         self._history = self._history[:self._undo_index + 1]
+        self._history_labels = self._history_labels[:self._undo_index + 1]
         self._history.append(state)
+        self._history_labels.append(label)
         self._undo_index = len(self._history) - 1
         self._undo_active = False  # 新操作 → 退出撤回浏览态
         if len(self._history) > 50:
             self._history.pop(0)
+            self._history_labels.pop(0)
             self._undo_index -= 1
+
+    def _save_history(self, label: str = ""):
+        if self._history_transaction_depth:
+            return
+        self._append_history_snapshot(self._snapshot(), label)
+
+    @contextmanager
+    def edit_transaction(self, label: str = "", record: bool = True):
+        """Group nested model mutations into one undo step."""
+        outer = self._history_transaction_depth == 0
+        if outer:
+            self._history_transaction_snapshot = self._snapshot()
+        self._history_transaction_depth += 1
+        try:
+            yield self
+        finally:
+            self._history_transaction_depth -= 1
+            if outer:
+                state = self._history_transaction_snapshot
+                self._history_transaction_snapshot = None
+                if state is not None and record:
+                    self._append_history_snapshot(state, label)
+
+    def execute_command(self, name: str, mutate: Callable[[], Any]) -> TimelineCommand:
+        """Execute a named edit through the shared command contract."""
+        command = TimelineCommand(self, name, mutate)
+        command.execute()
+        return command
 
     def undo(self):
         if self._undo_index < 0:
@@ -1242,6 +1775,13 @@ class EditTimeline(QObject):
                              for track in self.audio_tracks],
             "subtitle":     [[copy.deepcopy(b) for b in track]
                               for track in self.subtitle_tracks],
+            # Track state is part of the edit state.  Keeping it outside the
+            # snapshot made mute/lock changes impossible to undo and caused
+            # restored projects to drift from what the user saw.
+            "auto_align": self.auto_align,
+            "video_track_info": [ti.to_dict() for ti in self.video_track_info],
+            "audio_track_info": [ti.to_dict() for ti in self.audio_track_info],
+            "subtitle_track_info": [ti.to_dict() for ti in self.subtitle_track_info],
         }
 
     def _restore(self, state: dict):
@@ -1265,6 +1805,38 @@ class EditTimeline(QObject):
         else:
             # 旧格式：单列表
             self.subtitle_tracks = [sub]
+
+        # Track metadata was added after the original undo format.  Accept
+        # older snapshots, but restore newer ones completely so undo/redo is
+        # a faithful state transition rather than a clip-only rewind.
+        if "auto_align" in state:
+            self.auto_align = bool(state["auto_align"])
+        if "video_track_info" in state:
+            self.video_track_info = [TrackInfo.from_dict(x)
+                                     for x in state["video_track_info"]]
+        if "audio_track_info" in state:
+            self.audio_track_info = [TrackInfo.from_dict(x)
+                                     for x in state["audio_track_info"]]
+        if "subtitle_track_info" in state:
+            self.subtitle_track_info = [TrackInfo.from_dict(x)
+                                        for x in state["subtitle_track_info"]]
+
+        # Keep metadata and track arrays aligned for both legacy snapshots and
+        # projects created before explicit track metadata existed.
+        def _sync_infos(tracks, infos, prefix):
+            infos = list(infos or [])
+            while len(infos) < len(tracks):
+                idx = len(infos)
+                infos.append(TrackInfo("主轨道" if idx == 0 and prefix == "视频"
+                                       else f"{prefix}{idx + 1 if prefix != '视频' else idx}"))
+            return infos[:len(tracks)]
+
+        self.video_track_info = _sync_infos(
+            self.video_tracks, self.video_track_info, "视频")
+        self.audio_track_info = _sync_infos(
+            self.audio_tracks, self.audio_track_info, "音频")
+        self.subtitle_track_info = _sync_infos(
+            self.subtitle_tracks, self.subtitle_track_info, "字幕")
 
     # ─── 生成 SRT ───
     def export_srt(self, path: str):
@@ -1297,6 +1869,7 @@ class EditTimeline(QObject):
 
         return {
             "name": self.name,
+            "canvas_bg_color": self.canvas_bg_color,
             "auto_align": self.auto_align,
             "video_tracks": _clips_to_dict(self.video_tracks),
             "audio_tracks": _clips_to_dict(self.audio_tracks),
@@ -1311,6 +1884,7 @@ class EditTimeline(QObject):
         """从 dict 恢复时间线"""
         tl = EditTimeline(parent)
         tl.name = d.get("name", "")
+        tl.canvas_bg_color = d.get("canvas_bg_color", "#000000") or "#000000"
         tl.auto_align = d.get("auto_align", True)
 
         # 恢复轨道信息
@@ -1700,6 +2274,7 @@ class FFmpegDirectExportWorker(QThread):
 
     progress = pyqtSignal(int, str)
     finished = pyqtSignal(bool, str)
+    _nvenc_probe_cache: dict[str, bool] = {}
 
     def __init__(self, timeline, output: str, resolution: Tuple[int, int],
                  fps: float = 30.0, crf: int = 18,
@@ -1713,6 +2288,35 @@ class FFmpegDirectExportWorker(QThread):
         self.crf = crf
         self._cancelled = False
         self._proc = None
+
+    @classmethod
+    def _has_nvenc(cls, ff: str) -> bool:
+        """Probe the actual encoder once; listing an encoder does not prove a GPU exists."""
+        if ff not in cls._nvenc_probe_cache:
+            import sys
+            try:
+                probe = subprocess.run(
+                    [ff, "-hide_banner", "-loglevel", "error",
+                     "-f", "lavfi", "-i", "color=c=black:s=320x180:r=1:d=1",
+                     "-frames:v", "1", "-c:v", "h264_nvenc",
+                     "-f", "null", "-"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=8,
+                    creationflags=(subprocess.CREATE_NO_WINDOW
+                                   if sys.platform == "win32" else 0),
+                )
+                cls._nvenc_probe_cache[ff] = probe.returncode == 0
+            except (OSError, subprocess.TimeoutExpired):
+                cls._nvenc_probe_cache[ff] = False
+        return cls._nvenc_probe_cache[ff]
+
+    def _video_encoder_args(self, ff: str, *, software: bool = False) -> tuple[list, bool]:
+        if not software and self._has_nvenc(ff):
+            return (["-c:v", "h264_nvenc", "-preset", "p3",
+                     "-rc", "vbr", "-cq", str(self.crf), "-b:v", "0",
+                     "-pix_fmt", "yuv420p"], True)
+        return (["-c:v", "libx264", "-preset", "veryfast",
+                 "-crf", str(self.crf), "-pix_fmt", "yuv420p"], False)
 
     def cancel(self):
         self._cancelled = True
@@ -1844,7 +2448,10 @@ class FFmpegDirectExportWorker(QThread):
                 total_dur = max(total_dur, c.timeline_start + dur)
 
         # ── 字幕轨 ──
-        for track in self.tl.subtitle_tracks:
+        for track_idx, track in enumerate(self.tl.subtitle_tracks):
+            info_list = getattr(self.tl, "subtitle_track_info", []) or []
+            if track_idx < len(info_list) and info_list[track_idx].muted:
+                continue
             for b in track:
                 if getattr(b, 'visible', True) and getattr(b, 'text', '').strip():
                     subtitles.append(b)
@@ -1856,6 +2463,8 @@ class FFmpegDirectExportWorker(QThread):
 
     def _build_video_graph(self, video_clips, total_dur):
         """构建视频滤镜图。返回 filter_complex 字符串片段列表和最终输出标签。"""
+        if self._uses_fast_layer_graph(video_clips):
+            return self._build_fast_layer_graph(video_clips, total_dur)
         parts = []
         W, H = self.W, self.H
 
@@ -1990,6 +2599,176 @@ class FFmpegDirectExportWorker(QThread):
         # 其余情况（单背景 / 有间隙 / 无背景）：沿用原 overlay 模型（硬切，无转场）
         return self._build_overlay_all(parts, processed, total_dur, W, H, self.fps)
 
+    def _uses_fast_layer_graph(self, video_clips):
+        """Use source-sized layers when a timeline has ordinary PiP or placement."""
+        if self._fast_transition_background(video_clips):
+            return True
+        # A non-black canvas must also use this graph: the legacy path starts black.
+        if str(getattr(self.tl, "canvas_bg_color", "#000000") or "#000000").lower() != "#000000":
+            return True
+        for vc in video_clips:
+            clip = vc["clip"]
+            if getattr(clip, "mask_enabled", False):
+                return True
+            if vc["track"] > 0:
+                return True
+            if (abs(float(getattr(clip, "pos_x", 0.0) or 0.0)) > 0.001
+                    or abs(float(getattr(clip, "pos_y", 0.0) or 0.0)) > 0.001
+                    or abs(float(getattr(clip, "scale", 1.0) or 1.0) - 1.0) > 0.001
+                    or abs(float(getattr(clip, "opacity", 1.0)) - 1.0) > 0.001):
+                return True
+        return False
+
+    def _build_fast_layer_graph(self, video_clips, total_dur):
+        """FFmpeg source-sized overlays; blank space around a PiP stays transparent."""
+        from collections import Counter, defaultdict
+
+        parts = []
+        bg = str(getattr(self.tl, "canvas_bg_color", "#000000") or "#000000")
+        bg = bg.lstrip("#")
+        if len(bg) != 6 or any(ch not in "0123456789abcdefABCDEF" for ch in bg):
+            bg = "000000"
+        parts.append(
+            f"color=c=0x{bg}:s={self.W}x{self.H}:d={total_dur:.4f}:r={self.fps},"
+            "format=rgba[layerbase]")
+
+        counts = Counter(vc["input_idx"] for vc in video_clips)
+        branch_index = defaultdict(int)
+        for idx, count in counts.items():
+            if count > 1:
+                outputs = "".join(f"[vsrc{idx}_{j}]" for j in range(count))
+                parts.append(f"[{idx}:v]split={count}{outputs}")
+
+        transition_bg = self._fast_transition_background(video_clips)
+        layers = []
+        for n, vc in enumerate(sorted(video_clips,
+                                      key=lambda item: (item["track"], item["clip"].timeline_start))):
+            clip = vc["clip"]
+            idx = vc["input_idx"]
+            if counts[idx] > 1:
+                branch = branch_index[idx]
+                branch_index[idx] += 1
+                source = f"[vsrc{idx}_{branch}]"
+            else:
+                source = f"[{idx}:v]"
+            source_dur = max(0.001, clip.trim_end - clip.trim_start)
+            speed = max(0.01, float(clip.speed))
+            start = max(0.0, float(clip.timeline_start))
+            end = start + vc["playback_dur"]
+            scale = max(0.001, float(clip.scale))
+            opacity = max(0.0, min(1.0, float(clip.opacity)))
+            if vc["is_image"]:
+                chain = f"{source}trim=duration={source_dur:.6f},setpts=PTS-STARTPTS"
+            else:
+                chain = (f"{source}trim=start={clip.trim_start:.6f}:"
+                         f"duration={source_dur:.6f},setpts=PTS-STARTPTS")
+            if abs(speed - 1.0) > 0.001:
+                chain += f",setpts=PTS/{speed:.8f}"
+            fit = f"min({self.W}/iw\\,{self.H}/ih)"
+            target_w = f"max(1\\,trunc(iw*{fit}*{scale:.8f}))"
+            target_h = f"max(1\\,trunc(ih*{fit}*{scale:.8f}))"
+            chain += (f",fps={self.fps},"
+                      f"scale=w='{target_w}':h='{target_h}':flags=bilinear")
+            chain += ",setsar=1,format=rgba"
+            if opacity < 0.9999:
+                chain += f",colorchannelmixer=aa={opacity:.6f}"
+            mask_input = getattr(self, "_fast_mask_inputs", {}).get(id(clip))
+            shifted = not (transition_bg and vc["track"] == 0)
+            pts = (f",setpts=PTS+{start:.6f}/TB" if shifted else "")
+            if mask_input is not None:
+                parts.append(chain + f"[masksource{n}]")
+                parts.append(
+                    f"[masksource{n}]split=2[maskcolor{n}][maskalpha{n}]")
+                parts.append(f"[maskalpha{n}]alphaextract[originalpha{n}]")
+                parts.append(
+                    f"[{mask_input}:v]fps={self.fps},format=gray,"
+                    f"trim=duration={vc['playback_dur']:.6f},"
+                    f"setpts=PTS-STARTPTS[maskbitmap{n}]")
+                parts.append(
+                    f"[originalpha{n}][maskbitmap{n}]"
+                    f"blend=all_mode=multiply[combinedalpha{n}]")
+                parts.append(
+                    f"[maskcolor{n}][combinedalpha{n}]"
+                    f"alphamerge{pts}[layer{n}]")
+            else:
+                parts.append(chain + f"{pts}[layer{n}]")
+            px = int(float(getattr(clip, "pos_x", 0.0) or 0.0))
+            py = int(float(getattr(clip, "pos_y", 0.0) or 0.0))
+            layers.append((n, vc, start, end, px, py))
+
+        current = "layerbase"
+        if transition_bg:
+            background_layers = [item for item in layers if item[1]["track"] == 0]
+            background_color = f"0x{bg}"
+            for n, vc, _start, _end, px, py in background_layers:
+                duration = vc["playback_dur"]
+                parts.append(
+                    f"color=c={background_color}:s={self.W}x{self.H}:"
+                    f"d={duration:.6f}:r={self.fps},format=rgba[bgblank{n}]")
+                parts.append(
+                    f"[bgblank{n}][layer{n}]"
+                    f"overlay=x=(W-w)/2+{px}:y=(H-h)/2+{py}:"
+                    f"shortest=1:format=auto,format=yuv420p[bgclip{n}]")
+            first_n, first_vc, *_ = background_layers[0]
+            bg_current = f"bgclip{first_n}"
+            bg_duration = first_vc["playback_dur"]
+            for n, vc, _start, _end, _px, _py in background_layers[1:]:
+                previous = first_vc["clip"]
+                transition = getattr(previous, "out_transition", None) or {}
+                next_label = f"bgjoin{n}"
+                if transition.get("type"):
+                    duration = float(transition["duration"])
+                    mode = self._native_transition_mode(transition["type"])
+                    if mode:
+                        parts.append(
+                            f"[{bg_current}]tpad=stop_mode=clone:"
+                            f"stop_duration={duration:.6f}[bgheld{n}]")
+                        parts.append(
+                            f"[bgheld{n}][bgclip{n}]"
+                            f"xfade=transition={mode}:duration={duration:.6f}:"
+                            f"offset={bg_duration:.6f}[{next_label}]")
+                    else:
+                        asset = getattr(self, "_fast_transition_inputs", {}).get(
+                            id(previous))
+                        if asset is None:
+                            raise RuntimeError("转场片段未准备完成")
+                        parts.append(
+                            f"[{asset}:v]fps={self.fps},"
+                            f"trim=duration={duration:.6f},"
+                            f"setpts=PTS-STARTPTS[transition{n}]")
+                        parts.append(
+                            f"[{bg_current}][transition{n}]"
+                            f"concat=n=2:v=1:a=0[bgwithtrans{n}]")
+                        parts.append(
+                            f"[bgclip{n}]trim=start={duration:.6f},"
+                            f"setpts=PTS-STARTPTS[bgremainder{n}]")
+                        parts.append(
+                            f"[bgwithtrans{n}][bgremainder{n}]"
+                            f"concat=n=2:v=1:a=0[{next_label}]")
+                else:
+                    parts.append(
+                        f"[{bg_current}][bgclip{n}]"
+                        f"concat=n=2:v=1:a=0[{next_label}]")
+                bg_current = next_label
+                bg_duration += vc["playback_dur"]
+                first_vc = vc
+            parts.append(
+                f"[{current}][{bg_current}]overlay=0:0:"
+                f"eof_action=pass:repeatlast=0:format=auto[stackbg]")
+            current = "stackbg"
+
+        for n, vc, start, end, px, py in layers:
+            if transition_bg and vc["track"] == 0:
+                continue
+            next_label = f"stack{n}"
+            parts.append(
+                f"[{current}][layer{n}]overlay=x=(W-w)/2+{px}:y=(H-h)/2+{py}:"
+                f"enable='gte(t,{start:.6f})*lt(t,{end:.6f})':"
+                f"eof_action=pass:repeatlast=0:format=auto[{next_label}]")
+            current = next_label
+        parts.append(f"[{current}]format=yuv420p[vout]")
+        return parts, "vout"
+
     # ── 转场（xfade）辅助 ──────────────────────
 
     @staticmethod
@@ -2086,6 +2865,67 @@ class FFmpegDirectExportWorker(QThread):
         parts.append(f"[{prev_label}]null[vout]")
         return parts, "vout"
 
+    def _build_raster_subtitle_layers(self, subtitles, video_label, input_count):
+        """Rasterize static text once with the preview renderer, then overlay it."""
+        if not subtitles:
+            return [], video_label, [], None
+        import tempfile
+        import numpy as np
+        from PyQt6.QtGui import QImage
+        from core.compositor import VideoCompositor
+
+        tempdir = tempfile.TemporaryDirectory(prefix="cep_subtitles_")
+        compositor = None
+        try:
+            compositor = VideoCompositor(
+                self.tl, (self.W, self.H), self.fps,
+                subtitle_reference_resolution=self.reference_resolution)
+            parts = []
+            input_args = []
+            current = video_label
+            raster_count = 0
+            for n, block in enumerate(subtitles):
+                self._check_cancel()
+                image = QImage(self.W, self.H, QImage.Format.Format_ARGB32)
+                image.fill(Qt.GlobalColor.transparent)
+                compositor.paint_subtitles_on_image(
+                    image, [block], block.timeline_start)
+                rgba = image.convertToFormat(QImage.Format.Format_RGBA8888)
+                pixels = np.frombuffer(
+                    rgba.constBits().asstring(rgba.sizeInBytes()), np.uint8
+                ).reshape(self.H, self.W, 4)
+                alpha = pixels[:, :, 3] != 0
+                rows = np.flatnonzero(alpha.any(axis=1))
+                if len(rows) == 0:
+                    continue
+                columns = np.flatnonzero(alpha.any(axis=0))
+                x0 = max(0, int(columns[0]) - 1)
+                y0 = max(0, int(rows[0]) - 1)
+                x1 = min(self.W, int(columns[-1]) + 2)
+                y1 = min(self.H, int(rows[-1]) + 2)
+                cropped = image.copy(x0, y0, x1 - x0, y1 - y0)
+                path = os.path.join(tempdir.name, f"subtitle_{n:05d}.png")
+                if not cropped.save(path):
+                    raise RuntimeError(f"字幕图层保存失败：{path}")
+                input_args.extend(["-loop", "1", "-i", path])
+                input_idx = input_count + raster_count
+                raster_count += 1
+                next_label = f"caption{n}"
+                start = max(0.0, float(block.timeline_start))
+                end = max(start, float(block.timeline_end))
+                parts.append(
+                    f"[{current}][{input_idx}:v]overlay={x0}:{y0}:"
+                    f"enable='gte(t,{start:.6f})*lt(t,{end:.6f})':"
+                    f"eof_action=pass:repeatlast=0:format=auto[{next_label}]")
+                current = next_label
+            return parts, current, input_args, tempdir
+        except Exception:
+            tempdir.cleanup()
+            raise
+        finally:
+            if compositor is not None:
+                compositor.close()
+
     def _build_subtitle_filters(self, subtitles, video_label="vout"):
         """构建字幕 drawtext 滤镜链。返回 filter_complex 片段和最终标签。"""
         parts = []
@@ -2174,16 +3014,13 @@ class FFmpegDirectExportWorker(QThread):
     def _build_audio_graph(self, audio_clips, total_dur):
         """构建音频滤镜图。返回 filter_complex 片段和最终标签。
 
-        转场音频处理：背景轨相邻且有 outgoing 转场的两段 (A→B)，
-        对 A 尾音加 afade out、对 B 头音加 afade in，并把 B 音频起点前移 d
-        秒实现重叠，从而与视频 xfade 重叠窗口一致（音频交叉淡入淡出，
-        不再在截断处硬切 / 错位）。无转场时行为完全不变。"""
+        转场音频处理：A 的尾音淡出，B 从自身时间线起点淡入。
+        不把 B 的音频提前到 A 尚未结束的时段。"""
         parts = []
 
         # ── 1) 扫描背景轨（track 0）转场对 ──
         a_to_b = {}   # id(A) -> (B_clip, d, A_end)
         b_to_a = {}   # id(B) -> (A_clip, d, A_end)
-        bg_overlap = 0.0
         tracks = getattr(self.tl, 'video_tracks', []) or []
         if tracks:
             track0 = tracks[0]
@@ -2203,7 +3040,6 @@ class FFmpegDirectExportWorker(QThread):
                     continue
                 a_to_b[id(A)] = (B, d, A_end)
                 b_to_a[id(B)] = (A, d, A_end)
-                bg_overlap += d
 
         # ── 2) 去重：只过滤同一个片段对象的意外重复收集 ──
         # 同一素材可以被用户多次放到不同时间点；旧 key 没有 timeline_start，
@@ -2277,10 +3113,10 @@ class FFmpegDirectExportWorker(QThread):
             if abs(vol - 1.0) > 0.01:
                 filters.append(f"volume={vol:.4f}")
 
-            # 转场：B 头音淡入，且起点前移 d 与 A 尾音重叠（交叉淡入淡出）
+            # 转场：B 头音从其时间线起点淡入。
             if b_info is not None:
                 _A, _d, _A_end = b_info
-                delay_ms = int((_A_end - _d) * 1000)
+                delay_ms = int(_A_end * 1000)
                 filters.append(f"afade=t=in:st=0:d={_d:.4f}")
             # 转场：A 尾音淡出（在自身音频末尾 d 秒内）
             if fade_out_d > 0:
@@ -2296,8 +3132,7 @@ class FFmpegDirectExportWorker(QThread):
         if not parts:
             return [], ""
 
-        # 音频总时长按背景轨转场重叠量缩短，与视频 xfade 输出长度对齐
-        audio_total = max(0.01, total_dur - bg_overlap)
+        audio_total = max(0.01, total_dur)
 
         n_inputs = len(unique)
         if n_inputs == 1:
@@ -2330,59 +3165,89 @@ class FFmpegDirectExportWorker(QThread):
                     return True
         return False
 
+    def _fast_transition_background(self, video_clips):
+        """Return contiguous background clips eligible for FFmpeg transitions."""
+        from core.slideshow_engine import TRANSITIONS
+        modes = set(TRANSITIONS.values())
+        background = sorted((vc for vc in video_clips if vc["track"] == 0),
+                            key=lambda vc: vc["clip"].timeline_start)
+        if len(background) < 2 or abs(background[0]["clip"].timeline_start) > 0.001:
+            return None
+        has_transition = False
+        for previous, following in zip(background, background[1:]):
+            a = previous["clip"]
+            b = following["clip"]
+            end = a.timeline_start + previous["playback_dur"]
+            if abs(b.timeline_start - end) > 0.001:
+                return None
+            transition = getattr(a, "out_transition", None) or {}
+            if transition.get("type"):
+                duration = float(transition.get("duration", 0.5))
+                if (transition["type"] not in modes or duration <= 0
+                        or duration > min(previous["playback_dur"],
+                                          following["playback_dur"])):
+                    return None
+                if (self._native_transition_mode(transition["type"]) is None
+                        and duration >= following["playback_dur"] - 1 / self.fps):
+                    return None
+                has_transition = True
+        return background if has_transition else None
+
+    @staticmethod
+    def _native_transition_mode(kind):
+        # xfade's wipe names describe travel, while the editor names the edge
+        # where the incoming picture first appears.
+        return {
+            "fade": "fade", "wipe_left": "wiperight",
+            "wipe_right": "wipeleft", "wipe_up": "wipedown",
+            "wipe_down": "wipeup",
+        }.get(kind)
+
     def _needs_compositor(self, video_clips, input_alpha):
         """判断是否需要走 compositor 逐帧渲染（而非 FFmpeg filter_complex 直接导出）。
 
         compositor 路径在以下情况必须启用：
-        1. 背景轨含任意转场（xfade 不支持自定义型，且与预览逐帧一致）
+        1. 背景轨时间布局无法用 FFmpeg 片段图表达；连续片段的
+           淡入/擦除走原生 xfade，其余内置转场只渲染效果窗口。
         2. 任意视频片段启用了绿幕抠像（chroma_key_enabled）
-        3. 任意视频片段启用了几何蒙版（mask_enabled）
-        4. 时间线上存在 FFmpeg drawtext 无法精确复现的复杂字幕（逐词动画、
-           关键帧、旋转、自定义尺寸/字距/行距、填充圆角或描边）。普通纯文字
-           字幕继续走 FFmpeg 原生 drawtext；带样式字幕使用与预览同源的 Qt
-           绘制，避免颜色、透明度、圆角和描边发生变化。
+        3. 带动态关键帧的几何蒙版；静态蒙版只生成一次灰度贴图，
+           在 FFmpeg 中与原始 alpha 相乘。
+        4. 逐词动画或关键帧字幕需要每帧重新绘制；其它字幕可先用
+           预览同源的 Qt 绘制一次，再作为透明层交给 FFmpeg 合成。
 
-        5. 存在叠加视频轨或视频变换（位置/缩放/旋转/透明度/关键帧）。快速
-           filter_complex 路径的片段预处理是全画布帧，非透明 MP4 放在叠加轨
-           时会把整张黑色画布盖到背景上；同时它无法可靠复现动态变换。交给
-           compositor 后，叠加轨和预览都使用同一套按源帧绘制逻辑。
+        5. 动态关键帧、旋转或模糊继续逐帧渲染；静态多轨、位置、缩放、
+           透明度使用源尺寸的 FFmpeg 图，透明区域不会覆盖下层轨道。
 
-        注意：单独的 alpha 视频（MOV ProRes 4444 / WebM VP9 alpha 等）仍可走
-        快速路径，filter_complex 已通过 `format=rgba` + `overlay=format=auto`
-        正确处理透明通道；但叠加轨和视频变换按上面的规则统一走 compositor。
+        Alpha MOV / WebM 静态叠加也走 FFmpeg 图：format=rgba 和
+        overlay=format=auto 会在解码后保留透明通道。
         逐帧 compositor 在 1080p 下约 8MB/帧经 Python 管道喂给 ffmpeg，速度慢
         一个数量级以上，因此无叠加/变换的普通主轨仍保留快速路径。
         """
-        if self._bg_has_transition(video_clips):
+        input_alpha = input_alpha or []
+        if (self._bg_has_transition(video_clips)
+                and self._fast_transition_background(video_clips) is None):
             return True
         for vc in video_clips:
             clip = vc["clip"]
-            # 叠加轨必须保留源帧之外的透明区域。直接 FFmpeg 路径会把普通
-            # MP4 先 pad 成整张不透明画布，随后 overlay 时覆盖背景，导致
-            # “视频1轨道”导出黑屏/失败。compositor 使用 QPainter SourceOver，
-            # 与预览的 PiP 合成保持一致。
-            if vc["track"] > 0:
-                return True
             if getattr(clip, "chroma_key_enabled", False):
                 return True
             if getattr(clip, "mask_enabled", False):
-                return True
-            # 快速路径只支持静态的基础布局；这些属性一旦被编辑，就必须
-            # 走同源渲染，否则导出画面会继续使用旧的全画布滤镜结果。
+                kf = getattr(clip, "keyframes", None) or {}
+                if any(kf.get(key) for key in (
+                        "mask_x", "mask_y", "mask_width", "mask_height",
+                        "mask_rotation", "mask_feather")):
+                    return True
+            # 快速图支持静态位置/缩放/透明度；其它像素效果仍走同源渲染。
             try:
-                if abs(float(getattr(clip, "pos_x", 0.0) or 0.0)) > 0.001:
-                    return True
-                if abs(float(getattr(clip, "pos_y", 0.0) or 0.0)) > 0.001:
-                    return True
-                if abs(float(getattr(clip, "scale", 1.0) or 1.0) - 1.0) > 0.001:
-                    return True
                 if abs(float(getattr(clip, "rotation", 0.0) or 0.0)) > 0.001:
                     return True
-                opacity = getattr(clip, "opacity", 1.0)
-                # 0 是合法值（完全透明），不能用 ``or 1.0`` 把它还原成
-                # 不透明，否则快速路径会漏掉这次变换。
-                if abs(float(opacity) - 1.0) > 0.001:
+                if float(getattr(clip, "blur_radius", 0.0) or 0.0) > 0.5:
                     return True
+                float(getattr(clip, "pos_x", 0.0) or 0.0)
+                float(getattr(clip, "pos_y", 0.0) or 0.0)
+                if float(getattr(clip, "scale", 1.0)) <= 0:
+                    return True
+                float(getattr(clip, "opacity", 1.0))
             except (TypeError, ValueError):
                 # 非法的旧工程值交给 compositor 的安全回退处理，不让导出
                 # 静默采用与预览不同的结果。
@@ -2402,28 +3267,142 @@ class FFmpegDirectExportWorker(QThread):
                           and getattr(block, "timeline_end", 0) > getattr(block, "timeline_start", 0))
                 if not active:
                     continue
-                complex_subtitle = (
-                    bool(getattr(block, "word_animation", False))
-                    or bool(getattr(block, "keyframes", None))
-                    or abs(float(getattr(block, "rotation", 0.0) or 0.0)) > 0.001
-                    or int(getattr(block, "custom_width", 0) or 0) > 0
-                    or int(getattr(block, "custom_height", 0) or 0) > 0
-                    or int(getattr(block, "letter_spacing", 0) or 0) != 0
-                    or int(getattr(block, "line_spacing", 0) or 0) != 0
-                    or bool(getattr(block, "font_bold", False))
-                    or bool(getattr(block, "font_italic", False))
-                    or bool(getattr(block, "font_underline", False))
-                    or abs(float(getattr(block, "opacity", 1.0) or 1.0) - 1.0) > 0.001
-                    or bool(getattr(block, "fill_enabled", False))
-                    or int(getattr(block, "border_radius", 0) or 0) > 0
-                    or int(getattr(block, "outline_width", 0) or 0) > 0
-                )
-                if complex_subtitle:
+                if (bool(getattr(block, "word_animation", False))
+                        or bool(getattr(block, "keyframes", None))):
                     return True
         return False
 
-    def _export_via_compositor(self, ff, input_files, audio_clips, total_dur):
-        """背景轨含转场时，视频经 compositor 逐帧渲染（与预览同源，15 种转场像素级一致），
+    def _prepare_fast_masks(self, video_clips, input_count):
+        """Rasterize each static mask once at its transformed clip size."""
+        import tempfile
+        import numpy as np
+        from PyQt6.QtGui import QImage
+        from utils.video_mask import build_mask_alpha, evaluate_mask_values
+
+        masked = [vc for vc in video_clips
+                  if getattr(vc["clip"], "mask_enabled", False)]
+        if not masked:
+            return {}, [], None
+        directory = tempfile.TemporaryDirectory(prefix="cep_masks_")
+        inputs = []
+        indices = {}
+        try:
+            for n, vc in enumerate(masked):
+                clip = vc["clip"]
+                if vc["is_image"]:
+                    source = QImage(clip.source_path)
+                    source_w, source_h = source.width(), source.height()
+                else:
+                    from utils.alpha_video import _probe_video_info
+                    source_w, source_h, _fps = _probe_video_info(clip.source_path)
+                if source_w <= 0 or source_h <= 0:
+                    raise ValueError(f"无法读取蒙版素材尺寸：{clip.source_path}")
+                scale = max(0.001, float(clip.scale))
+                fit = min(self.W / source_w, self.H / source_h)
+                width = max(1, int(source_w * fit * scale))
+                height = max(1, int(source_h * fit * scale))
+                mask = np.ascontiguousarray(build_mask_alpha(
+                    width, height, evaluate_mask_values(clip)))
+                image = QImage(mask.data, width, height, mask.strides[0],
+                               QImage.Format.Format_Grayscale8).copy()
+                path = os.path.join(directory.name, f"mask_{n:05d}.png")
+                if not image.save(path):
+                    raise OSError(f"无法生成蒙版贴图：{path}")
+                indices[id(clip)] = input_count + n
+                inputs.extend(["-loop", "1", "-i", path])
+            return indices, inputs, directory
+        except Exception:
+            directory.cleanup()
+            raise
+
+    def _prepare_transition_assets(self, background, input_count, ff):
+        """Render custom transitions only during their short effect windows."""
+        if not background:
+            return {}, [], None
+        pairs = []
+        for previous, following in zip(background, background[1:]):
+            transition = getattr(previous["clip"], "out_transition", None) or {}
+            kind = transition.get("type")
+            if kind and self._native_transition_mode(kind) is None:
+                pairs.append((previous, following, float(transition["duration"])))
+        if not pairs:
+            return {}, [], None
+
+        import math
+        import tempfile
+        import sys
+        from core.compositor import VideoCompositor
+        from PyQt6.QtGui import QImage
+
+        directory = tempfile.TemporaryDirectory(prefix="cep_transitions_")
+        renderer = VideoCompositor(
+            self.tl, (self.W, self.H), self.fps,
+            subtitle_reference_resolution=self.reference_resolution)
+        indices = {}
+        inputs = []
+        creationflags = (subprocess.CREATE_NO_WINDOW
+                         if sys.platform == "win32" else 0)
+        try:
+            for n, (previous, following, duration) in enumerate(pairs):
+                self._check_cancel()
+                path = os.path.join(directory.name, f"transition_{n:05d}.mp4")
+                command = [
+                    ff, "-y", "-loglevel", "error",
+                    "-f", "rawvideo", "-pix_fmt", "rgba",
+                    "-s", f"{self.W}x{self.H}", "-r", str(self.fps),
+                    "-i", "-", "-an", "-c:v", "libx264",
+                    "-preset", "veryfast", "-crf", "16",
+                    "-pix_fmt", "yuv420p", path,
+                ]
+                proc = subprocess.Popen(
+                    command, stdin=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                    creationflags=creationflags)
+                self._proc = proc
+                try:
+                    end = (previous["clip"].timeline_start
+                           + previous["playback_dur"])
+                    frames = max(1, int(math.ceil(duration * self.fps)))
+                    for frame in range(frames):
+                        self._check_cancel()
+                        image = renderer.render_background_transition(
+                            previous["clip"], following["clip"],
+                            end + frame / self.fps)
+                        rgba = image.convertToFormat(
+                            QImage.Format.Format_RGBA8888)
+                        proc.stdin.write(bytes(
+                            rgba.constBits().asstring(rgba.sizeInBytes())))
+                    proc.stdin.close()
+                    error = proc.stderr.read()
+                    proc.wait(timeout=60)
+                    if proc.returncode != 0:
+                        raise RuntimeError(
+                            "转场片段编码失败："
+                            + error.decode("utf-8", "replace")[-1000:])
+                except Exception:
+                    if proc.poll() is None:
+                        proc.kill()
+                        proc.wait(timeout=5)
+                    raise
+                finally:
+                    self._proc = None
+                    for stream in (proc.stdin, proc.stderr):
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
+                indices[id(previous["clip"])] = input_count + n
+                inputs.extend(["-i", path])
+            return indices, inputs, directory
+        except Exception:
+            directory.cleanup()
+            raise
+        finally:
+            renderer.close()
+
+    def _export_via_compositor(self, ff, input_files, audio_clips, total_dur,
+                               *, _software_fallback=False):
+        """复杂动态效果走 compositor 逐帧渲染（与预览同源），
         原始 RGBA 帧通过 stdin 喂给 ffmpeg。画面先独立编码成无声临时视频，随后
         再用 filter_complex 混音并以 stream-copy 封装最终文件。
 
@@ -2434,26 +3413,8 @@ class FFmpegDirectExportWorker(QThread):
         字幕由 compositor 在帧内烧录，无需单独 drawtext。"""
         import sys
 
-        # 计算视频实际时长 = natural total_dur − 背景轨转场重叠总量（与音频 _build_audio_graph 对齐）
-        bg_overlap = 0.0
-        tracks = getattr(self.tl, 'video_tracks', []) or []
-        if tracks:
-            track0 = tracks[0]
-            for i, A in enumerate(track0[:-1]):
-                ot = getattr(A, 'out_transition', None)
-                if not (ot and ot.get('type')):
-                    continue
-                B = track0[i + 1]
-                A_dur = (A.trim_end - A.trim_start) / max(A.speed, 0.01)
-                A_end = A.timeline_start + A_dur
-                if B.timeline_start > A_end + 1e-3:
-                    continue
-                B_dur = (B.trim_end - B.trim_start) / max(B.speed, 0.01)
-                d = max(0.0, float(ot.get('duration', 0.5)))
-                d = min(d, A_dur, B_dur)
-                if d > 0:
-                    bg_overlap += d
-        video_dur = max(0.01, total_dur - bg_overlap)
+        # 转场从 A 结束时开始，不提前移动 B 的时间线位置。
+        video_dur = max(0.01, total_dur)
 
         self.progress.emit(12, "初始化渲染器…")
         try:
@@ -2475,21 +3436,22 @@ class FFmpegDirectExportWorker(QThread):
             prefix="ce_render_", suffix=".mp4", dir=output_dir)
         os.close(temp_fd)
 
-        # 第一阶段只负责编码画面。没有素材文件输入与 raw stdin 争用。
-        cmd = [ff, "-y",
-            "-f", "rawvideo", "-pix_fmt", "rgba",
+        # 完整画布始终不透明；RGB24 比 RGBA 每帧少传 25% 数据。
+        # -nostats 让 stderr 只保留诊断信息，避免进度输出淹没真正错误。
+        cmd = [ff, "-y", "-nostats", "-loglevel", "warning",
+            "-f", "rawvideo", "-pix_fmt", "rgb24",
             "-s", f"{self.W}x{self.H}", "-r", str(self.fps), "-i", "-",
             "-map", "0:v:0", "-an",
         ]
-        cmd += ["-c:v", "libx264", "-preset", "fast",
-                "-crf", str(self.crf), "-pix_fmt", "yuv420p",
-                "-r", str(self.fps), temp_video]
+        encoder_args, using_gpu = self._video_encoder_args(
+            ff, software=_software_fallback)
+        cmd += encoder_args + ["-r", str(self.fps), temp_video]
 
         self._check_cancel()
         self.progress.emit(15, "开始渲染导出…")
 
         n_frames = max(1, int(round(video_dur * self.fps)))
-        frame_bytes = self.W * self.H * 4
+        frame_bytes = self.W * self.H * 3
 
         try:
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
@@ -2511,69 +3473,104 @@ class FFmpegDirectExportWorker(QThread):
                         if not chunk:
                             break
                         _stderr_chunks.append(chunk)
+                        if len(_stderr_chunks) > 256:
+                            del _stderr_chunks[:128]
                 except Exception:
                     pass
                 _stderr_done.set()
             _stderr_thread = _threading.Thread(target=_drain_stderr, daemon=True)
             _stderr_thread.start()
         except Exception as e:
+            comp.close()
             try:
                 os.remove(temp_video)
             except OSError:
                 pass
+            if using_gpu and not self._cancelled:
+                self.progress.emit(12, "显卡编码不可用，改用软件编码…")
+                return self._export_via_compositor(
+                    ff, input_files, audio_clips, total_dur,
+                    _software_fallback=True)
             self.finished.emit(False, f"无法启动 FFmpeg：{e}")
             return
 
+        f = -1
         try:
             black = b"\x00" * frame_bytes
             for f in range(n_frames):
                 self._check_cancel()
+                if proc.poll() is not None:
+                    raise RuntimeError(f"FFmpeg 在第 {f + 1}/{n_frames} 帧前提前退出（代码 {proc.returncode}）")
                 sec = f / self.fps
                 qimg = comp.render_frame(sec)
                 if qimg is None or qimg.isNull():
-                    proc.stdin.write(black)
+                    data = black
                 else:
-                    rgba = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
+                    rgb = qimg.convertToFormat(QImage.Format.Format_RGB888)
                     # 兼容 PyQt5/6：constBits().asarray() 部分版本不提供
                     try:
-                        data = bytes(rgba.constBits().asarray(rgba.sizeInBytes()))
+                        data = bytes(rgb.constBits().asarray(rgb.sizeInBytes()))
                     except AttributeError:
-                        data = bytes(rgba.constBits())
+                        data = bytes(rgb.constBits())
                     if len(data) != frame_bytes:
                         # 行对齐兜底：按 scanLine 逐行拼接
-                        row = rgba.bytesPerLine()
+                        row = rgb.bytesPerLine()
                         buf = bytearray(frame_bytes)
                         for y in range(self.H):
-                            sl = rgba.scanLine(y)
+                            sl = rgb.scanLine(y)
                             try:
-                                row_data = bytes(sl.asarray(row)[:self.W * 4])
+                                row_data = bytes(sl.asarray(row)[:self.W * 3])
                             except AttributeError:
-                                row_data = bytes(sl)[:self.W * 4]
-                            buf[y * self.W * 4:(y + 1) * self.W * 4] = row_data
+                                row_data = bytes(sl)[:self.W * 3]
+                            buf[y * self.W * 3:(y + 1) * self.W * 3] = row_data
                         data = bytes(buf)
-                    proc.stdin.write(data)
+                # Large single writes on Windows can surface Errno 22 when the
+                # encoder closes mid-frame. Bounded writes also locate failure
+                # before another full 4K frame is allocated.
+                view = memoryview(data)
+                for offset in range(0, len(view), 1024 * 1024):
+                    if proc.poll() is not None:
+                        raise RuntimeError(
+                            f"FFmpeg 在第 {f + 1}/{n_frames} 帧提前退出"
+                            f"（代码 {proc.returncode}）")
+                    proc.stdin.write(view[offset:offset + 1024 * 1024])
                 if (f & 7) == 0:
                     pct = 15 + int(80 * (f + 1) / n_frames)
                     self.progress.emit(min(99, pct), f"渲染中… {f + 1}/{n_frames}")
-            proc.stdin.flush()
             proc.stdin.close()
         except Exception as e:
             import traceback as _tb
             tb = _tb.format_exc()
-            # 抓 ffmpeg 最近 stderr（限 500 字符），帮用户判断是 pipe 死掉还是编码器拒绝
+            # Windows 下子进程提前退出常表现为 stdin.write 的 Errno 22。
+            # 先关闭输入并等诊断流结束，避免只截到 fps 进度而丢掉真实错误。
             try:
-                _stderr_done.wait(timeout=1.0)
-                stderr_text = b"".join(_stderr_chunks).decode("utf-8", "replace").strip()[-500:]
+                if proc.stdin is not None and not proc.stdin.closed:
+                    proc.stdin.close()
             except Exception:
-                stderr_text = ""
-            extra = f"\n\nFFmpeg 报错：\n{stderr_text}" if stderr_text else ""
+                pass
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+            _stderr_done.wait(timeout=2.0)
+            stderr_text = b"".join(_stderr_chunks).decode("utf-8", "replace").strip()[-1500:]
+            if not stderr_text:
+                stderr_text = ("FFmpeg 进程未留下错误日志，可能被系统终止。"
+                               f"退出代码：{proc.poll()}；"
+                               f"中断帧：{f + 1}/{n_frames}。")
+            extra = f"\n\nFFmpeg 诊断：\n{stderr_text}"
             try:
                 comp.close()
             except Exception:
                 pass
             try:
-                proc.terminate()
-                proc.wait(timeout=2)
+                if proc.poll() is None:
+                    proc.terminate()
+                    proc.wait(timeout=2)
             except Exception:
                 pass
             try:
@@ -2588,6 +3585,11 @@ class FFmpegDirectExportWorker(QThread):
                 os.remove(temp_video)
             except OSError:
                 pass
+            if using_gpu and not self._cancelled:
+                self.progress.emit(12, "显卡编码中断，改用软件编码…")
+                return self._export_via_compositor(
+                    ff, input_files, audio_clips, total_dur,
+                    _software_fallback=True)
             self.finished.emit(False, f"渲染失败：{e}\n{tb}{extra}")
             return
 
@@ -2600,6 +3602,11 @@ class FFmpegDirectExportWorker(QThread):
                 os.remove(temp_video)
             except OSError:
                 pass
+            if using_gpu and not self._cancelled:
+                self.progress.emit(12, "显卡编码超时，改用软件编码…")
+                return self._export_via_compositor(
+                    ff, input_files, audio_clips, total_dur,
+                    _software_fallback=True)
             self.finished.emit(False, "导出超时（超过10分钟）")
             return
         finally:
@@ -2626,6 +3633,11 @@ class FFmpegDirectExportWorker(QThread):
                 os.remove(temp_video)
             except OSError:
                 pass
+            if using_gpu and not self._cancelled:
+                self.progress.emit(12, "显卡编码失败，改用软件编码…")
+                return self._export_via_compositor(
+                    ff, input_files, audio_clips, total_dur,
+                    _software_fallback=True)
             if self._cancelled:
                 self.finished.emit(False, "用户取消")
             else:
@@ -2756,7 +3768,7 @@ class FFmpegDirectExportWorker(QThread):
         self._check_cancel()
         self.progress.emit(10, "构建导出命令…")
 
-        # ── 背景轨含转场 / 绿幕抠像 / alpha 视频 → 走 compositor 逐帧渲染 ──
+        # ── 仅复杂效果走 compositor；静态透明 MOV 叠加走 FFmpeg 快速图 ──
         if self._needs_compositor(video_clips, self._input_alpha):
             self._export_via_compositor(ff, input_files, audio_clips, total_dur)
             return
@@ -2770,10 +3782,43 @@ class FFmpegDirectExportWorker(QThread):
                 input_args.extend(["-loop", "1"])
             input_args.extend(["-i", path])
 
-        # ── 构建 filter_complex ──
-        v_parts, v_label = self._build_video_graph(video_clips, total_dur)
-        s_parts, s_label = self._build_subtitle_filters(subtitles, v_label)
+        # 静态蒙版按片段尺寸生成一次，交给 FFmpeg 在整个片段上复用。
+        self._fast_mask_inputs = {}
+        self._fast_transition_inputs = {}
+        mask_dir = None
+        transition_dir = None
+        try:
+            self._fast_mask_inputs, mask_inputs, mask_dir = (
+                self._prepare_fast_masks(video_clips, len(input_files)))
+            self._fast_transition_inputs, transition_inputs, transition_dir = (
+                self._prepare_transition_assets(
+                    self._fast_transition_background(video_clips),
+                    len(input_files) + len(self._fast_mask_inputs), ff))
+            v_parts, v_label = self._build_video_graph(video_clips, total_dur)
+        except Exception:
+            # 探测不到旧素材尺寸等情况仍用完整渲染，不能丢掉蒙版。
+            if mask_dir is not None:
+                mask_dir.cleanup()
+            if transition_dir is not None:
+                transition_dir.cleanup()
+            self._export_via_compositor(ff, input_files, audio_clips, total_dur)
+            return
+        input_args.extend(mask_inputs + transition_inputs)
         a_parts, a_label = self._build_audio_graph(audio_clips, total_dur)
+        try:
+            s_parts, s_label, subtitle_inputs, subtitle_dir = (
+                self._build_raster_subtitle_layers(
+                    subtitles, v_label, len(input_files)
+                    + len(self._fast_mask_inputs)
+                    + len(self._fast_transition_inputs)))
+        except Exception as e:
+            if mask_dir is not None:
+                mask_dir.cleanup()
+            if transition_dir is not None:
+                transition_dir.cleanup()
+            self.finished.emit(False, f"字幕图层准备失败：{e}")
+            return
+        input_args.extend(subtitle_inputs)
 
         all_parts = v_parts + s_parts + a_parts
         filter_complex = ";".join(all_parts)
@@ -2782,7 +3827,7 @@ class FFmpegDirectExportWorker(QThread):
         cmd = [ff, "-y"] + input_args + [
             "-filter_complex", filter_complex,
             "-map", f"[{s_label}]",
-            "-c:v", "libx264", "-preset", "fast",
+            "-c:v", "libx264", "-preset", "veryfast",
             "-crf", str(self.crf), "-pix_fmt", "yuv420p",
             "-r", str(self.fps),
         ]
@@ -2794,11 +3839,11 @@ class FFmpegDirectExportWorker(QThread):
 
         cmd.append(self.output)
 
-        self._check_cancel()
         self.progress.emit(15, "开始合成导出…")
 
         # ── 执行 FFmpeg ──
         try:
+            self._check_cancel()
             creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             # 不用 text=True：FFmpeg 在 Windows 上输出 UTF-8（含中文/特殊符号），
             # 默认 GBK 解码会抛 UnicodeDecodeError 中断整个导出流程
@@ -2885,3 +3930,9 @@ class FFmpegDirectExportWorker(QThread):
                     except Exception:
                         pass
             self._proc = None
+            if subtitle_dir is not None:
+                subtitle_dir.cleanup()
+            if mask_dir is not None:
+                mask_dir.cleanup()
+            if transition_dir is not None:
+                transition_dir.cleanup()

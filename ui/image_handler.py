@@ -12,6 +12,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl   # ← 这里加了 QUrl
 from PyQt6.QtGui import QPixmap, QImage, QColor, QDragEnterEvent, QDropEvent
 from .widgets import CheckMarkBox
+from .widgets.workbench_controls import (
+    IMAGE_ACCENT, batch_workbench_style, workbench_button, workbench_icon, workbench_section_heading,
+)
+from .duo_delivery import offer_duo_export
 
 
 # ==================== 独立工具函数（不挂在线程上）====================
@@ -128,6 +132,7 @@ class ImageExportThread(QThread):
         self.tasks = tasks
         self.config = config
         self._is_running = True
+        self.completed_paths = []
 
     def stop(self):
         self._is_running = False
@@ -195,6 +200,7 @@ class ImageExportThread(QThread):
                     params = []
 
                 cv2.imencode(ext, result, params)[1].tofile(out_path)
+                self.completed_paths.append(out_path)
 
                 self.log_signal.emit(f"STATUS_UPDATE_IMG:{row_idx}:已完成")
 
@@ -251,10 +257,10 @@ class PreviewLabel(QLabel):
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.setStyleSheet("""
             QLabel {
-                background-color: #0d0d0d;
-                border: 1px solid #2a2a2a;
-                border-radius: 4px;
-                color: #444;
+                background-color:#14171e;
+                border:1px solid #343946;
+                border-radius:7px;
+                color:#a8abb8;
                 font-size: 12px;
             }
         """)
@@ -335,6 +341,8 @@ class ImageHandler:
         self._preview_timer.timeout.connect(self._do_refresh_preview_after)
 
         w = QWidget()
+        w.setObjectName("batchWorkbench")
+        w.setStyleSheet(batch_workbench_style(IMAGE_ACCENT))
         w.setAcceptDrops(True)
         w.dragEnterEvent = self._img_drag_enter
         w.dropEvent      = self._img_drop
@@ -353,12 +361,10 @@ class ImageHandler:
         ll = QVBoxLayout(left_p)
         ll.setSpacing(6)
 
-        title = QLabel("图片队列 (Image Queue)")
-        title.setStyleSheet("font-weight:bold; font-size:16px; color:#e0e0e0;")
-        ll.addWidget(title)
+        ll.addWidget(workbench_section_heading("图片队列", "image", IMAGE_ACCENT))
 
         hint = QLabel("支持直接拖拽图片到此区域导入")
-        hint.setStyleSheet("color:#555; font-size:11px;")
+        hint.setStyleSheet("color:#a8abb8;font-size:11px;")
         ll.addWidget(hint)
 
         # -- 筛选栏 --
@@ -369,7 +375,7 @@ class ImageHandler:
         self.img_filter_combo.addItem("全部")
         self.img_filter_combo.currentTextChanged.connect(self._apply_img_filter)
         filter_lay.addWidget(self.img_filter_combo, 1)
-        btn_clear_filter = QPushButton("✖ 清除筛选")
+        btn_clear_filter = workbench_button("清除筛选", "x", accent=IMAGE_ACCENT, quiet=True)
         btn_clear_filter.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_clear_filter.setFixedWidth(90)
         btn_clear_filter.clicked.connect(
@@ -379,20 +385,21 @@ class ImageHandler:
 
         # -- 操作按钮行 --
         ctrl_lay = QHBoxLayout()
-        self.btn_add_img = QPushButton("➕ 导入图片")
+        self.btn_add_img = workbench_button("导入图片", "folder-open", accent=IMAGE_ACCENT, primary=True)
         self.btn_add_img.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_add_img.clicked.connect(self.mock_import_image)
 
-        self.btn_select_all_img = QPushButton("全选/反选")
+        self.btn_select_all_img = workbench_button("全选 / 反选", "square-dashed", accent=IMAGE_ACCENT)
         self.btn_select_all_img.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_select_all_img.clicked.connect(self._img_toggle_select_all)
 
         btn_del_i = QPushButton("删除选中")
+        btn_del_i.setIcon(workbench_icon("trash-2", "#ffb1b8"))
         btn_del_i.setObjectName("DangerBtn")
         btn_del_i.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_del_i.clicked.connect(self.delete_selected_image)
 
-        btn_clear_i = QPushButton("清空列表")
+        btn_clear_i = workbench_button("清空列表", "x", accent=IMAGE_ACCENT, quiet=True)
         btn_clear_i.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_clear_i.clicked.connect(self._img_clear_list)
 
@@ -405,6 +412,7 @@ class ImageHandler:
 
         # -- 表格 --
         self.i_table = QTableWidget(0, 6)
+        self.i_table.setAlternatingRowColors(True)
         self.i_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.i_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.i_table.setHorizontalHeaderLabels(
@@ -444,7 +452,6 @@ class ImageHandler:
 
         # -- 预览对比 --
         preview_grp = QGroupBox("预览对比")
-        preview_grp.setStyleSheet("QGroupBox { color: #00eaff; font-weight: bold; }")
         pg_lay = QHBoxLayout(preview_grp)
         pg_lay.setSpacing(8)
         self.preview_before = PreviewLabel()
@@ -454,7 +461,7 @@ class ImageHandler:
         rl.addWidget(preview_grp, stretch=3)
 
         # -- 参数区 --
-        param_grp = QGroupBox("图片批量重构参数")
+        param_grp = QGroupBox("批量处理参数")
         pgl = QVBoxLayout(param_grp)
         pgl.setSpacing(7)
 
@@ -462,22 +469,25 @@ class ImageHandler:
         size_lay = QHBoxLayout()
         size_lay.addWidget(QLabel("目标 W:"))
         self.img_w = SizeLineEdit(1080)
+        self.img_w.setAccessibleName("目标宽度")
         self.img_w.value_changed.connect(self._on_size_changed)
         size_lay.addWidget(self.img_w)
         size_lay.addWidget(QLabel("H:"))
         self.img_h = SizeLineEdit(1920)
+        self.img_h.setAccessibleName("目标高度")
         self.img_h.value_changed.connect(self._on_size_changed)
         size_lay.addWidget(self.img_h)
-        # 快捷预设
+        pgl.addLayout(size_lay)
+
+        presets = QHBoxLayout()
         for label, ww, hh in [("9:16",1080,1920),("4:5",1080,1350),
                                ("1:1",1080,1080),("16:9",1920,1080)]:
-            btn = QPushButton(label)
-            btn.setFixedWidth(46)
+            btn = workbench_button(label, None, f"设为 {ww} × {hh}", accent=IMAGE_ACCENT)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setStyleSheet("padding:3px; font-size:11px;")
             btn.clicked.connect(lambda _, a=ww, b=hh: self._set_preset_size(a, b))
-            size_lay.addWidget(btn)
-        pgl.addLayout(size_lay)
+            presets.addWidget(btn)
+        presets.addStretch()
+        pgl.addLayout(presets)
 
         # 变形策略
         mode_lay = QHBoxLayout()
@@ -556,21 +566,24 @@ class ImageHandler:
         rl.addWidget(param_grp)
 
         # 刷新预览
-        self.btn_preview_refresh = QPushButton("刷新预览")
+        actions = QHBoxLayout()
+        self.btn_preview_refresh = workbench_button("刷新预览", "redo-2", accent=IMAGE_ACCENT)
         self.btn_preview_refresh.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_preview_refresh.clicked.connect(self._do_refresh_preview_after)
-        rl.addWidget(self.btn_preview_refresh)
+        actions.addWidget(self.btn_preview_refresh)
 
         # 单条导出（高亮选中）
-        self.btn_export_img_single = QPushButton("仅导出当前选中图片")
+        self.btn_export_img_single = workbench_button("仅导出当前图片", "upload", accent=IMAGE_ACCENT)
         self.btn_export_img_single.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_export_img_single.clicked.connect(self._start_img_export_single)
-        rl.addWidget(self.btn_export_img_single)
+        actions.addWidget(self.btn_export_img_single)
+        rl.addLayout(actions)
 
         # 批量导出
         self.btn_export_img = QPushButton("一键批量处理所有勾选图片")
+        self.btn_export_img.setIcon(workbench_icon("upload", "#161b24"))
         self.btn_export_img.setObjectName("PrimaryBtn")
-        self.btn_export_img.setFixedHeight(50)
+        self.btn_export_img.setFixedHeight(38)
         self.btn_export_img.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_export_img.clicked.connect(self._start_img_export)
         rl.addWidget(self.btn_export_img)
@@ -588,7 +601,7 @@ class ImageHandler:
         vl.setSpacing(2)
         t = QLabel(title)
         t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        t.setStyleSheet("color:#888; font-size:11px;")
+        t.setStyleSheet("color:#bdc4d4;font-size:11px;")
         vl.addWidget(t)
         vl.addWidget(label, 1)
         return wrap
@@ -924,7 +937,8 @@ class ImageHandler:
 
     def _on_img_export_finished(self):
         self._unlock_export_ui()
-        QMessageBox.information(self, "完成", "图片处理完毕！")
+        paths = getattr(self.img_export_thread, 'completed_paths', ())
+        offer_duo_export(self, paths, "图片处理", "图片处理结束", f"本次成功导出 {len(paths)} 张图片。")
         if (hasattr(self, 'cb_img_open_dir') and self.cb_img_open_dir.isChecked()):
             out_dir = getattr(self, '_img_export_out_dir', '')
             if out_dir and os.path.exists(out_dir):

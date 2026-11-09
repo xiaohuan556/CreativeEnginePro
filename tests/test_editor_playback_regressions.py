@@ -5,7 +5,10 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
+
+import numpy as np
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -21,7 +24,7 @@ try:
         SubtitleBlock,
         VideoClip,
     )
-    from ui.preview_player import PreviewPlayer
+    from ui.preview_player import PreviewPlayer, _AudioPlayerSD
     from ui.timeline_widget import TimelineWidget
     from utils.alpha_video import probe_has_audio
     from utils.ffmpeg_utils import get_ffmpeg_path
@@ -65,6 +68,15 @@ class _CoarseClockPreview:
         pass
 
 
+class _BlockingAudioPreview(_CoarseClockPreview):
+    def __init__(self):
+        super().__init__(None)
+
+    def play_all_audio(self, _sec):
+        # 模拟首次建音频播放器/提取音频时的慢路径。
+        time.sleep(0.08)
+
+
 class _RatePlayer:
     class PlaybackState:
         PlayingState = 1
@@ -103,6 +115,47 @@ class EditorPlaybackRegressionTests(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def test_audio_boundary_waits_for_pending_player_then_retries(self):
+        timeline = EditTimeline()
+        timeline.add_video_clip(VideoClip(
+            source_path="main.mp4", source_duration=2.0,
+            trim_start=0.0, trim_end=2.0, timeline_start=1.0),
+            skip_overlap=True)
+        widget = TimelineWidget(timeline)
+        try:
+            widget._audio_offset_pending = True
+            widget._last_sync_time = time.perf_counter()
+            with patch.object(widget, "_sync_audio") as sync:
+                self.assertFalse(widget._check_audio_boundary(1.05, 0.95))
+                sync.assert_not_called()
+                widget._last_sync_time = 0.0
+                self.assertTrue(widget._check_audio_boundary(1.15, 0.95))
+                sync.assert_called_once_with(1.15)
+        finally:
+            widget.close()
+
+    def test_overlay_boundary_updates_overlay_sound_without_main_resync(self):
+        timeline = EditTimeline()
+        timeline.add_video_clip(VideoClip(
+            source_path="main.mp4", source_duration=4.0,
+            trim_start=0.0, trim_end=4.0), skip_overlap=True)
+        overlay_index = timeline.add_video_track()
+        timeline.add_video_clip(VideoClip(
+            source_path="overlay.mp4", source_duration=1.0,
+            trim_start=0.0, trim_end=1.0, timeline_start=1.0),
+            track_idx=overlay_index, skip_overlap=True)
+        widget = TimelineWidget(timeline)
+        overlay_audio = Mock()
+        widget._preview_player = SimpleNamespace(play_overlay_audio=overlay_audio)
+        try:
+            with patch.object(widget, "_sync_audio") as sync:
+                self.assertTrue(widget._check_audio_boundary(1.05, 0.95))
+                sync.assert_not_called()
+                overlay_audio.assert_called_once_with(1.05)
+        finally:
+            widget._preview_player = None
+            widget.close()
+
     def test_speed_audio_clock_is_mapped_back_to_timeline_time(self):
         timeline = EditTimeline()
         clip = VideoClip(
@@ -126,8 +179,8 @@ class EditorPlaybackRegressionTests(unittest.TestCase):
         preview = PreviewPlayer(EditTimeline())
         calls = []
 
-        def compute(sec, write_pending=True):
-            calls.append((sec, write_pending))
+        def compute(sec, write_pending=True, expected_revision=None):
+            calls.append((sec, write_pending, expected_revision))
             return {
                 "raw": "frame", "clip": None, "subs": [], "ovs": [],
                 "cleared": False, "is_image": False, "w": 1, "h": 1,
@@ -138,7 +191,7 @@ class EditorPlaybackRegressionTests(unittest.TestCase):
         preview._playing = True
         preview._fetch_frame(1.0, ahead=12)
 
-        self.assertEqual([(1.0, True)], calls)
+        self.assertEqual([(1.0, True, preview._timeline_revision)], calls)
         self.assertEqual([1.0], list(preview._payload_ring.keys()))
         preview.close()
 
@@ -156,6 +209,40 @@ class EditorPlaybackRegressionTests(unittest.TestCase):
 
             self.assertEqual([2.0, 1.0], player.rates)
             preview.close()
+
+    def test_volume_change_restarts_only_affected_subprocess_slot(self):
+        class RunningPlayer(_AudioPlayerSD):
+            def __init__(self):
+                super().__init__()
+                self.switches = []
+
+            def playbackState(self):
+                return self.PlaybackState.PlayingState
+
+            def audio_clock_sec(self):
+                return 0.0
+
+            def seamless_position(self, ms, dur_ms, rate=1.0,
+                                  fade_in=0.0, fade_out=0.0, duration_sec=0.0):
+                self.switches.append((ms, dur_ms, rate, fade_in, fade_out,
+                                      duration_sec))
+
+        with tempfile.TemporaryDirectory() as directory:
+            source = str(Path(directory) / "sound.wav")
+            Path(source).write_bytes(b"placeholder")
+            preview = PreviewPlayer(EditTimeline())
+            player = RunningPlayer()
+            preview._ensure_audio_player = lambda _slot: (player, None)
+            preview._ensure_audio_for_video = lambda _path: source
+            preview._audio_sources[0] = source
+            preview._audio_rates[0] = 1.0
+            preview._audio_volumes[0] = 1.0
+            try:
+                self.assertTrue(preview.play_audio(source, 0.0, volume=0.4))
+                self.assertEqual([(0, 0, 1.0, 0.0, 0.0, 0.0)], player.switches)
+                self.assertEqual(0.4, preview._audio_volumes[0])
+            finally:
+                preview.close()
 
     def test_coarse_audio_clock_does_not_freeze_playhead_between_updates(self):
         timeline = EditTimeline()
@@ -196,6 +283,91 @@ class EditorPlaybackRegressionTests(unittest.TestCase):
             places=3,
         )
         widget.close()
+
+    def test_playback_timer_starts_before_slow_audio_sync(self):
+        timeline = EditTimeline()
+        timeline.add_video_clip(VideoClip(
+            source_path="slow-audio.mp4", source_duration=5.0,
+            trim_start=0.0, trim_end=5.0, timeline_start=0.0,
+        ))
+        widget = TimelineWidget(timeline)
+        widget._preview_player = _BlockingAudioPreview()
+        try:
+            widget.toggle_play()
+            # 音频同步被延后到事件队列，播放计时器必须在 toggle_play 返回前启动。
+            self.assertTrue(widget.is_playing())
+            self.assertTrue(widget._play_timer.isActive())
+
+            deadline = time.perf_counter() + 0.25
+            while time.perf_counter() < deadline:
+                self.app.processEvents()
+                time.sleep(0.005)
+            self.assertGreater(widget.get_playhead(), 0.05)
+        finally:
+            widget.stop_playback()
+            widget.close()
+
+    def test_space_restarts_at_beginning_after_reaching_end(self):
+        timeline = EditTimeline()
+        timeline.add_video_clip(VideoClip(
+            source_path="end.mp4", source_duration=2.0,
+            trim_start=0.0, trim_end=2.0, timeline_start=0.0,
+        ))
+        widget = TimelineWidget(timeline)
+        widget.set_playhead(timeline.total_duration)
+        try:
+            widget.toggle_play()
+            self.assertTrue(widget.is_playing())
+            self.assertAlmostEqual(0.0, widget.get_playhead())
+            self.assertTrue(widget._play_timer.isActive())
+        finally:
+            widget.stop_playback()
+            widget.close()
+
+    def test_playback_accepts_a_short_decode_lag_instead_of_dropping_every_frame(self):
+        preview = PreviewPlayer(EditTimeline())
+        try:
+            preview._playing = True
+            preview._current_sec = 1.0
+            preview._pending_raw = np.zeros((2, 2, 3), dtype=np.uint8)
+            preview._pending_sec = 0.9
+            preview._pending_raw_overlays = []
+            preview._pending_subs = []
+            preview._pending_cleared = False
+            preview._pending_raw_is_image = False
+            preview._canvas_w = 2
+            preview._canvas_h = 2
+
+            preview._flush_frame()
+
+            self.assertIsNotNone(preview._last_raw_img)
+            self.assertIsNone(preview._pending_raw)
+        finally:
+            preview.close()
+
+    def test_same_size_video_frames_do_not_reuse_first_transformed_frame(self):
+        preview = PreviewPlayer(EditTimeline())
+        try:
+            red = np.full((8, 8, 3), (255, 0, 0), dtype=np.uint8)
+            blue = np.full((8, 8, 3), (0, 0, 255), dtype=np.uint8)
+            first = preview._numpy_to_qimage(red)
+            second = preview._numpy_to_qimage(blue)
+            values = {
+                "scale": 1.0, "rotation": 0.0, "blur_radius": 0.0,
+            }
+
+            # 主轨与叠加轨尺寸相同也必须保有各自像素；变换缓存不能
+            # 把下一时刻的蓝帧当作已经处理过的红帧。
+            self.assertEqual(QColor("red"), first.pixelColor(0, 0))
+            self.assertEqual(QColor("blue"), second.pixelColor(0, 0))
+            transformed_first = preview._transform_qimage(
+                first, None, 8, 8, 8, 8, values)
+            transformed_second = preview._transform_qimage(
+                second, None, 8, 8, 8, 8, values)
+            self.assertEqual(QColor("red"), transformed_first.pixelColor(0, 0))
+            self.assertEqual(QColor("blue"), transformed_second.pixelColor(0, 0))
+        finally:
+            preview.close()
 
     def test_master_clock_prefers_started_clip_mapping_at_speed_boundary(self):
         timeline = EditTimeline()
@@ -275,6 +447,40 @@ class EditorPlaybackRegressionTests(unittest.TestCase):
         shown = preview._screen.pixmap().toImage()
         self.assertEqual(QColor("#d02020"), shown.pixelColor(10, 10))
         preview.close()
+
+    def test_scrubbing_discards_pending_frame_from_old_playhead(self):
+        preview = PreviewPlayer(EditTimeline())
+        preview._current_sec = 2.0
+        preview._pending_raw = object()
+        preview._pending_sec = 1.0
+        preview._pending_cleared = False
+
+        preview._flush_frame()
+
+        self.assertIsNone(preview._pending_raw)
+        self.assertIsNone(preview._pending_sec)
+        preview.close()
+
+    def test_playhead_scrub_is_frame_quantized_and_deduplicated(self):
+        timeline = EditTimeline()
+        timeline.add_video_clip(VideoClip(
+            source_path="scrub.mp4", source_duration=5.0,
+            trim_start=0.0, trim_end=5.0, timeline_start=0.0,
+        ))
+        widget = TimelineWidget(timeline)
+        try:
+            canvas = widget._canvas
+            canvas._drag_mode = "playhead"
+            emitted = []
+            canvas.playhead_moved.connect(emitted.append)
+
+            canvas._move_playhead(canvas._sec_to_x(1.04), snap_kf=True)
+            canvas._move_playhead(canvas._sec_to_x(1.045), snap_kf=True)
+
+            self.assertEqual(1, len(emitted))
+            self.assertAlmostEqual(1.0 + 1.0 / 30.0, emitted[0], places=3)
+        finally:
+            widget.close()
 
 
 @unittest.skipUnless(QT_AVAILABLE, "PyQt6 runtime is not available")

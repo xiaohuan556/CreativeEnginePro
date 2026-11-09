@@ -16,10 +16,15 @@ os.environ.setdefault("OPENCV_FFMPEG_CAPTURE_OPTIONS", "threads;1")
 import logging
 from typing import Optional, List, Tuple, Callable
 from PyQt6.QtGui import (QImage, QColor, QPainter, QPen, QFont,
-                          QFontMetrics, QBrush, QPainterPath,
-                          QPixmap, QTransform)
+                          QFontMetrics, QBrush, QPainterPath)
 from PyQt6.QtCore import Qt, QRectF
-from PyQt6.QtWidgets import QGraphicsScene
+from core.preview_effects import (
+    evaluate_video_effects,
+    evaluate_subtitle_effects,
+    subtitle_words,
+    subtitle_word_animation_state,
+)
+from core.video_render import apply_chroma, paint_video_image, transform_video_image
 
 _HAS_KF = True
 try:
@@ -59,6 +64,10 @@ class VideoCompositor:
         # 叠加轨独立解码器池：id(clip) -> ClipDecoder（同文件多轨道分离 cap）
         self._overlay_decoders: dict = {}
         self._clip_src_cache: dict = {}
+        self._image_frames: dict[str, QImage] = {}
+        self._image_transforms: dict = {}
+        self._image_chroma: dict = {}
+        self._transition_freeze: dict = {}
         # OpenCV 在连续处理多条 HEVC 时间线时可能因解码器资源不足而返回空帧。
         # 导出不能把空帧静默替换成黑色，因此为每个片段准备独立 FFmpeg 连续管道兜底。
         self._ffmpeg_fallback_readers: dict = {}
@@ -69,21 +78,11 @@ class VideoCompositor:
         注意：opacity=0 是合法值（完全透明），绝不能用 `or 1.0` 写法——
         `0 or 1.0` 在 Python 中恒为 1.0，会导致「不透明度拉到 0 反而恢复原样」。
         """
-        op = getattr(clip, 'opacity', default)
-        if not isinstance(op, (int, float)):
-            op = default
-        kf = getattr(clip, 'keyframes', None) or {}
-        op_kf = kf.get('opacity')
-        if _HAS_KF and op_kf:
-            try:
-                rel_t = sec - clip.timeline_start
-                vals = interpolate_keyframes(clip, {'opacity': op_kf}, rel_t, {'opacity': op})
-                v = vals.get('opacity', op)
-                if isinstance(v, (int, float)):
-                    op = v
-            except Exception:
-                logging.debug("opacity 关键帧插值失败", exc_info=True)
-        return op
+        try:
+            return evaluate_video_effects(clip, sec)["opacity"]
+        except Exception:
+            op = getattr(clip, 'opacity', default)
+            return max(0.0, min(1.0, float(op))) if isinstance(op, (int, float)) else default
 
     def total_duration(self) -> float:
         """计算时间线的总时长（所有轨道的最大结束时间）"""
@@ -109,10 +108,12 @@ class VideoCompositor:
             QImage (Format_ARGB32), 尺寸 = (W, H)
         """
         canvas = QImage(self.W, self.H, QImage.Format.Format_ARGB32)
-        canvas.fill(QColor('#000000'))
+        canvas.fill(QColor(getattr(self.tl, 'canvas_bg_color', '#000000') or '#000000'))
 
         painter = QPainter(canvas)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
 
         # ── 1. 收集活跃的视频片段（轨道顺序：0=背景, 1+=PiP）──
         active_clips: List[Tuple[int, VideoClip]] = []
@@ -170,7 +171,9 @@ class VideoCompositor:
         for ti, clip in active_clips:
             if id(clip) in transition_incoming:
                 A, alpha, tfn, A_end = transition_incoming[id(clip)]
-                self._paint_transition(painter, A, clip, alpha, tfn, A_end, sec)
+                self._paint_transition(
+                    painter, A, clip, alpha, tfn, A_end, sec,
+                    source_images.get(id(clip)))
                 continue
             img = source_images.get(id(clip))
             if img is None or img.isNull():
@@ -193,108 +196,23 @@ class VideoCompositor:
 
     def _paint_video_clip(self, painter: QPainter, clip, img: QImage,
                           sec: float, track_idx: int):
-        """渲染单个视频片段（含变换 + 关键帧）"""
-        iw, ih = img.width(), img.height()
-        if iw <= 0 or ih <= 0:
+        """Render one source frame with the same pixel effects as preview."""
+        if img is None or img.isNull():
             return
-
-        s = getattr(clip, 'scale', 1.0) or 1.0
-        px = getattr(clip, 'pos_x', 0.0) or 0.0
-        py = getattr(clip, 'pos_y', 0.0) or 0.0
-        rot = getattr(clip, 'rotation', 0.0) or 0.0
-        blur = getattr(clip, 'blur_radius', 0.0) or 0.0
-
-        # 关键帧插值
-        kf = getattr(clip, 'keyframes', None) or {}
-        if _HAS_KF and kf:
-            rel_t = sec - clip.timeline_start
-            base = {"scale": s, "pos_x": px, "pos_y": py, "rotation": rot, "blur_radius": blur}
-            try:
-                vals = interpolate_keyframes(clip, kf, rel_t, base)
-                s = vals["scale"]
-                px = vals["pos_x"]
-                py = vals["pos_y"]
-                rot = vals["rotation"]
-                blur = vals["blur_radius"]
-            except Exception:
-                logging.debug("关键帧插值失败", exc_info=True)
-
-        # 适配画布
-        fit_w = self.W / iw
-        fit_h = self.H / ih
-        base_scale = min(fit_w, fit_h)
-        total_scale = base_scale * s
-
-        new_w = max(1, int(iw * total_scale))
-        new_h = max(1, int(ih * total_scale))
-
-        # 缩放（QImage.scaled() 保留 alpha 通道，不转 QPixmap）
-        scaled_img = img.scaled(
-            new_w, new_h,
-            Qt.AspectRatioMode.IgnoreAspectRatio,
-            Qt.TransformationMode.SmoothTransformation
-        )
-        # 旋转（QImage，保留格式）
-        if rot != 0.0:
-            t = QTransform().translate(scaled_img.width() / 2, scaled_img.height() / 2)
-            t.rotate(rot)
-            t.translate(-scaled_img.width() / 2, -scaled_img.height() / 2)
-            scaled_img = scaled_img.transformed(t, Qt.TransformationMode.SmoothTransformation)
-
-        # 高斯模糊（QImage 路径，不转 QPixmap，保留 alpha）
-        if blur > 0.5:
-            try:
-                import cv2, numpy as np
-                w, h = scaled_img.width(), scaled_img.height()
-                if w > 0 and h > 0:
-                    ptr = scaled_img.bits()
-                    ptr.setsize(h * scaled_img.bytesPerLine())
-                    arr = np.frombuffer(ptr, np.uint8).reshape((h, w, 4)).copy()
-                    bgr = cv2.cvtColor(arr[:, :, :3], cv2.COLOR_RGB2BGR)
-                    ksize = int(blur * 2) | 1
-                    if ksize < 3:
-                        ksize = 3
-                    blur_cv = cv2.GaussianBlur(bgr, (ksize, ksize), blur)
-                    arr[:, :, :3] = cv2.cvtColor(blur_cv, cv2.COLOR_BGR2RGB)
-                    blur_img = QImage(arr.data, w, h, scaled_img.bytesPerLine(),
-                                          QImage.Format.Format_RGBA8888).copy()
-                    scaled_img = blur_img
-            except Exception:
-                logging.debug("compositor OpenCV blur failed, skipping", exc_info=True)
-
-        ox = (self.W - scaled_img.width()) // 2 + int(px)
-        oy = (self.H - scaled_img.height()) // 2 + int(py)
-
-        # 绿幕抠像（导出路径，与预览一致）
-        if getattr(clip, 'chroma_key_enabled', False):
-            try:
-                from utils.chroma_key import apply_chroma_key
-                scaled_img = apply_chroma_key(
-                    scaled_img,
-                    getattr(clip, 'chroma_key_color', (0, 255, 0)),
-                    getattr(clip, 'chroma_key_similarity', 0.40),
-                    getattr(clip, 'chroma_key_smoothness', 0.10),
-                    getattr(clip, 'chroma_key_spill', 0.10),
-                )
-            except Exception:
-                logging.debug("compositor chroma key failed", exc_info=True)
-
-        if getattr(clip, 'mask_enabled', False):
-            try:
-                from utils.video_mask import apply_video_mask
-                scaled_img = apply_video_mask(
-                    scaled_img, clip, sec - clip.timeline_start)
-            except Exception:
-                logging.debug("compositor video mask failed", exc_info=True)
-
-        painter.save()
-        # 视频整体不透明度（含 alpha 视频：setOpacity 会乘到源 alpha 上）
-        _op = self._clip_opacity(clip, sec)
-        if _op < 1.0:
-            painter.setOpacity(_op)
-        # 直接用 drawImage，QImage 的 alpha 通道自动做 SourceOver 混合
-        painter.drawImage(ox, oy, scaled_img)
-        painter.restore()
+        values = evaluate_video_effects(clip, sec)
+        is_image = os.path.splitext(clip.source_path)[1].lower() in {
+            ".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+        source = apply_chroma(
+            img, clip, cache=self._image_chroma if is_image else None,
+            cache_limit=4)
+        transformed = transform_video_image(
+            source, clip, self.W, self.H, values,
+            cache=self._image_transforms if is_image else None,
+            cache_limit=4)
+        x = (self.W - transformed.width()) // 2 + int(values["pos_x"])
+        y = (self.H - transformed.height()) // 2 + int(values["pos_y"])
+        paint_video_image(
+            painter, clip, transformed, x, y, sec, values["opacity"])
 
     def _render_clip_offscreen(self, clip, sec: float, img: QImage):
         """把单个片段（已提取帧）合成到全尺寸黑底画布，返回 BGR numpy（供转场混合）"""
@@ -312,25 +230,35 @@ class VideoCompositor:
         return bgr
 
     def _paint_transition(self, painter: QPainter, A, B, alpha: float,
-                          tfn: str, A_end: float, sec: float):
+                          tfn: str, A_end: float, sec: float,
+                          b_img: Optional[QImage] = None):
         """渲染转场：A 冻结末帧 + B 当前帧，按 alpha 混合（仅背景轨，全屏不透明）"""
         try:
             from core.slideshow_engine import apply_transition
             import cv2, numpy as np
         except Exception:
-            b_img = self._extract_frame(B, sec)
+            b_img = b_img if b_img is not None else self._extract_frame(B, sec)
             if b_img and not b_img.isNull():
                 self._paint_video_clip(painter, B, b_img, sec, 0)
             return
 
-        a_img = self._extract_frame(A, A_end - 0.001)
-        b_img = self._extract_frame(B, sec)
-        if a_img is None or b_img is None or a_img.isNull() or b_img.isNull():
+        b_img = b_img if b_img is not None else self._extract_frame(B, sec)
+        if b_img is None or b_img.isNull():
+            return
+        freeze_key = (id(A), round(A_end, 4), self.W, self.H)
+        a_bgr = self._transition_freeze.get(freeze_key)
+        if a_bgr is None:
+            a_img = self._extract_frame(A, A_end - 0.001)
+            if a_img is not None and not a_img.isNull():
+                a_bgr = self._render_clip_offscreen(A, A_end - 0.001, a_img)
+                if a_bgr is not None:
+                    self._transition_freeze.clear()
+                    self._transition_freeze[freeze_key] = a_bgr
+        if a_bgr is None:
             if b_img and not b_img.isNull():
                 self._paint_video_clip(painter, B, b_img, sec, 0)
             return
 
-        a_bgr = self._render_clip_offscreen(A, A_end - 0.001, a_img)
         b_bgr = self._render_clip_offscreen(B, sec, b_img)
         if a_bgr is None or b_bgr is None:
             if b_img and not b_img.isNull():
@@ -349,6 +277,26 @@ class VideoCompositor:
         qimg = QImage(blended_rgba.data, w, h, w * 4,
                       QImage.Format.Format_RGBA8888).copy()
         painter.drawImage(0, 0, qimg)
+
+    def render_background_transition(self, previous, following,
+                                     sec: float) -> QImage:
+        """Render only a transition window for the hybrid FFmpeg export."""
+        transition = getattr(previous, "out_transition", None) or {}
+        duration = max(0.001, float(transition.get("duration", 0.5)))
+        end = (previous.timeline_start
+               + (previous.trim_end - previous.trim_start)
+               / max(previous.speed, 0.01))
+        alpha = max(0.0, min(1.0, (sec - end) / duration))
+        image = QImage(self.W, self.H, QImage.Format.Format_ARGB32)
+        image.fill(QColor(getattr(self.tl, "canvas_bg_color", "#000000")
+                          or "#000000"))
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self._paint_transition(
+            painter, previous, following, alpha,
+            transition.get("type", "zoom_push"), end, sec)
+        painter.end()
+        return image
 
     def _extract_frame(self, clip, sec: float) -> Optional[QImage]:
         """从视频片段中提取 sec 时刻的帧（保留 alpha 通道）"""
@@ -470,6 +418,10 @@ class VideoCompositor:
 
     def close(self):
         """释放所有资源"""
+        self._image_frames.clear()
+        self._image_transforms.clear()
+        self._image_chroma.clear()
+        self._transition_freeze.clear()
         self._release_decoders()
         for reader in list(self._ffmpeg_fallback_readers.values()):
             try:
@@ -480,12 +432,20 @@ class VideoCompositor:
 
     def _load_image_frame(self, path: str) -> Optional[QImage]:
         """加载图片帧（保留 alpha 通道）"""
+        cached = self._image_frames.get(path)
+        if cached is not None:
+            return cached
         img = QImage(path)
         if img.isNull():
             return None
         if img.hasAlphaChannel():
-            return img.convertToFormat(QImage.Format.Format_ARGB32)
-        return img.convertToFormat(QImage.Format.Format_RGB888)
+            img = img.convertToFormat(QImage.Format.Format_ARGB32)
+        else:
+            img = img.convertToFormat(QImage.Format.Format_RGB888)
+        self._image_frames[path] = img
+        while len(self._image_frames) > 4:
+            self._image_frames.pop(next(iter(self._image_frames)))
+        return img
 
     # ────────────────────────────────────
     # 字幕渲染
@@ -504,8 +464,23 @@ class VideoCompositor:
                 if b.timeline_start <= sec < b.timeline_end:
                     self._paint_one_subtitle(painter, canvas, b, sec)
 
+    def paint_subtitles_on_image(self, image: QImage, blocks: list,
+                                 sec: float, interactive_block=None) -> QImage:
+        """Paint preview subtitles using the exact export drawing path."""
+        if image is None or image.isNull() or not blocks:
+            return image
+        painter = QPainter(image)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        for block in blocks:
+            self._paint_one_subtitle(
+                painter, image, block, sec,
+                interactive=(block is interactive_block))
+        painter.end()
+        return image
+
     def _paint_one_subtitle(self, painter: QPainter, canvas: QImage,
-                            block, sec: float):
+                            block, sec: float, interactive: bool = False):
         """渲染单个字幕块（完整样式）"""
         text = getattr(block, 'text', '') or ''
         if not text.strip():
@@ -513,22 +488,14 @@ class VideoCompositor:
 
         img_w, img_h = self.W, self.H
 
-        # ── 位置 ──
-        position = getattr(block, 'position', 'bottom') or 'bottom'
-        margin_v = getattr(block, 'margin_v', 8) or 8
-        pos_x = getattr(block, 'pos_x', None)
-        pos_y = getattr(block, 'pos_y', None)
-
-        if pos_x is None or pos_y is None:
-            pos_map = {'top': -0.85, 'center': 0.0, 'bottom': 0.85}
-            px = 0.0
-            py = pos_map.get(position, 0.85)
-        else:
-            px = float(pos_x)
-            py = float(pos_y)
+        # ── 位置/关键帧/整体透明度：与实时预览共用评估器 ──
+        effect_values = evaluate_subtitle_effects(
+            block, sec, interactive=interactive)
+        px = effect_values["pos_x"]
+        py = effect_values["pos_y"]
 
         # ── 样式 ──
-        fs = (getattr(block, 'font_size', 15) or 15) * self._subtitle_scale
+        fs = effect_values["font_size"] * self._subtitle_scale
         fc = getattr(block, 'color', '#ffffff') or '#ffffff'
         family = getattr(block, 'font_family', 'Microsoft YaHei') or 'Microsoft YaHei'
         bold = getattr(block, 'font_bold', False)
@@ -542,7 +509,7 @@ class VideoCompositor:
         # ── 背景填充 ──
         has_fill = getattr(block, 'fill_enabled', False)
         bg_color = getattr(block, 'background_color', '#000000') or '#000000'
-        border_radius = int(round((getattr(block, 'border_radius', 4) or 4) * self._subtitle_scale))
+        border_radius = int(round((getattr(block, 'border_radius', 0) or 0) * self._subtitle_scale))
 
         # ── 逐词动画 ──
         word_anim = getattr(block, 'word_animation', False)
@@ -551,25 +518,8 @@ class VideoCompositor:
         word_timings = getattr(block, 'word_timings', []) or []
 
         # ── 关键帧插值 ──
-        kf = getattr(block, 'keyframes', None) or {}
-        rot = getattr(block, 'rotation', 0.0) or 0.0
-        sc = getattr(block, 'scale', 1.0) or 1.0
-        kf_applied = False
-        if _HAS_KF and kf:
-            try:
-                rel_t = sec - block.timeline_start
-                base = {"pos_x": px, "pos_y": py, "font_size": fs,
-                        "rotation": rot, "scale": sc}
-                vals = interpolate_keyframes(block, kf, rel_t, base)
-                px = float(vals.get("pos_x", px))
-                py = float(vals.get("pos_y", py))
-                fs = int(vals.get("font_size", fs) * vals.get("scale", sc))
-                rot = float(vals.get("rotation", rot))
-                kf_applied = True
-            except Exception:
-                pass
-        if not kf_applied:
-            fs = max(6, int(fs * sc))
+        rot = effect_values["rotation"]
+        fs = max(6, int(fs * effect_values["scale"]))
 
         # ── custom_width 实时换行 ──
         cw_custom = int(round((getattr(block, 'custom_width', 0) or 0) * self._subtitle_scale))
@@ -588,11 +538,11 @@ class VideoCompositor:
 
         # ── 渲染分支 ──
         # 字幕整体不透明度（0~1）；逐词动画自带淡入 alpha，二者相乘
-        _op = self._clip_opacity(block, sec)
+        _op = effect_values["opacity"]
         painter.save()
         if _op < 1.0:
             painter.setOpacity(_op)
-        if word_anim and from_asr and not has_fill and text.strip():
+        if word_anim and not has_fill and text.strip():
             self._draw_word_anim(painter, block, text, sec, cx, cy,
                                  fs, fc, family, bold, italic, underline,
                                  ow, oc, word_anim_dur, word_timings,
@@ -627,25 +577,12 @@ class VideoCompositor:
         # 计算每行宽度
         line_widths = []
         for line in lines:
-            if letter_sp > 0:
-                w = sum(fm.horizontalAdvance(ch) for ch in line) + letter_sp * (len(line) - 1)
-            else:
-                w = fm.horizontalAdvance(line)
-            if not w:
-                w = 1
-            line_widths.append(w)
+            w = fm.horizontalAdvance(line)
+            if letter_sp > 0 and len(line) > 1:
+                w += letter_sp * (len(line) - 1)
+            line_widths.append(max(1, w))
 
         max_w = max(line_widths) if line_widths else 0
-
-        # 每个字的位置（用于字间距手绘）
-        def _char_positions(line: str) -> List[Tuple[int, int, str]]:
-            pos = []
-            x = 0
-            for ch in line:
-                cw_ch = fm.horizontalAdvance(ch)
-                pos.append((x, cw_ch, ch))
-                x += cw_ch + letter_sp
-            return pos
 
         painter.save()
 
@@ -657,11 +594,12 @@ class VideoCompositor:
 
         # 背景填充
         if has_fill:
-            padding = max(4, fs // 3)
-            bx = cx - max_w // 2 - padding
-            by = cy - total_h // 2 - padding
-            bw = max_w + padding * 2
-            bh = total_h + padding * 2
+            pad_h = max(4, int(round(8 * self._subtitle_scale)))
+            pad_v = max(3, int(round(6 * self._subtitle_scale)))
+            bx = cx - max_w // 2 - pad_h
+            by = cy - total_h // 2 - pad_v
+            bw = max_w + pad_h * 2
+            bh = total_h + pad_v * 2
             painter.setBrush(QColor(bg_color))
             painter.setPen(Qt.PenStyle.NoPen)
             if border_radius > 0:
@@ -675,19 +613,12 @@ class VideoCompositor:
             lx = cx - lw // 2
             ly = cy - total_h // 2 + line_idx * line_h
 
-            if letter_sp > 0:
-                # 逐字符绘制（精确控制间距）
-                for ch_x, ch_w, ch in _char_positions(line):
-                    chx = lx + ch_x
-                    # 描边
-                    if ow > 0:
-                        _draw_text_with_outline(painter, ch, chx, ly, ow, QColor(oc))
-                    painter.setPen(QColor(fc))
-                    painter.drawText(chx, ly, ch)
+            # 与实时预览一致：由 QFont 的字间距负责排版，整行绘制，
+            # 避免导出路径逐字绘制造成字形和基线差异。
+            if ow > 0:
+                _draw_text_with_outline(
+                    painter, line, lx, ly, ow, QColor(oc), QColor(fc))
             else:
-                # 整行绘制
-                if ow > 0:
-                    _draw_text_with_outline(painter, line, lx, ly, ow, QColor(oc))
                 painter.setPen(QColor(fc))
                 painter.drawText(lx, ly + fm.ascent(), line)
 
@@ -700,34 +631,13 @@ class VideoCompositor:
                         ow: int, oc: str, word_anim_dur: float,
                         word_timings: list, letter_sp: int, line_sp: int):
         """逐词动画渲染（每个词依次淡入展示）"""
-        if not word_timings:
-            # 无时间戳时，按空格简单分词
-            words = text.split()
-            if not words:
-                return
-            block_dur = block.timeline_end - block.timeline_start
-            word_dur = block_dur / len(words)
-            rel_t = sec - block.timeline_start
-            idx = min(int(rel_t / word_dur), len(words) - 1)
-            current_word = words[idx]
-            elapsed = rel_t - idx * word_dur
-            alpha = min(1.0, elapsed / max(word_anim_dur, 0.01))
-        else:
-            # 有 ASR 时间戳
-            current_word = ""
-            idx = -1
-            rel_t = sec - block.timeline_start
-            for wi, wt in enumerate(word_timings):
-                ws = wt.get("start", 0)
-                we = wt.get("end", 1)
-                if ws <= rel_t < we:
-                    current_word = wt.get("text", "")
-                    idx = wi
-                    elapsed = rel_t - ws
-                    alpha = min(1.0, elapsed / max(word_anim_dur, 0.01))
-                    break
-            if not current_word:
-                return
+        words = subtitle_words(text)
+        if not words:
+            return
+        current_word, alpha, anim_scale = subtitle_word_animation_state(
+            block, sec, words)
+        if not current_word:
+            return
 
         font = QFont(family, fs)
         font.setBold(bold)
@@ -742,27 +652,28 @@ class VideoCompositor:
             w = 1
 
         painter.save()
-        # 缩放动画（1.0 → 1.3 → 1.0）
-        anim_scale = 1.0 + 0.3 * (1.0 - abs(alpha - 0.5) * 2)
+        # 预览和导出共享同一套弹入缩放曲线。
         tx = cx
         ty = cy
         painter.translate(tx, ty)
         painter.scale(anim_scale, anim_scale)
         painter.translate(-tx, -ty)
 
-        # 透明度（逐词淡入 alpha × 字幕整体不透明度）
-        _op = self._clip_opacity(block, sec)
-        _final_alpha = alpha * _op
-        if _final_alpha < 1.0:
-            painter.setOpacity(_final_alpha)
+        # 与预览一致：逐词淡入写进文字颜色，整体透明度留给外层 painter。
+        fill_color = QColor(fc)
+        fill_color.setAlpha(int(255 * alpha))
+        outline_color = QColor(oc)
+        outline_color.setAlpha(int(255 * alpha))
 
-        lx = cx - int(w * anim_scale) // 2
+        lx = cx - w // 2
         ly = cy - fm.height() // 2
 
         if ow > 0:
-            _draw_text_with_outline(painter, current_word, lx, ly, ow, QColor(oc))
-        painter.setPen(QColor(fc))
-        painter.drawText(lx, ly + fm.ascent(), current_word)
+            _draw_text_with_outline(
+                painter, current_word, lx, ly, ow, outline_color, fill_color)
+        else:
+            painter.setPen(fill_color)
+            painter.drawText(lx, ly + fm.ascent(), current_word)
 
         painter.restore()
 
@@ -802,24 +713,28 @@ class VideoCompositor:
     def close(self):
         """释放所有 OpenCV 资源"""
         import cv2
-        for cap in self._cap_cache.values():
+        for cap in getattr(self, "_cap_cache", {}).values():
             try:
                 cap.release()
             except Exception:
                 pass
-        self._cap_cache.clear()
-        self._cap_cache_order.clear()
-        self._clip_src_cache.clear()
+        getattr(self, "_cap_cache", {}).clear()
+        getattr(self, "_cap_cache_order", []).clear()
+        getattr(self, "_clip_src_cache", {}).clear()
 
 
 def _draw_text_with_outline(painter: QPainter, text: str, x: int, y: int,
-                            ow: int, color: QColor):
-    """使用 QPainterPath 高效绘制文字描边（O(1) 替代逐像素 for 循环）"""
+                            ow: int, color: QColor, fill: QColor):
+    """与预览一致：先描边，再用字形路径覆盖侵入文字内部的描边。"""
     font = painter.font()
     path = QPainterPath()
     path.addText(x, y + QFontMetrics(font).ascent(), font, text)
-    pen = QPen(color, ow * 2 + 1)
+    pen = QPen(color, ow * 2)
     pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     painter.setPen(pen)
     painter.setBrush(Qt.BrushStyle.NoBrush)
+    painter.drawPath(path)
+    painter.setPen(Qt.PenStyle.NoPen)
+    painter.setBrush(fill)
     painter.drawPath(path)

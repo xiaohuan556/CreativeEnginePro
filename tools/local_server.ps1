@@ -22,6 +22,10 @@ function Resolve-ServerPort {
             Where-Object { $_.Name -eq $configName } |
             Select-Object -First 1 -ExpandProperty FullName
     }
+    if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) {
+        $configName = [string]([char]0x6253) + [char]0x5305 + [char]0x914D + [char]0x7F6E + ".json"
+        $configPath = Join-Path $PSScriptRoot ("desktop_support\" + $configName)
+    }
     if ($configPath -and (Test-Path -LiteralPath $configPath)) {
         try {
             $value = (Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 |
@@ -60,6 +64,17 @@ function Test-TrackedProcess([object]$item) {
     return $null -ne (Get-Process -Id ([int]$item.pid) -ErrorAction SilentlyContinue)
 }
 
+function Test-ServerPortListening {
+    $client = New-Object Net.Sockets.TcpClient
+    try {
+        $attempt = $client.BeginConnect("127.0.0.1", $serverPort, $null, $null)
+        if (-not $attempt.AsyncWaitHandle.WaitOne(500)) { return $false }
+        $client.EndConnect($attempt)
+        return $client.Connected
+    } catch { return $false }
+    finally { $client.Dispose() }
+}
+
 if ($Action -eq "Stop") {
     $state = Read-ProcessState
     if ($state) {
@@ -87,13 +102,15 @@ if ($Action -eq "Status") {
     if (-not $state) { Write-Host "Local server is not running."; exit 1 }
     foreach ($name in @("api", "worker")) {
         $item = $state.$name
-        if ($item) { Write-Host "$name : $(if (Test-TrackedProcess $item) {'running'} else {'stopped'}) (PID $($item.pid))" }
+        $running = Test-TrackedProcess $item
+        if ($name -eq "api") { $running = $running -and (Test-ServerPortListening) }
+        if ($item) { Write-Host "$name : $(if ($running) {'running'} else {'stopped'}) (PID $($item.pid))" }
     }
     exit 0
 }
 
 $oldState = Read-ProcessState
-if ($oldState -and (Test-TrackedProcess $oldState.api)) {
+if ($oldState -and (Test-TrackedProcess $oldState.api) -and (Test-ServerPortListening)) {
     Write-Host "Local server is already running." -ForegroundColor Yellow
     exit 0
 }

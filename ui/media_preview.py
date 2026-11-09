@@ -5,7 +5,6 @@ media_preview.py — 素材库双击预览弹窗
 from __future__ import annotations
 import os
 import logging
-import subprocess
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QSlider, QFrame, QSizePolicy, QGraphicsView, QGraphicsScene,
@@ -13,6 +12,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QUrl
 from PyQt6.QtGui import QPixmap, QImage, QFont, QPainter, QDesktopServices
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
 
 import cv2
 
@@ -107,7 +107,8 @@ class MediaPreviewDialog(QDialog):
         self._fps = 30.0
         self._total_frames = 0
         self._duration_sec = 0.0
-        self._audio_proc = None
+        self._audio_player = None
+        self._audio_output = None
         self._seek_sliding = False  # 用户拖拽滑块时暂停计时器更新
         self._cached_frame = None   # 原始 QPixmap 缓存（缩放用）
         self._src_pix = None        # 图片原始 QPixmap
@@ -396,18 +397,20 @@ class MediaPreviewDialog(QDialog):
         elif self._media_type == "audio":
             self._playing = True
             self._btn_play.setText("⏸  暂停")
-            self._start_audio()
-            # 音频播放时启动定时器更新进度
             self._timer.start(100)  # 100ms 刷新进度
+            self._start_audio()
 
     def _pause(self):
         self._playing = False
         self._btn_play.setText("▶  播放")
         self._timer.stop()
-        self._stop_audio()
+        if self._audio_player is not None:
+            self._audio_player.pause()
 
     def _stop(self):
         self._pause()
+        if self._audio_player is not None:
+            self._audio_player.stop()
         self._current_sec = 0.0
         self._seek_slider.setValue(0)
         self._time_label.setText("00:00")
@@ -433,10 +436,7 @@ class MediaPreviewDialog(QDialog):
             ret, frame = self._cap.read()
             if ret:
                 self._paint_frame(frame)
-        if self._playing and self._media_type == "audio":
-            # 重新启动音频从新位置播放
-            self._stop_audio()
-            self._start_audio()
+        self._sync_audio_position()
 
     def _tick(self):
         """定时器回调：推进画面 / 更新进度"""
@@ -457,14 +457,8 @@ class MediaPreviewDialog(QDialog):
             self._paint_frame(frame)
 
         elif self._media_type == "audio":
-            self._current_sec += 0.1
-            if self._current_sec >= self._duration_sec - 0.01:
-                self._stop()
-                return
-            # 检查子进程是否还活着
-            if self._audio_proc and self._audio_proc.poll() is not None:
-                self._stop()
-                return
+            if self._audio_player is not None:
+                self._current_sec = self._audio_player.position() / 1000.0
 
         self._update_slider()
 
@@ -493,56 +487,36 @@ class MediaPreviewDialog(QDialog):
         self._time_label.setText(self._fmt_time(self._current_sec))
 
     def _start_audio(self):
-        """启动 ffmpeg 子进程播放音频"""
-        try:
-            from utils.ffmpeg_utils import get_ffmpeg_path
-            ffmpeg = get_ffmpeg_path()
-        except Exception:
-            ffmpeg = "ffmpeg"
+        """Play the source audio through Qt Multimedia, including in frozen builds."""
+        if self._audio_player is None:
+            self._audio_output = QAudioOutput(self)
+            self._audio_output.setVolume(1.0)
+            self._audio_player = QMediaPlayer(self)
+            self._audio_player.setAudioOutput(self._audio_output)
+            self._audio_player.seekableChanged.connect(self._sync_audio_position)
+            self._audio_player.mediaStatusChanged.connect(self._on_audio_status)
+            self._audio_player.errorOccurred.connect(self._on_audio_error)
+            self._audio_player.setSource(QUrl.fromLocalFile(os.path.abspath(self._file_path)))
+        self._sync_audio_position()
+        self._audio_player.play()
 
-        if not os.path.exists(ffmpeg):
-            import shutil
-            ffmpeg = shutil.which("ffmpeg") or "ffmpeg"
+    def _sync_audio_position(self, *_):
+        player = self._audio_player
+        if player is not None and player.isSeekable():
+            position = round(self._current_sec * 1000)
+            if abs(player.position() - position) > 50:
+                player.setPosition(position)
 
-        # 使用 ffplay 播放音频（ffplay 是 ffmpeg 自带的）
-        ffplay = os.path.join(os.path.dirname(ffmpeg), "ffplay.exe")
-        if not os.path.exists(ffplay):
-            import shutil
-            ffplay = shutil.which("ffplay")
+    def _on_audio_status(self, status):
+        if (self._media_type == "audio" and
+                status == QMediaPlayer.MediaStatus.EndOfMedia and self._playing):
+            self._stop()
 
-        if not ffplay:
-            logging.warning("ffplay 不可用，预览无音频")
-            return
-
-        try:
-            # ffplay -nodisp -autoexit -ss start_sec -i file
-            cmd = [
-                ffplay, "-nodisp", "-autoexit",
-                "-ss", str(self._current_sec),
-                "-i", self._file_path,
-                "-loglevel", "quiet"
-            ]
-            self._audio_proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                stdin=subprocess.DEVNULL
-            )
-        except Exception:
-            logging.debug("ffplay 启动失败", exc_info=True)
-            self._audio_proc = None
-
-    def _stop_audio(self):
-        if self._audio_proc:
-            try:
-                self._audio_proc.terminate()
-                try:
-                    self._audio_proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    self._audio_proc.kill()
-            except Exception:
-                pass
-            self._audio_proc = None
+    def _on_audio_error(self, error, message):
+        logging.warning("Media preview audio playback failed: %s", message)
+        self._info_label.setToolTip("音频播放失败：" + message)
+        if self._media_type == "audio" and self._playing:
+            self._pause()
 
     def _on_seek_pressed(self):
         self._seek_sliding = True
@@ -569,7 +543,10 @@ class MediaPreviewDialog(QDialog):
     def _cleanup(self):
         """释放所有资源"""
         self._timer.stop()
-        self._stop_audio()
+        self._playing = False
+        if self._audio_player is not None:
+            self._audio_player.stop()
+            self._audio_player.setSource(QUrl())
         if self._cap:
             self._cap.release()
             self._cap = None

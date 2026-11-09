@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from core.project_files import AI_SUFFIX, read_project
 
 # UI construction reads the shared asset service during refresh. Never let a
 # local test run attach WAL/SHM files to the user's real production database.
@@ -1412,6 +1413,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
                 "image_node", QPointF(0, 600), {"path": str(paths[2])})
             video_id = panel.create_custom_node(
                 "video_node", QPointF(500, 300), {
+                    "beginner_mode":"first_last_frame_video",
                     "content":"人物向前走", "provider_name":"seedance",
                     "model":"doubao-seedance-2-5-260628", "duration":20,
                     "resolution":"480p", "generate_audio":True,
@@ -2019,8 +2021,9 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             portrait = folder / "portrait.png"
             portrait_image = QImage(200, 400, QImage.Format.Format_RGB32)
             portrait_image.fill(QColor("#665599")); portrait_image.save(str(portrait))
-            portrait_node = canvas_module.CanvasNodeItem(
-                panel, "portrait", "image_node", "竖图", thumbnail=str(portrait))
+            portrait_id = panel.create_custom_node(
+                "image_node", QPointF(0, 0), {"title":"竖图", "path":str(portrait)})
+            portrait_node = panel._nodes[portrait_id]
             self.assertGreater(portrait_node.height, portrait_node.width)
             self.assertAlmostEqual(0.5,
                 portrait_node._thumb_pixmap.width() / portrait_node._thumb_pixmap.height(), places=1)
@@ -2028,7 +2031,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
             panel.toggle_asset_library(False)
             self.assertTrue(panel.navigator_panel.isHidden())
             dock_asset = next(button for button in panel.create_dock.findChildren(
-                              canvas_module.QPushButton) if button.text() == "▣ 资产")
+                              canvas_module.QPushButton) if button.text() == "资产")
             dock_asset.click()
             self.assertFalse(panel.navigator_panel.isHidden())
             dock_asset.click()
@@ -2133,7 +2136,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
     def test_manual_project_file_restores_graph_candidates_and_final_choices(self):
         folder = Path(tempfile.mkdtemp())
         checkpoint = folder / "autosave.json"
-        project_file = folder / "fight_short.cepstudio"
+        project_file = folder / "fight_short.xiaohuanai"
         image_path = folder / "final.png"
         image = QImage(160, 90, QImage.Format.Format_RGB32)
         image.fill(QColor("#6b4250")); image.save(str(image_path))
@@ -2160,7 +2163,7 @@ class ProductionAssetPipelineTest(unittest.TestCase):
                 {"source":source_id, "target":candidate_id, "type":"image"})
             self.assertTrue(first.save_canvas_project(
                 str(project_file), show_message=False))
-            document = json.loads(project_file.read_text(encoding="utf-8"))
+            document = read_project(project_file, AI_SUFFIX)
             self.assertEqual(canvas_module.PROJECT_FORMAT, document["format"])
             self.assertEqual("15秒打斗测试", document["title"])
             self.assertTrue(document["media_manifest"][0]["exists"])

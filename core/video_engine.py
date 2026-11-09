@@ -77,6 +77,7 @@ class VideoProcessor:
         self.is_cancelled = False
         self.current_subprocess = None      # 保存当前子进程对象
         self.current_out_path = None         # 保存当前输出文件路径
+        self.last_completed_path = None
 
     def _stream_ffmpeg_progress(self, cmd, start_pct, end_pct, duration):
         """运行 FFmpeg，报告进度并支持立即取消。"""
@@ -325,6 +326,7 @@ class VideoProcessor:
             if self.log_signal:
                 self.log_signal.emit("RENDER_PROGRESS:100")
             self.emit_log(f"导出成功: {final_name}")
+            self.last_completed_path = out_path
             return True
 
         except Exception as e:
@@ -485,6 +487,7 @@ class VideoProcessor:
         """决策中心：严格区分全量渲染与极速导出，并支持立即中断"""
         # 1. 每次任务开始前，重置取消标志
         self.is_cancelled = False
+        self.last_completed_path = None
         
         try:
             video_path = task['path']
@@ -670,6 +673,7 @@ class VideoProcessor:
                     return False
                 if self.log_signal:
                     self.log_signal.emit("RENDER_PROGRESS:100")
+            self.last_completed_path = out_path
             return True
 
         except Exception as e:

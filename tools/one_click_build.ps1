@@ -15,6 +15,10 @@ if (-not (Test-Path -LiteralPath $configPath)) {
         Select-Object -First 1 -ExpandProperty FullName)
 }
 if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) {
+    $configName = [string]([char]0x6253) + [char]0x5305 + [char]0x914D + [char]0x7F6E + ".json"
+    $configPath = Join-Path $PSScriptRoot ("desktop_support\" + $configName)
+}
+if (-not $configPath -or -not (Test-Path -LiteralPath $configPath)) {
     throw "Packaging config was not found."
 }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -109,13 +113,15 @@ $serverPort = [int]$config.server_port
 if ($serverPort -lt 1 -or $serverPort -gt 65535) {
     throw "Configured server_port is invalid: $serverPort"
 }
+$channel = ([string]$config.channel).Trim().ToLowerInvariant()
+if ($channel -notin @("release", "demo")) { throw "Configured channel is invalid: $channel" }
 
 $expiresAt = [DateTimeOffset]::Parse([string]$config.expires_at)
 if ($expiresAt -le [DateTimeOffset]::Now) {
     throw "The configured release expiry is already in the past: $expiresAt"
 }
 $versionPrefix = ([string]$config.version_prefix).Trim()
-if (-not $versionPrefix) { $versionPrefix = "1.0.0-local" }
+if (-not $versionPrefix) { $versionPrefix = "1.0.0-$channel" }
 $version = "$versionPrefix-$(Get-Date -Format 'yyyyMMdd-HHmm')"
 $distPath = ([string]$config.output_dir).Trim()
 if (-not $distPath) { $distPath = "build\release-local" }
@@ -149,6 +155,7 @@ if (Test-Path -LiteralPath $configuredExe) {
 Write-Host ""
 Write-Host "One-click package configuration" -ForegroundColor Cyan
 Write-Host "  Server:  http://${serverIp}:$serverPort"
+Write-Host "  Channel: $channel"
 Write-Host "  Version: $version"
 Write-Host "  Expires: $($expiresAt.ToString('yyyy-MM-ddTHH:mm:sszzz'))"
 Write-Host "  Python:  $pythonExe"
@@ -177,6 +184,7 @@ try {
     & (Join-Path $PSScriptRoot "build_local_release.ps1") `
         -ServerIp $serverIp `
         -ServerPort $serverPort `
+        -Channel $channel `
         -PythonExe $pythonExe `
         -Version $version `
         -ExpiresAfter $expiresAt `

@@ -113,6 +113,81 @@ class SubtitleTranslationDialogTests(unittest.TestCase):
         self.assertTrue(worker.deleted)
         self.assertIsNone(self.dialog._ai_worker)
 
+    def test_translation_result_is_visible_and_translation_tab_is_selected(self):
+        from core.transcriber import SRTEntry
+
+        self.dialog._on_trans_done([
+            SRTEntry(1, 0.0, 1.5, "Translated line")])
+
+        self.assertFalse(self.dialog._btn_orig.isChecked())
+        self.assertTrue(self.dialog._btn_trans.isChecked())
+        self.assertEqual("Translated line", self.dialog._table.item(0, 3).text())
+        self.assertEqual("Translated line", self.dialog._selected_subs()[0]["text"])
+
+    def test_blank_translation_is_reported_instead_of_shown_as_success(self):
+        from core.builtin_translator import translate_srt_entries
+        from core.transcriber import SRTEntry
+
+        entry = SRTEntry(1, 0.0, 1.5, "测试字幕")
+        with (patch("core.builtin_translator.GoogleTranslator") as translator,
+              patch("core.builtin_translator.MyMemoryTranslator") as fallback):
+            translator.return_value.translate.return_value = None
+            fallback.return_value.translate.return_value = None
+            with self.assertRaisesRegex(RuntimeError, "空文本"):
+                translate_srt_entries([entry], "en", strict=True)
+            self.assertEqual("测试字幕",
+                             translate_srt_entries([entry], "en")[0].text)
+
+    def test_sentence_batch_preserves_timing_and_uses_one_request(self):
+        from core.builtin_translator import translate_srt_entries
+        from core.transcriber import SRTEntry
+
+        entries = [SRTEntry(1, 0.0, 1.5, "你好"),
+                   SRTEntry(2, 2.0, 3.0, "谢谢")]
+        with patch("core.builtin_translator.GoogleTranslator") as translator:
+            translator.return_value.translate.return_value = (
+                "[[SRT000000]] Hello\n[[SRT000001]] Thank you")
+            result = translate_srt_entries(entries, "en", strict=True)
+
+        self.assertEqual(["Hello", "Thank you"], [item.text for item in result])
+        self.assertEqual([(0.0, 1.5), (2.0, 3.0)],
+                         [(item.start, item.end) for item in result])
+        translator.return_value.translate.assert_called_once()
+
+    def test_rate_limited_google_uses_batched_backup(self):
+        from deep_translator.exceptions import TooManyRequests
+        from core.builtin_translator import translate_srt_entries
+        from core.transcriber import SRTEntry
+
+        entries = [SRTEntry(1, 0.0, 1.5, "你好"),
+                   SRTEntry(2, 2.0, 3.0, "谢谢")]
+        with (patch("core.builtin_translator.GoogleTranslator") as translator,
+              patch("core.builtin_translator.MyMemoryTranslator") as fallback):
+            translator.return_value.translate.side_effect = TooManyRequests()
+            fallback.return_value.translate.return_value = (
+                "[[SRT000000]] Hello\n[[SRT000001]] Thank you")
+            result = translate_srt_entries(entries, "en", strict=True)
+
+        self.assertEqual(["Hello", "Thank you"], [item.text for item in result])
+        fallback.return_value.translate.assert_called_once()
+
+    def test_long_subtitle_splits_backup_requests(self):
+        from deep_translator.exceptions import TooManyRequests
+        from core.builtin_translator import translate_srt_entries
+        from core.transcriber import SRTEntry
+
+        entry = SRTEntry(1, 0.0, 4.0, "长" * 850)
+        with (patch("core.builtin_translator.GoogleTranslator") as translator,
+              patch("core.builtin_translator.MyMemoryTranslator") as fallback):
+            translator.return_value.translate.side_effect = TooManyRequests()
+            fallback.return_value.translate.side_effect = lambda text: "part"
+            result = translate_srt_entries([entry], "en", strict=True)
+
+        assert result[0].text == "part part part"
+        assert fallback.return_value.translate.call_count == 3
+        assert all(len(call.args[0]) <= 400
+                   for call in fallback.return_value.translate.call_args_list)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,4 +1,7 @@
 import os
+import json
+import time
+import zipfile
 import tempfile
 import unittest
 from pathlib import Path
@@ -32,6 +35,459 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         panel._task_timer.stop()
         panel._save_layout_now = lambda *args, **kwargs: None
         return panel
+
+    def test_pinterest_failure_notice_opens_inline_without_a_modal(self):
+        panel = self.make_panel()
+        self.addCleanup(panel.close)
+        panel.resize(1400, 1000)
+        panel.show()
+        first_error = "第 1 张图片生成失败"
+        node_id = panel.create_custom_node("ai_editor_node", QPointF(0, 0), {
+            "agent_tool": "pinterest_import",
+            "content": "换成玻璃风格",
+        })
+        panel._custom_record(node_id)["agent_run"] = {"status": "completed", "steps": {
+            "images": {"errors": [first_error]},
+        }}
+        panel.refresh()
+        panel.scene.clearSelection()
+        panel._nodes[node_id].setSelected(True)
+        panel.show_inline_editor(panel._nodes[node_id])
+        proxy = panel._inline_editor_proxy
+        widget = proxy.widget()
+        notice = widget.findChild(canvas_module.QPushButton, "agentRunNotice")
+        details = widget.findChild(canvas_module.QTextEdit, "agentRunIssueDetails")
+        panel.view.centerOn(proxy.sceneBoundingRect().center())
+        self.app.processEvents()
+
+        def click_notice():
+            local = notice.mapTo(widget, notice.rect().center())
+            point = panel.view.mapFromScene(proxy.mapToScene(QPointF(local)))
+            self.assertTrue(panel.view.viewport().rect().contains(point))
+            with patch.object(canvas_module.QMessageBox, "information") as show_modal:
+                QTest.mouseClick(panel.view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+                self.app.processEvents()
+            show_modal.assert_not_called()
+            self.assertIsNone(self.app.activeModalWidget())
+            self.assertIs(proxy, panel._inline_editor_proxy)
+            self.assertTrue(panel._nodes[node_id].isSelected())
+
+        self.assertTrue(notice.isVisible())
+        self.assertTrue(details.isHidden())
+        click_notice()
+        self.assertTrue(details.isVisible())
+        self.assertEqual(first_error, details.toPlainText())
+
+        next_error = "第 2 张图片生成失败"
+        panel._update_agent_issue_notice(widget, {"steps": {
+            "images": {"errors": [first_error, next_error]},
+        }})
+        self.assertTrue(details.isVisible())
+        self.assertEqual(f"{first_error}\n{next_error}", details.toPlainText())
+        click_notice()
+        self.assertTrue(details.isHidden())
+
+        click_notice()
+        panel._update_agent_issue_notice(widget, {"status": "completed"})
+        self.assertTrue(notice.isHidden())
+        self.assertFalse(notice.isChecked())
+        self.assertTrue(details.isHidden())
+
+    def test_ctrl_video_reference_is_visible_at_prompt_cursor_and_survives_reopen(self):
+        panel = self.make_panel()
+        image = self.layout_root / "ctrl-video-visible.png"
+        pixmap = QPixmap(40, 40)
+        pixmap.fill(Qt.GlobalColor.blue)
+        pixmap.save(str(image))
+        source_id = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(image)})
+        target_id = panel._create_registered_node("video", QPointF(600, 0), overrides={"content": "让人物向前走"})
+        panel.show_inline_editor(panel._nodes[target_id])
+        editor = panel._inline_text_editor
+        cursor = editor.textCursor()
+        cursor.setPosition(1)
+        editor.setTextCursor(cursor)
+        self.assertTrue(panel._attach_image_nodes_as_references(target_id, [source_id]))
+        self.assertIs(editor, panel._inline_text_editor)
+        self.assertIn("让 【图片1】 人物", editor.toPlainText())
+        self.assertEqual(str(image), panel._custom_record(target_id)["first_frame"])
+        widget = panel._inline_editor_proxy.widget()
+        self.assertEqual("图生视频", widget.findChild(canvas_module.QComboBox, "nodeActionMode").currentText())
+        chip = widget.findChild(canvas_module.QPushButton, "videoPromptReference:" + source_id)
+        self.assertIsNotNone(chip)
+        self.assertFalse(chip.icon().isNull())
+        self.assertTrue(widget.findChild(canvas_module.QFrame, "videoReferenceDetails").isHidden())
+        refs = panel._reference_assets_for_node(panel._nodes[target_id])
+        self.assertIn("【图片1】", refs[0]["label"])
+        submitted = []
+        manager = SimpleNamespace(registry=SimpleNamespace(by_capability=lambda _op: [SimpleNamespace(name="seedance")]),
+            submit=lambda _provider, request: (submitted.append(request) or SimpleNamespace(id="ctrl-video-capture", is_finished=True)))
+        with patch.object(canvas_module, "get_ai_manager", return_value=manager):
+            panel.submit_standalone_generation(panel._nodes[target_id], editor.toPlainText(),
+                widget.findChild(canvas_module.QComboBox, "nodeActionMode").currentText())
+        self.assertEqual(str(image), submitted[0].inputs["image"])
+        self.assertIn("【图片1】", submitted[0].inputs["reference_assets"][0]["label"])
+        panel.hide_inline_editor()
+        panel.show_inline_editor(panel._nodes[target_id])
+        self.assertIn("【图片1】", panel._inline_text_editor.toPlainText())
+        self.assertEqual("", panel._nodes[target_id].thumbnail)
+        panel.remove_workflow_edge(source_id, target_id)
+        self.assertNotIn("【图片1】", panel._custom_record(target_id)["content"])
+        panel.close()
+
+    def test_ctrl_video_reference_can_be_inserted_in_supplemental_prompt(self):
+        panel = self.make_panel()
+        image = self.layout_root / "ctrl-video-supplement.png"
+        image.touch()
+        source_id = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(image)})
+        target_id = panel._create_registered_node("video", QPointF(600, 0))
+        panel.show_inline_editor(panel._nodes[target_id])
+        creative = panel._inline_editor_proxy.widget().findChild(canvas_module._NodeTextEdit, "videoCreativePrompt")
+        creative.setPlainText("作为背景")
+        cursor = creative.textCursor()
+        cursor.setPosition(0)
+        creative.setTextCursor(cursor)
+        creative.editingStarted.emit()
+        self.assertTrue(panel._attach_image_nodes_as_references(target_id, [source_id]))
+        self.assertIn("【图片1】", creative.toPlainText())
+        self.assertIn("【图片1】", panel._custom_record(target_id)["creative_prompt"])
+        self.assertEqual("图生视频", panel._custom_record(target_id)["editor_action"])
+        panel.close()
+
+    def test_generator_card_does_not_show_connected_input_as_its_media(self):
+        panel = self.make_panel()
+        image = self.layout_root / "input-cover.png"
+        pixmap = QPixmap(60, 100)
+        pixmap.fill(Qt.GlobalColor.blue)
+        pixmap.save(str(image))
+        source_id = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(image)})
+        video_id = panel._create_registered_node("video", QPointF(600, 0))
+        panel.connect_workflow_nodes(panel._nodes[source_id], panel._nodes[video_id])
+        video = panel._nodes[video_id]
+        self.assertEqual(str(image), video.payload["first_frame"])
+        self.assertEqual("", video.thumbnail)
+        self.assertTrue(video._thumb_pixmap.isNull())
+        self.assertTrue(video.is_media_task)
+        self.assertEqual((240, 156), (video.width, video.height))
+        self.assertEqual(str(image), panel._nodes[source_id].thumbnail)
+        self.assertFalse(panel._nodes[source_id].is_media_task)
+        generated = self.layout_root / "task-result.mp4"
+        generated.touch()
+        panel._custom_record(video_id).update(path=str(generated), video_thumbnail=str(image))
+        panel.refresh()
+        self.assertTrue(panel._nodes[video_id].is_media_task)
+        self.assertEqual("", panel._nodes[video_id].thumbnail)
+        self.assertFalse(panel._node_has_existing_media(panel._nodes[video_id]))
+        panel.close()
+
+    def test_video_reference_details_fold_persist_and_allow_removal(self):
+        panel = self.make_panel()
+        image = self.layout_root / "foldable-reference.png"
+        image.touch()
+        source_id = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(image)})
+        video_id = panel._create_registered_node("video", QPointF(600, 0))
+        panel.connect_workflow_nodes(panel._nodes[source_id], panel._nodes[video_id])
+        panel.show_inline_editor(panel._nodes[video_id])
+        widget = panel._inline_editor_proxy.widget()
+        body = widget.findChild(canvas_module.QFrame, "videoReferenceDetails")
+        toggle = widget.findChild(canvas_module.QPushButton, "videoReferenceToggle")
+        self.assertTrue(body.isHidden())
+        self.assertFalse(toggle.isChecked())
+        toggle.click()
+        self.assertFalse(body.isHidden())
+        self.assertTrue(panel._custom_record(video_id)["video_references_expanded"])
+        panel.hide_inline_editor()
+        panel.show_inline_editor(panel._nodes[video_id])
+        widget = panel._inline_editor_proxy.widget()
+        self.assertFalse(widget.findChild(canvas_module.QFrame, "videoReferenceDetails").isHidden())
+        remove = widget.findChild(canvas_module.QPushButton, f"videoReferenceRemove:{source_id}")
+        remove.click()
+        self.app.processEvents()
+        self.assertFalse(panel._custom_record(video_id).get("first_frame"))
+        self.assertFalse(any(edge.get("source") == source_id and edge.get("target") == video_id
+                             for edge in panel._positions()["__workflow_edges__"]))
+        self.assertIn(source_id, panel._nodes)
+        panel.close()
+
+    def test_creative_agent_runs_plan_and_materializes_results(self):
+        panel = self.make_panel()
+        media = self.layout_root / "agent-input.png"
+        media.write_bytes(b"fixture")
+        result = self.layout_root / "agent-generated.png"
+        result.write_bytes(b"generated")
+        source_id = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(media)})
+        agent_id = panel._create_registered_node("ai_editor", QPointF(400, 0))
+        panel.connect_workflow_nodes(panel._nodes[source_id], panel._nodes[agent_id])
+        calls = []
+        def execute(step, refs, settings, folder, manager, cancelled, progress):
+            calls.append((step, refs))
+            return [{"path": str(result), "kind": "image"}]
+        with patch("ai.canvas_agent_runtime.execute_tool", side_effect=execute), \
+                patch.object(canvas_module, "get_ai_manager", return_value=SimpleNamespace()):
+            panel.run_creative_agent(panel._nodes[agent_id], "生成图片")
+            deadline = time.monotonic() + 5
+            while getattr(panel, "_agent_workers", {}) and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(.01)
+        self.assertEqual(1, len(calls))
+        self.assertEqual(str(media), calls[0][1][0]["path"])
+        record = panel._custom_record(agent_id)
+        self.assertEqual("completed", record["agent_run"]["status"])
+        children = [row for row in panel._positions()["__custom_nodes__"]
+                    if row.get("source_node_id") == agent_id]
+        self.assertEqual(1, len(children))
+        self.assertEqual(str(result), children[0]["path"])
+        self.assertFalse(any(row.get("type") == "agent_step" for row in panel._positions()["__workflow_edges__"]))
+        self.assertTrue(any(row.get("source") == agent_id and row.get("target") == children[0]["id"]
+                            for row in panel._positions()["__workflow_edges__"]))
+        panel.close()
+
+    def test_creative_agent_can_review_plan_before_execution(self):
+        panel = self.make_panel()
+        agent_id = panel._create_registered_node("ai_editor", QPointF(100, 100))
+        panel.update_custom_setting(panel._nodes[agent_id], "agent_auto_run", False)
+        output = self.layout_root / "reviewed-plan.png"
+        output.write_bytes(b"result")
+        with patch("ai.canvas_agent_runtime.execute_tool", return_value=[{"path": str(output), "kind": "image"}]) as execute, \
+                patch.object(canvas_module, "get_ai_manager", return_value=SimpleNamespace()):
+            for expected in ("ready", "completed"):
+                panel.run_creative_agent(panel._nodes[agent_id], "生成图片")
+                deadline = time.monotonic() + 5
+                while panel._agent_workers and time.monotonic() < deadline:
+                    self.app.processEvents()
+                    time.sleep(.01)
+                self.assertEqual(expected, panel._custom_record(agent_id)["agent_run"]["status"])
+                if expected == "ready":
+                    execute.assert_not_called()
+            execute.assert_called_once()
+        panel.close()
+
+    def test_video_accepts_multiple_images_without_replacing_tail(self):
+        panel = self.make_panel()
+        video_id = panel.create_custom_node("video_node", QPointF(600, 100), {
+            "provider_name": "seedance", "model": "doubao-seedance-2-5-260628"})
+        images = []
+        for index in range(4):
+            media = self.layout_root / f"video-reference-{index}.png"
+            media.touch()
+            sid = panel.create_custom_node("image_node", QPointF(0, index * 200), {"path": str(media)})
+            images.append(sid)
+            self.assertTrue(panel.connect_workflow_nodes(panel._nodes[sid], panel._nodes[video_id]))
+        record = panel._custom_record(video_id)
+        edges = [edge for edge in panel._positions()["__workflow_edges__"] if edge.get("target") == video_id]
+        self.assertEqual(4, len(edges))
+        self.assertEqual(["first_frame", "reference", "reference", "reference"], [edge["type"] for edge in edges])
+        self.assertEqual(4, len(panel._reference_assets_for_node(panel._nodes[video_id])))
+        self.assertFalse(record.get("last_frame"))
+        self.assertTrue(panel.set_video_reference_purpose(video_id, images[1], "last_frame"))
+        self.assertTrue(panel.set_video_reference_purpose(video_id, images[2], "last_frame"))
+        settings = {row["source_node_id"]: row["purpose"] for row in record["reference_settings"]}
+        self.assertEqual("reference", settings[images[1]])
+        self.assertEqual("last_frame", settings[images[2]])
+        self.assertEqual(4, len(edges))
+        panel.show_inline_editor(panel._nodes[video_id])
+        widget = panel._inline_editor_proxy.widget()
+        self.assertEqual(4, sum(combo.objectName().startswith("videoReferencePurpose:")
+                                for combo in widget.findChildren(canvas_module.QComboBox)))
+
+        submitted = []
+        provider = SimpleNamespace(name="seedance")
+        manager = SimpleNamespace(registry=SimpleNamespace(by_capability=lambda _op: [provider]),
+            submit=lambda _provider, request: (submitted.append(request) or SimpleNamespace(id="multi-images", is_finished=True)))
+        with patch.object(canvas_module, "get_ai_manager", return_value=manager):
+            panel.submit_standalone_generation(panel._nodes[video_id], "角色穿过庭院", "图生视频")
+        self.assertEqual(1, len(submitted))
+        self.assertEqual("text_to_video", submitted[0].operation)
+        self.assertNotIn("image", submitted[0].inputs)
+        self.assertEqual(4, len(submitted[0].inputs["reference_assets"]))
+        panel.close()
+
+    def test_explicit_first_last_video_keeps_third_image_as_reference(self):
+        panel = self.make_panel()
+        video_id = panel.create_custom_node("video_node", QPointF(600, 100), {
+            "beginner_mode": "first_last_frame_video"})
+        paths = []
+        for index in range(3):
+            media = self.layout_root / f"endpoint-reference-{index}.png"
+            media.touch()
+            paths.append(str(media))
+            sid = panel.create_custom_node("image_node", QPointF(0, index * 200), {"path": str(media)})
+            panel.connect_workflow_nodes(panel._nodes[sid], panel._nodes[video_id])
+        record = panel._custom_record(video_id)
+        self.assertEqual(paths[0], record["first_frame"])
+        self.assertEqual(paths[1], record["last_frame"])
+        self.assertEqual(paths, record["references"])
+        panel.close()
+
+    def test_ctrl_attach_and_remove_video_reference_updates_frames(self):
+        panel = self.make_panel()
+        video_id = panel.create_custom_node("video_node", QPointF(500, 100), {})
+        ids = []
+        for index in range(3):
+            media = self.layout_root / f"ctrl-video-reference-{index}.png"
+            media.touch()
+            ids.append(panel.create_custom_node("image_node", QPointF(0, index * 200), {"path": str(media)}))
+        self.assertTrue(panel._attach_image_nodes_as_references(video_id, ids))
+        self.assertEqual(3, len(panel._custom_record(video_id)["references"]))
+        panel.remove_workflow_edge(ids[0], video_id)
+        record = panel._custom_record(video_id)
+        self.assertFalse(record.get("first_frame"))
+        self.assertEqual(2, len(record["references"]))
+        self.assertFalse(any(row["source_node_id"] == ids[0] for row in record["reference_settings"]))
+        panel.close()
+
+    def test_web_canvas_import_preserves_original_and_can_export(self):
+        panel = self.make_panel()
+        source = self.layout_root / "server-canvas.json"
+        original = {"protocol": "creative-engine-canvas", "version": 1,
+                    "storyboard": {"title": "服务器画布", "shots": []},
+                    "nodes": [{"id": "agent", "type": "studio",
+                               "position": {"x": 120, "y": 80},
+                               "data": {"desktopType": "ai_editor_node",
+                                        "specKey": "ai_editor", "title": "Agent",
+                                        "desktopPayload": {"content": "生成视频"}}}],
+                    "edges": []}
+        source.write_text(json.dumps(original, ensure_ascii=False), encoding="utf-8")
+        self.assertTrue(panel.open_canvas_project(
+            str(source), show_message=False, confirm_switch=False))
+        self.assertEqual("", panel._positions().get("__project_file__"))
+        self.assertEqual(str(source), panel._positions().get("__web_source_file__"))
+        self.assertIn("agent", panel._nodes)
+        exported = self.layout_root / "roundtrip.json"
+        self.assertTrue(panel.export_web_canvas(str(exported), show_message=False))
+        self.assertEqual("生成视频", json.loads(exported.read_text(
+            encoding="utf-8"))["nodes"][0]["data"]["desktopPayload"]["content"])
+        self.assertEqual(original, json.loads(source.read_text(encoding="utf-8")))
+        panel.close()
+
+    def test_control_a_selects_all_visible_canvas_nodes(self):
+        panel = self.make_panel()
+        first = panel.create_custom_node("text_node", QPointF(50, 70), {"content": "一"})
+        second = panel.create_custom_node("text_node", QPointF(370, 70), {"content": "二"})
+        panel.scene.clearSelection()
+        event = QKeyEvent(QEvent.Type.KeyPress, Qt.Key.Key_A,
+                          Qt.KeyboardModifier.ControlModifier)
+        panel.view.keyPressEvent(event)
+        selected = {item.node_id for item in panel.scene.selectedItems()
+                    if isinstance(item, canvas_module.CanvasNodeItem)}
+        self.assertIn(first, selected)
+        self.assertIn(second, selected)
+        self.assertTrue(panel.selection_export_button.isEnabled())
+        self.assertEqual(Qt.ItemSelectionMode.IntersectsItemShape,
+                         panel.view.rubberBandSelectionMode())
+        panel.close()
+
+    def test_dangling_wire_creates_and_connects_agent_after_menu_closes(self):
+        panel = self.make_panel()
+        media = self.layout_root / "dangling-input.png"
+        media.write_bytes(b"fixture")
+        source_id = panel.create_custom_node(
+            "image_node", QPointF(70, 90), {"path": str(media)})
+
+        def choose_agent(menu, _position):
+            return next(action for action in menu.actions()
+                        if "通用创作 Agent" in action.text())
+
+        with patch.object(canvas_module.QMenu, "exec", new=choose_agent), \
+                patch.object(canvas_module.QMessageBox, "information",
+                             side_effect=AssertionError("unexpected dialog")):
+            panel.show_reference_generation_menu(
+                panel._nodes[source_id], QPoint(80, 80), QPointF(390, 120))
+            self.app.processEvents()
+        agents = [record for record in panel._positions()["__custom_nodes__"]
+                  if record.get("type") == "ai_editor_node"]
+        self.assertEqual(1, len(agents))
+        self.assertTrue(any(edge.get("source") == source_id and
+                            edge.get("target") == agents[0]["id"]
+                            for edge in panel._positions()["__workflow_edges__"]))
+        panel.close()
+
+    def test_box_selected_media_can_connect_to_agent_in_one_action(self):
+        panel = self.make_panel()
+        sources = []
+        for index in range(2):
+            media = self.layout_root / f"bulk-{index}.png"
+            media.write_bytes(b"fixture")
+            sources.append(panel.create_custom_node(
+                "image_node", QPointF(60, 90 + index * 190),
+                {"path": str(media)}))
+        agent_id = panel._create_registered_node("ai_editor", QPointF(400, 140))
+        panel.scene.clearSelection()
+        for node_id in [*sources, agent_id]:
+            panel._nodes[node_id].setSelected(True)
+        with patch.object(canvas_module.QMessageBox, "information",
+                          side_effect=AssertionError("unexpected dialog")):
+            self.assertEqual(2, panel.connect_selected_to_target(agent_id, sources))
+        agent = panel._custom_record(agent_id)
+        self.assertEqual(2, len(agent["reference_assets"]))
+        self.assertEqual(2, sum(edge.get("target") == agent_id
+                                for edge in panel._positions()["__workflow_edges__"]))
+        panel.close()
+
+    def test_unpacked_selection_project_restores_its_media_paths(self):
+        from ai.canvas_selection import selected_project, write_selection_archive
+
+        panel = self.make_panel()
+        media = self.layout_root / "portable-original.png"
+        media.write_bytes(b"fixture")
+        node_id = panel.create_custom_node(
+            "image_node", QPointF(80, 100), {"path": str(media)})
+        project = selected_project(
+            panel.current_storyboard(), panel._positions(), {node_id})
+        archive = self.layout_root / "portable-selection.zip"
+        write_selection_archive(archive, project)
+        unpacked = self.layout_root / "portable-unpacked"
+        with zipfile.ZipFile(archive) as saved:
+            saved.extractall(unpacked)
+        self.assertTrue(panel.open_canvas_project(
+            str(unpacked / "selection.xiaohuanai"),
+            show_message=False, confirm_switch=False))
+        record = panel._custom_record(node_id)
+        self.assertEqual(str(unpacked / "media" / "001_portable-original.png"),
+                         record["path"])
+        panel.close()
+
+    def test_creative_agent_editor_exposes_local_routes(self):
+        panel = self.make_panel()
+        media = self.layout_root / "agent-control-source.png"
+        media.write_bytes(b"fixture")
+        source_id = panel.create_custom_node(
+            "image_node", QPointF(40, 80), {"path": str(media)})
+        agent_id = panel._create_registered_node("ai_editor", QPointF(390, 80))
+        self.assertTrue(panel.connect_workflow_nodes(
+            panel._nodes[source_id], panel._nodes[agent_id]))
+        panel.show_inline_editor(panel._nodes[agent_id])
+        self.assertIsNotNone(panel._inline_editor_proxy)
+        editor = panel._inline_editor_proxy.widget()
+        self.assertTrue(any(combo.findData("editor") >= 0
+                            for combo in editor.findChildren(canvas_module.QComboBox)))
+        self.assertFalse(any(combo.findData("server") >= 0
+                             for combo in editor.findChildren(canvas_module.QComboBox)))
+        self.assertTrue(panel.set_agent_reference_role(
+            agent_id, source_id, "product_icon"))
+        self.assertEqual("product_icon",
+                         panel._custom_record(agent_id)["reference_settings"][0]["purpose"])
+        panel.close()
+
+    def test_web_asset_can_be_relinked_to_local_file(self):
+        panel = self.make_panel()
+        media = self.layout_root / "relinked.png"
+        media.write_bytes(b"fixture")
+        source = self.layout_root / "offline-web.json"
+        source.write_text(json.dumps({
+            "protocol": "creative-engine-canvas", "version": 1,
+            "nodes": [{"id": "web-image", "position": {"x": 0, "y": 0},
+                       "data": {"specKey": "image_asset",
+                                "desktopType": "image_node", "title": "网页图片",
+                                "desktopPayload": {"asset_id": "asset-1"}}}],
+            "edges": [],
+        }, ensure_ascii=False), encoding="utf-8")
+        self.assertTrue(panel.open_canvas_project(
+            str(source), show_message=False, confirm_switch=False))
+        self.assertEqual("缺少本地素材 · 请右键关联文件",
+                         panel._custom_record("web-image")["status"])
+        self.assertTrue(panel.relink_canvas_media("web-image", str(media)))
+        self.assertEqual(str(media), panel._custom_record("web-image")["path"])
+        panel.close()
 
     def test_canceling_new_menu_never_creates_an_image_node(self):
         panel = self.make_panel()
@@ -132,8 +588,8 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         panel = self.make_panel()
         labels = [button.text() for button in
                   panel.create_dock.findChildren(canvas_module.QPushButton)]
-        self.assertIn("⇧ 导入", labels)
-        self.assertIn("▣ 资产", labels)
+        self.assertIn("导入", labels)
+        self.assertIn("资产", labels)
         panel.close()
 
     def test_navigator_middle_handle_collapses_and_restores_sidebar(self):
@@ -262,12 +718,6 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         self.assertFalse(toolbar.isHidden())
         self.assertEqual("未选择节点", panel.selection_count_label.text())
         self.assertFalse(panel.selection_delete_button.isEnabled())
-        self.assertIn(
-            "QFrame#canvasSelectionToolbar{background:transparent;",
-            toolbar.styleSheet())
-        self.assertIn(
-            "QLabel#canvasSelectionCount{background:transparent;",
-            toolbar.styleSheet())
         self.assertFalse(toolbar.autoFillBackground())
         self.assertTrue(panel.selection_count_label.testAttribute(
             Qt.WidgetAttribute.WA_TransparentForMouseEvents))
@@ -345,7 +795,7 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
         def choose(kind):
             def choose_action(menu, _position):
                 for action in menu.actions():
-                    if action.text().strip().endswith(kind):
+                    if action.text().split("\t", 1)[0].strip().endswith(kind):
                         return action
                 return None
             return choose_action
@@ -557,6 +1007,9 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
 
     def test_project_video_generator_can_override_lock_with_seedance_25(self):
         panel = self.make_panel()
+        panel.set_storyboard({"id":"seedance-model-lock", "shots":[], "production_models":{
+            "video_provider":"seedance", "video_model":"doubao-seedance-2-0-260128",
+        }})
         source_id = panel.create_custom_node(
             "storyboard_node", QPointF(100, 100), {
                 "video_provider":"seedance",
@@ -567,8 +1020,11 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
             "editor_action":"文生视频",
         })
         panel.hide_inline_editor()
-        with patch.object(panel, "_production_source_for_generator",
-                          return_value=source_id):
+        registry = SimpleNamespace(by_capability=lambda capability: (
+            [SimpleNamespace(name="seedance")]
+            if capability in {"image_to_video", "text_to_video"} else []))
+        with patch.object(panel, "_production_source_for_generator", return_value=source_id), \
+                patch.object(canvas_module, "get_ai_manager", return_value=SimpleNamespace(registry=registry)):
             panel.show_inline_editor(panel._nodes[node_id])
         widget = panel._inline_editor_proxy.widget()
         model_combo = next(
@@ -616,6 +1072,229 @@ class CanvasRecentUIRegressionTests(unittest.TestCase):
             panel.edit_image_style_explorer(panel._nodes[node_id])
         self.assertGreater(captured["count"], 40)
         self.assertTrue(all(captured["icons"]))
+        panel.close()
+
+    def test_style_search_keeps_selection_and_explicitly_unlocked_content(self):
+        panel = self.make_panel()
+        node_id = panel.create_custom_node("image_node", QPointF(100, 100), {
+            "multi_image_composer": True, "style_preset": "knitted-wool",
+            "style_preserve": [], "style_strength": 80,
+        })
+
+        def use_dialog(dialog):
+            self.assertFalse(any(check.isChecked() for check in dialog.preserve_checks.values()))
+            dialog.search.setText("不存在的风格")
+            self.assertEqual(0, dialog.presets.count())
+            self.assertEqual("knitted-wool", dialog.settings()["style_preset"])
+            dialog.search.clear()
+            selected = next(dialog.presets.item(i) for i in range(dialog.presets.count())
+                            if dialog.presets.item(i).data(Qt.ItemDataRole.UserRole) == "blown-glass")
+            dialog.presets.setCurrentItem(selected)
+            dialog.category.setCurrentIndex(dialog.category.findData("未来视觉"))
+            self.assertEqual("blown-glass", dialog.settings()["style_preset"])
+            self.assertTrue(dialog.preview.isHidden())
+            return int(canvas_module.QDialog.DialogCode.Accepted)
+
+        with patch.object(canvas_module.QDialog, "exec", new=use_dialog):
+            panel.edit_image_style_explorer(panel._nodes[node_id])
+        self.assertEqual("blown-glass", panel._custom_record(node_id)["style_preset"])
+        self.assertEqual([], panel._custom_record(node_id)["style_preserve"])
+        panel.close()
+
+    def test_style_clear_removes_old_style_and_updates_editor_without_losing_prompt(self):
+        panel = self.make_panel()
+        node_id = panel.create_custom_node("image_node", QPointF(100, 100), {
+            "multi_image_composer": True, "style_preset": "knitted-wool", "style": "针织毛线",
+            "style_custom": "保留文字", "content": "保持包装上的字清晰",
+        })
+        panel.show_inline_editor(panel._nodes[node_id])
+        editor = panel._inline_text_editor
+
+        def clear_dialog(dialog):
+            dialog.clear_style()
+            return int(canvas_module.QDialog.DialogCode.Accepted)
+
+        with patch.object(canvas_module.QDialog, "exec", new=clear_dialog):
+            panel.edit_image_style_explorer(panel._nodes[node_id])
+        record = panel._custom_record(node_id)
+        self.assertEqual("", record["style_preset"])
+        self.assertEqual("", record["style_custom"])
+        self.assertEqual("", record["style"])
+        self.assertIs(editor, panel._inline_text_editor)
+        self.assertEqual("保持包装上的字清晰", editor.toPlainText())
+        summary = panel._inline_editor_proxy.widget().findChild(canvas_module.QLabel, "imageStyleSummary")
+        self.assertIn("未设置风格", summary.text())
+        panel.close()
+
+    def test_image_reference_strip_and_batch_summary_update_without_changing_strategy(self):
+        panel = self.make_panel()
+        image = self.layout_root / "image-style-live-reference.png"
+        pixmap = QPixmap(40, 40)
+        pixmap.fill(Qt.GlobalColor.blue)
+        pixmap.save(str(image))
+        source_id = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(image)})
+        node_id = panel.create_custom_node("image_node", QPointF(600, 0), {
+            "multi_image_composer": True, "batch_mode": True, "batch_strategy": "style",
+            "editor_action": "批量换风格", "candidate_count": 2,
+        })
+        panel.show_inline_editor(panel._nodes[node_id])
+        editor = panel._inline_text_editor
+        panel._attach_image_nodes_as_references(node_id, [source_id])
+        widget = panel._inline_editor_proxy.widget()
+        summary = widget.findChild(canvas_module.QLabel, "imageBatchSummary")
+        self.assertIn("1 张输入 → 2 张结果", summary.text())
+        self.assertEqual("批量换风格", panel._custom_record(node_id)["editor_action"])
+        self.assertEqual(1, widget.findChild(canvas_module.QComboBox, "imageBatchSubject").count())
+        chip = widget.findChild(canvas_module.QPushButton, "imagePromptReference:" + source_id)
+        self.assertFalse(chip.icon().isNull())
+        editor.setPlainText("")
+        panel._sync_inline_reference_mentions(node_id, editor, allow_removal=True)
+        self.assertIn("0 张输入 → 0 张结果", summary.text())
+        self.assertIs(editor, panel._inline_text_editor)
+        panel.close()
+
+    def test_clicking_reference_chips_never_duplicates_prompt_markers(self):
+        panel = self.make_panel()
+        image = self.layout_root / "reference-chip-click.png"
+        pixmap = QPixmap(40, 40)
+        pixmap.fill(Qt.GlobalColor.blue)
+        pixmap.save(str(image))
+        source = panel.create_custom_node("image_node", QPointF(0, 0), {"path": str(image)})
+        node_id = panel.create_custom_node("image_node", QPointF(500, 0), {
+            "multi_image_composer": True, "content": "请保持原来的构图",
+        })
+        panel.show_inline_editor(panel._nodes[node_id])
+        panel._attach_image_nodes_as_references(node_id, [source])
+        editor = panel._inline_text_editor
+        widget = panel._inline_editor_proxy.widget()
+        chip = widget.findChild(canvas_module.QPushButton, "imagePromptReference:" + source)
+        before = editor.toPlainText()
+        for _ in range(5):
+            chip.click()
+        self.assertEqual(before, editor.toPlainText())
+        self.assertTrue(chip.isChecked())
+        insert = widget.findChild(canvas_module.QPushButton, "imageInsertReference")
+        insert.click()
+        insert.click()
+        self.assertEqual(before, editor.toPlainText())
+        # A normal click also leaves a prompt without this token untouched.
+        editor.setPlainText("不自动往这里复制图片标记")
+        chip.click()
+        self.assertEqual("不自动往这里复制图片标记", editor.toPlainText())
+        insert.click()
+        insert.click()
+        self.assertEqual(1, editor.toPlainText().count("【图片1】"))
+        with patch.object(panel, "open_media_preview") as preview:
+            widget.findChild(canvas_module.QPushButton, "imagePreviewReference").click()
+        preview.assert_called_once_with(str(image), "image")
+        panel.close()
+
+    def test_batch_subject_can_be_changed_remembered_and_used_for_generation(self):
+        panel = self.make_panel()
+        paths = [self.layout_root / f"batch-master-{i}.png" for i in range(3)]
+        sources = []
+        for i, path in enumerate(paths):
+            pixmap = QPixmap(40, 40)
+            pixmap.fill(Qt.GlobalColor.blue)
+            pixmap.save(str(path))
+            sources.append(panel.create_custom_node("image_node", QPointF(i * 100, 0), {"path": str(path)}))
+        node_id = panel.create_custom_node("image_node", QPointF(600, 0), {
+            "multi_image_composer": True, "batch_mode": True, "batch_strategy": "paired",
+            "provider_name": "gpt-image", "content": "让主图产品分别搭配其他图片中的场景",
+        })
+        panel.show_inline_editor(panel._nodes[node_id])
+        panel._attach_image_nodes_as_references(node_id, sources)
+        widget = panel._inline_editor_proxy.widget()
+        subject = widget.findChild(canvas_module.QComboBox, "imageBatchSubject")
+        self.assertFalse(widget.findChild(canvas_module.QFrame, "imageBatchSubjectRow").isHidden())
+        self.assertEqual(3, subject.count())
+        self.assertFalse(subject.itemIcon(1).isNull())
+        subject.setCurrentIndex(subject.findData(sources[1]))
+        self.assertEqual(sources[1], panel._custom_record(node_id)["batch_subject_source_id"])
+        chip = widget.findChild(canvas_module.QPushButton, "imagePromptReference:" + sources[1])
+        self.assertIn("主图", chip.text())
+        with patch.object(panel, "open_media_preview") as preview:
+            widget.findChild(canvas_module.QPushButton, "imagePreviewSubject").click()
+        preview.assert_called_once_with(str(paths[1]), "image")
+        panel.hide_inline_editor()
+        panel.show_inline_editor(panel._nodes[node_id])
+        widget = panel._inline_editor_proxy.widget()
+        self.assertEqual(sources[1], widget.findChild(canvas_module.QComboBox, "imageBatchSubject").currentData())
+        submissions = []
+        manager = SimpleNamespace(
+            registry=SimpleNamespace(by_capability=lambda _op: [SimpleNamespace(name="gpt-image")]),
+            submit=lambda _provider, request: (submissions.append(request) or
+                SimpleNamespace(id="paired-master-test", is_finished=False, progress=0)),
+        )
+        with patch.object(canvas_module, "get_ai_manager", return_value=manager):
+            self.assertTrue(panel.submit_multi_image_batch(panel._nodes[node_id], "让主图产品搭配场景", "批量搭配生成"))
+        self.assertEqual(str(paths[1]), submissions[0].inputs["reference_assets"][0]["path"])
+        self.assertEqual(str(paths[0]), submissions[0].inputs["reference_assets"][1]["path"])
+        panel.close()
+
+    def test_subject_can_be_set_by_real_canvas_mouse_clicks_after_zoom(self):
+        panel = self.make_panel()
+        panel.resize(1400, 1000)
+        panel.show()
+        sources = []
+        for i in range(2):
+            image = self.layout_root / f"mouse-subject-{i}.png"
+            pixmap = QPixmap(40, 40)
+            pixmap.fill(Qt.GlobalColor.blue)
+            pixmap.save(str(image))
+            sources.append(panel.create_custom_node("image_node", QPointF(-700, i * 100), {"path": str(image)}))
+        node_id = panel.create_custom_node("image_node", QPointF(0, 0), {
+            "multi_image_composer": True, "content": "保持人物的面部特征",
+        })
+        panel.scene.clearSelection()
+        panel._nodes[node_id].setSelected(True)
+        panel.show_inline_editor(panel._nodes[node_id])
+        panel._attach_image_nodes_as_references(node_id, sources)
+        self.app.processEvents()
+        widget = panel._inline_editor_proxy.widget()
+        before = panel._inline_text_editor.toPlainText()
+
+        def click_control(name):
+            button = widget.findChild(canvas_module.QPushButton, name)
+            local = button.mapTo(widget, button.rect().center())
+            point = panel.view.mapFromScene(panel._inline_editor_proxy.mapToScene(QPointF(local)))
+            self.assertTrue(panel.view.viewport().rect().contains(point))
+            QTest.mouseClick(panel.view.viewport(), Qt.MouseButton.LeftButton, pos=point)
+            self.app.processEvents()
+
+        panel.view.set_zoom(.77, keep_center=True)
+        panel.view.centerOn(panel._inline_editor_proxy.sceneBoundingRect().center())
+        self.app.processEvents()
+        click_control("imagePromptReference:" + sources[1])
+        click_control("imageSetSubject")
+        self.assertEqual("paired", widget.findChild(canvas_module.QComboBox, "imageBatchMode").currentData())
+        self.assertEqual(sources[1], panel._custom_record(node_id)["batch_subject_source_id"])
+        for zoom, source_id in ((1.15, sources[0]), (.63, sources[1])):
+            panel.view.set_zoom(zoom, keep_center=True)
+            panel.view.centerOn(panel._inline_editor_proxy.sceneBoundingRect().center())
+            self.app.processEvents()
+            click_control("imagePromptReference:" + source_id)
+            self.assertEqual(source_id, panel._custom_record(node_id)["batch_subject_source_id"])
+            chip = widget.findChild(canvas_module.QPushButton, "imagePromptReference:" + source_id)
+            self.assertIn("主图已选", chip.text())
+            self.assertTrue(chip.isChecked())
+        self.assertEqual(before, panel._inline_text_editor.toPlainText())
+        panel.close()
+
+    def test_style_cancel_keeps_saved_settings(self):
+        panel = self.make_panel()
+        node_id = panel.create_custom_node("image_node", QPointF(100, 100), {
+            "multi_image_composer": True, "style_preset": "knitted-wool", "style": "针织毛线",
+        })
+
+        def cancel_dialog(dialog):
+            dialog.clear_style()
+            return int(canvas_module.QDialog.DialogCode.Rejected)
+
+        with patch.object(canvas_module.QDialog, "exec", new=cancel_dialog):
+            panel.edit_image_style_explorer(panel._nodes[node_id])
+        self.assertEqual("knitted-wool", panel._custom_record(node_id)["style_preset"])
+        self.assertEqual("针织毛线", panel._custom_record(node_id)["style"])
         panel.close()
 
     def test_video_style_transfer_keeps_settings_in_compact_dialog_entry(self):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import urllib.parse
+from datetime import timedelta
 
 from PyQt6.QtCore import QObject, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QKeySequence, QPixmap, QShortcut
@@ -43,71 +44,75 @@ class ReleaseLoginDialog(QDialog):
         self.result: LoginResult | None = None
         self._worker: QThread | None = None
         self._login_intent = "app"
-        self.setWindowTitle("CreativeEnginePro 登录")
+        self.setWindowTitle("小欢ovo · 登录")
         self.setModal(True)
-        self.setFixedSize(520, 620)
+        self.setFixedSize(560, 710)
         self.setObjectName("releaseLogin")
         self.setStyleSheet("""
             QDialog#releaseLogin {
-                background:#1e1e1e; color:#cccccc;
-                font-family:'Segoe UI','Microsoft YaHei',sans-serif;
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #0b1220,stop:1 #111a2b);
+                color:#dce4f3;
+                font-family:'Segoe UI','Noto Sans SC',sans-serif;
             }
             QFrame#loginCard {
-                background:#202020; border:1px solid #383838;
-                border-radius:5px;
+                background:#141d2c; border:1px solid #27364b;
+                border-radius:18px;
             }
             QLabel#brandLogo {
-                background:#f2f3f6; border:1px solid #d5d8df;
-                border-radius:8px; padding:5px;
+                background:#f5f6fb; border:1px solid #e0e4ef;
+                border-radius:14px; padding:5px;
             }
-            QLabel#brandName { color:#eeeeee; font-size:15px; font-weight:700; }
-            QLabel#brandCaption { color:#777777; font-size:10px; }
+            QLabel#brandName { color:#f6f8ff; font-size:18px; font-weight:700; }
+            QLabel#brandCaption { color:#8e9ab0; font-size:10px; }
             QLabel#teamBadge {
-                color:#79b7ff; background:#1c2938; border:1px solid #315678;
-                border-radius:3px; padding:5px 9px; font-size:10px;
+                color:#c1baff; background:#242346; border:1px solid #474276;
+                border-radius:10px; padding:7px 12px; font-size:10px; font-weight:600;
             }
-            QLabel#loginTitle { color:#f2f2f2; font-size:21px; font-weight:700; }
-            QLabel#loginSubtitle { color:#888888; font-size:11px; }
-            QLabel#fieldLabel { color:#b7b7b7; font-size:11px; font-weight:600; }
+            QLabel#loginTitle { color:#f5f7fd; font-size:26px; font-weight:700; }
+            QLabel#loginSubtitle { color:#97a4ba; font-size:12px; }
+            QLabel#fieldLabel { color:#d3dced; font-size:11px; font-weight:600; }
+            QLabel#fieldHint { color:#8290a7; font-size:10px; }
             QLineEdit {
-                min-height:40px; padding:0 11px; color:#eeeeee;
-                background:#181818; border:1px solid #444444;
-                border-radius:3px; font-size:12px;
+                min-height:46px; padding:0 14px; color:#f1f4fb;
+                background:#0f1725; border:1px solid #2c3b50;
+                border-radius:10px; font-size:12px;
             }
-            QLineEdit:focus { border:1px solid #3d8ef8; background:#1b1b1b; }
-            QLineEdit:disabled { color:#777777; background:#222222; }
+            QLineEdit:focus { border:1px solid #8b80ff; background:#111b2b; }
+            QLineEdit:disabled { color:#77849a; background:#151e2c; }
             QPushButton#passwordToggle {
-                min-width:52px; min-height:40px; color:#bcbcbc;
-                background:#2d2d2d; border:1px solid #444444;
-                border-radius:3px; font-size:11px;
+                min-width:64px; min-height:46px; color:#c0c9d9;
+                background:#1a2637; border:1px solid #304157;
+                border-radius:10px; font-size:11px;
             }
-            QPushButton#passwordToggle:hover { color:#fff; background:#383838; border-color:#666666; }
-            QCheckBox { color:#a8a8a8; spacing:7px; font-size:11px; }
+            QPushButton#passwordToggle:hover { color:#fff; background:#25354a; border-color:#596985; }
+            QCheckBox { color:#b7c2d4; spacing:8px; font-size:11px; }
             QLabel#serverState {
-                color:#75c997; background:#18251f; border:1px solid #28523a;
-                border-radius:3px; padding:7px 10px; font-size:10px;
+                color:#b6c3d6; background:#101a29; border:1px solid #293a50;
+                border-radius:10px; padding:11px 13px; font-size:10px;
             }
-            QLabel#loginStatus { color:#e47777; font-size:11px; }
+            QLabel#loginStatus { color:#ff9a9e; font-size:11px; }
             QPushButton#loginPrimary {
-                min-height:42px; color:#fff; border:0; border-radius:4px;
-                background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #3d8ef8,stop:1 #1c6ed8);
+                min-height:50px; color:#fff; border:0; border-radius:11px;
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #7569f6,stop:1 #5b63df);
                 font-size:13px; font-weight:700;
             }
-            QPushButton#loginPrimary:hover { background:#4a9df9; }
-            QPushButton#loginPrimary:pressed { background:#0b5ed7; }
-            QPushButton#loginPrimary:disabled { color:#8d8d8d; background:#353535; }
-            QPushButton#adminManage {
-                min-height:38px; color:#bdbdbd; border:1px solid #444444;
-                border-radius:3px; background:#2d2d2d; font-size:11px;
+            QPushButton#loginPrimary:hover {
+                background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #8479ff,stop:1 #6b73ed);
             }
-            QPushButton#adminManage:hover { color:#fff; border-color:#3d8ef8; background:#343434; }
-            QPushButton#adminManage:disabled { color:#666666; border-color:#333333; background:#252525; }
+            QPushButton#loginPrimary:pressed { background:#514fc0; }
+            QPushButton#loginPrimary:disabled { color:#9399b1; background:#343750; }
+            QPushButton#adminManage {
+                min-height:40px; color:#c5cddd; border:1px solid #35445a;
+                border-radius:10px; background:#1a2637; font-size:11px;
+            }
+            QPushButton#adminManage:hover { color:#fff; border-color:#8178ef; background:#222c43; }
+            QPushButton#adminManage:disabled { color:#6f7b8e; border-color:#293649; background:#182332; }
             QPushButton#loginExit {
-                min-height:32px; color:#777777; border:0; background:transparent;
+                min-height:30px; color:#8190a7; border:0; background:transparent;
                 font-size:11px;
             }
-            QPushButton#loginExit:hover { color:#cccccc; }
-            QLabel#policyText { color:#696969; font-size:9px; }
+            QPushButton#loginExit:hover { color:#d3dced; }
+            QLabel#policyText { color:#8592a9; font-size:10px; }
         """)
 
         brand = QHBoxLayout()
@@ -122,27 +127,27 @@ class ReleaseLoginDialog(QDialog):
             Qt.TransformationMode.SmoothTransformation))
         brand_text = QVBoxLayout()
         brand_text.setSpacing(2)
-        brand_name = QLabel("CreativeEnginePro")
+        brand_name = QLabel("小欢ovo")
         brand_name.setObjectName("brandName")
-        brand_caption = QLabel("AI 制片工作台 · Desktop")
+        brand_caption = QLabel("AI 创作工作台")
         brand_caption.setObjectName("brandCaption")
         brand_text.addWidget(brand_name)
         brand_text.addWidget(brand_caption)
-        team_badge = QLabel("桌面授权")
+        team_badge = QLabel("体验版" if policy.channel == "demo" else "桌面版")
         team_badge.setObjectName("teamBadge")
         brand.addWidget(logo)
         brand.addLayout(brand_text)
         brand.addStretch(1)
         brand.addWidget(team_badge)
 
-        title = QLabel("桌面端授权登录")
+        title = QLabel("欢迎回来")
         title.setObjectName("loginTitle")
-        note = QLabel("登录后即可进入 AI 制片画布，账号和模型权限由管理员统一分配。")
+        note = QLabel("登录小欢ovo，继续你的创作。")
         note.setWordWrap(True)
         note.setObjectName("loginSubtitle")
 
         self.username = QLineEdit()
-        self.username.setPlaceholderText("请输入管理员分配的账号")
+        self.username.setPlaceholderText("请输入账号")
         self.username.setClearButtonEnabled(True)
         self.username.setAccessibleName("登录账号")
         self.password = QLineEdit()
@@ -156,6 +161,8 @@ class ReleaseLoginDialog(QDialog):
         username_label.setObjectName("fieldLabel")
         password_label = QLabel("密码")
         password_label.setObjectName("fieldLabel")
+        field_hint = QLabel("账号由管理员分配 · 忘记密码请联系管理员重置")
+        field_hint.setObjectName("fieldHint")
         password_row = QHBoxLayout()
         password_row.setSpacing(8)
         password_row.addWidget(self.password, 1)
@@ -175,7 +182,7 @@ class ReleaseLoginDialog(QDialog):
             self.remember.setChecked(True)
 
         host = urllib.parse.urlparse(policy.auth_base_url).hostname or "授权服务器"
-        server_state = QLabel(f"●  已连接团队授权服务  ·  {host}")
+        server_state = QLabel(f"登录服务  ·  {host}")
         server_state.setObjectName("serverState")
 
         self.status = QLabel("")
@@ -185,7 +192,7 @@ class ReleaseLoginDialog(QDialog):
         cancel = QPushButton("退出应用")
         cancel.setObjectName("loginExit")
         cancel.clicked.connect(self.reject)
-        self.submit = QPushButton("安全登录")
+        self.submit = QPushButton("登录并继续")
         self.submit.setObjectName("loginPrimary")
         self.submit.setDefault(True)
         self.submit.clicked.connect(self._submit)
@@ -197,19 +204,25 @@ class ReleaseLoginDialog(QDialog):
         self._admin_shortcut = QShortcut(QKeySequence("Ctrl+Shift+F12"), self)
         self._admin_shortcut.activated.connect(self._toggle_admin_entry)
 
+        if policy.channel == "demo":
+            last_valid_day = (
+                policy.expires_at.astimezone() - timedelta(microseconds=1)
+            ).strftime("%Y年%m月%d日")
+            authorization_label = f"体验授权  ·  可使用至 {last_valid_day}"
+        else:
+            authorization_label = f"桌面授权  ·  有效至 {policy.expiry_label}"
         policy_text = QLabel(
-            f"版本 {policy.version}  ·  可使用至 {policy.expiry_label}\n"
-            "登录、模型调用和额度变化会记录在管理员审计日志中。")
+            f"{authorization_label}\n账号及功能权限由管理员统一管理。")
         policy_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
         policy_text.setObjectName("policyText")
 
         card = QFrame()
         card.setObjectName("loginCard")
         content = QVBoxLayout(card)
-        content.setContentsMargins(28, 20, 28, 20)
-        content.setSpacing(9)
+        content.setContentsMargins(32, 28, 32, 24)
+        content.setSpacing(10)
         content.addLayout(brand)
-        content.addSpacing(10)
+        content.addSpacing(12)
         content.addWidget(title)
         content.addWidget(note)
         content.addSpacing(5)
@@ -219,6 +232,7 @@ class ReleaseLoginDialog(QDialog):
         content.addWidget(self.username)
         content.addWidget(password_label)
         content.addLayout(password_row)
+        content.addWidget(field_hint)
         content.addWidget(self.remember)
         content.addWidget(self.status)
         content.addWidget(self.submit)
@@ -226,8 +240,8 @@ class ReleaseLoginDialog(QDialog):
         content.addWidget(cancel)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 18, 20, 13)
-        layout.setSpacing(10)
+        layout.setContentsMargins(22, 20, 22, 14)
+        layout.setSpacing(12)
         layout.addWidget(card, 1)
         layout.addWidget(policy_text)
 
@@ -359,7 +373,7 @@ class ReleaseLoginDialog(QDialog):
         self.username.setEnabled(True)
         self.password.setEnabled(True)
         self.password_toggle.setEnabled(True)
-        self.submit.setText("安全登录")
+        self.submit.setText("登录并继续")
         self.admin_manage.setText("管理员账号管理")
         self._login_intent = "app"
 

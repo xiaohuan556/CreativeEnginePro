@@ -1,6 +1,8 @@
 param(
     [Parameter(Mandatory = $true)]
     [string]$AuthBaseUrl,
+    [ValidateSet("release", "demo")]
+    [string]$Channel = "release",
     [string]$PythonExe = "",
     [string]$Version = "1.0.0",
     [DateTimeOffset]$ExpiresAfter = "2026-12-02T00:00:00+08:00",
@@ -50,7 +52,7 @@ $safeBuildVersion = ($Version -replace '[^A-Za-z0-9._-]', '_')
 $pyInstallerWorkPath = Join-Path $projectRoot "build\pyinstaller-$safeBuildVersion"
 $manifestPath = Join-Path $releaseDir "release_manifest.json"
 $manifest = [ordered]@{
-    channel = "release"
+    channel = $Channel
     version = $Version
     expires_at = $ExpiresAfter.ToString("yyyy-MM-ddTHH:mm:sszzz")
     require_login = $true
@@ -65,7 +67,10 @@ if (-not $SkipTests) {
     $previousPythonPath = $env:PYTHONPATH
     $env:PYTHONPATH = "$projectRoot;$projectRoot\server"
     try {
-        & $PythonExe -m pytest -q --basetemp (Join-Path $projectRoot "build\pytest-temp")
+        & $PythonExe -m pytest -q `
+            (Join-Path $projectRoot "tests") `
+            (Join-Path $projectRoot "server\tests") `
+            --basetemp (Join-Path $projectRoot "build\pytest-temp")
         if ($LASTEXITCODE -ne 0) { throw "Tests failed; release build stopped." }
     }
     finally {

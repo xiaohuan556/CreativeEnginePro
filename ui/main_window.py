@@ -4,6 +4,7 @@ import os
 import subprocess
 import concurrent.futures
 from datetime import datetime
+from pathlib import Path
 from PyQt6.QtWidgets import *
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QTimer, QUrl, QSettings
 from PyQt6.QtGui import *
@@ -14,6 +15,13 @@ from .mix_handler import MixHandler
 from .slideshow_handler import SlideshowHandler
 from .image_editor import ImageEditorHandler
 from .widgets import CheckMarkBox
+from .widgets.selection_style import checkbox_style
+from .widgets.workbench_controls import (
+    CUT_ACCENT, IMAGE_ACCENT, batch_options_scroll, batch_workbench_style, set_workbench_playback,
+    workbench_button, workbench_icon, workbench_section_heading,
+)
+from .duo_delivery import DuoDeliveryDialog, offer_duo_export
+from core.project_files import AI_SUFFIX, PIC_SUFFIX, VID_SUFFIX
 
 
 # 应用级悬浮提示主题。必须拼入 UltimateEngine 的最终样式表；main.py 在创建
@@ -43,10 +51,11 @@ def _apply_global_tooltip_palette(app):
 # ═══════════════ 侧边栏折叠分组 ═══════════════
 class SidebarGroup(QFrame):
     """可折叠的侧边栏分组"""
-    def __init__(self, title: str, parent=None):
+    def __init__(self, title: str, accent: str, parent=None):
         super().__init__(parent)
         self.setObjectName("SidebarGroup")
         self._title = title
+        self._accent = accent
         self._collapsed = False
         lay = QVBoxLayout(self)
         lay.setContentsMargins(0, 4, 0, 4)
@@ -56,34 +65,33 @@ class SidebarGroup(QFrame):
         self._header.setCursor(Qt.CursorShape.PointingHandCursor)
         self._header.setStyleSheet(
             "QPushButton { text-align:left; padding:6px 10px; border:none;"
-            "font-size:12px; color:#777; background:transparent; }"
-            "QPushButton:hover { color:#aaa; background:rgba(255,255,255,0.03); }"
+            "font-size:11px;color:#a8abb8;background:transparent;border-radius:6px;}"
+            "QPushButton:hover{color:#ecedf3;background:#282b33;}"
         )
         self._header.clicked.connect(self._toggle)
         lay.addWidget(self._header)
 
         self._child_widget = QWidget()
         cl = QVBoxLayout(self._child_widget)
-        cl.setContentsMargins(12, 0, 0, 0)
-        cl.setSpacing(0)
+        cl.setContentsMargins(6, 2, 6, 0)
+        cl.setSpacing(2)
         self._child_layout = cl
         lay.addWidget(self._child_widget)
 
-    def add_button(self, text: str, index: int):
+    def add_button(self, text: str, index: int, icon: str):
         if index is None:
             return None
-        btn = QPushButton(f"  {text}")
+        btn = QPushButton(workbench_icon(icon, self._accent), text)
+        btn.setAccessibleName(text)
         btn.setCheckable(True)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
         btn.setProperty("tab_index", index)
         btn.setStyleSheet(
-            "QPushButton[checkable=\"true\"] {"
-            "text-align:left; padding:8px 10px; border:none; border-left:3px solid transparent;"
-            "font-size:12px; color:#999; background:transparent; }"
-            "QPushButton[checkable=\"true\"]:hover {"
-            "color:#ccc; background:rgba(255,255,255,0.05); border-left:3px solid #555; }"
-            "QPushButton[checkable=\"true\"]:checked {"
-            "color:#fff; background:rgba(255,255,255,0.08); border-left:3px solid #3d8ef8; font-weight:bold; }"
+            "QPushButton{text-align:left;padding:7px 9px;border:1px solid transparent;"
+            "font-size:12px;color:#b8becb;background:transparent;border-radius:7px;}"
+            "QPushButton:hover{color:#ecedf3;background:#272a32;}"
+            f"QPushButton:checked{{color:{self._accent};background:#282d39;border-color:#424858;}}"
+            f"QPushButton:focus{{border-color:{self._accent};}}"
         )
         self._child_layout.addWidget(btn)
         return btn
@@ -206,6 +214,9 @@ class CanvasPreviewContainer(QFrame):
             p.setPen(QPen(QColor("#00eaff"), 1))
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawRect(cx, cy, cw - 1, ch - 1)
+        if self.current_frame is None or self.current_frame.isNull():
+            p.setPen(QColor("#a8abb8"))
+            p.drawText(self.rect(), Qt.AlignmentFlag.AlignCenter, "从队列选择视频以预览")
         p.end()
 class SmartTimeline(QWidget):
     cut_changed = pyqtSignal(float)
@@ -515,22 +526,6 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
             /* ── 复选框 ── */
             QCheckBox { color: #aaaaaa; spacing: 6px; }
-            QCheckBox::indicator {
-                width: 16px; height: 16px;
-                border: 2px solid #555555;
-                border-radius: 3px;
-                background: #1a1a1a;
-            }
-            QCheckBox::indicator:checked {
-                background: #3d8ef8;
-                border: 2px solid #3d8ef8;
-            }
-            QCheckBox::indicator:hover {
-                border: 2px solid #777777;
-            }
-            QCheckBox::indicator:checked:hover {
-                border: 2px solid #64b5f6;
-            }
 
             /* ── 状态栏 ── */
             QStatusBar {
@@ -564,7 +559,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             QMessageBox QPushButton:pressed {
                 background: #2d7ee8;
             }
-        """ + GLOBAL_TOOLTIP_STYLE)
+        """ + GLOBAL_TOOLTIP_STYLE + checkbox_style())
         # 同时把同一套暗色主题应用到整个应用程序（QApplication），
         # 否则顶层弹窗（QMessageBox / QDialog）不会继承本窗口的样式表，
         # 在系统深色主题下会变成「黑底黑字」看不清。Qt 中控件的样式表不会
@@ -601,7 +596,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 pos = max(0, self.player.position() - 100)
                 self.player.setPosition(pos)
                 self.player.pause()
-                self.btn_play.setText("▶ 播放")
+                set_workbench_playback(self.btn_play, False)
                 self.statusBar().showMessage(f"逐帧微调:{pos/1000:.1f}s", 500)
             return
 
@@ -610,7 +605,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 pos = min(self.player.duration(), self.player.position() + 100)
                 self.player.setPosition(pos)
                 self.player.pause()
-                self.btn_play.setText("▶ 播放")
+                set_workbench_playback(self.btn_play, False)
                 self.statusBar().showMessage(f"逐帧微调:{pos/1000:.1f}s", 500)
             return
 
@@ -621,6 +616,31 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         super().keyPressEvent(event)
     def eventFilter(self, obj, event):
         from PyQt6.QtCore import QEvent
+        if obj in getattr(self, 'nav_btns', ()):
+            kind = event.type()
+            if kind in (QEvent.Type.DragEnter, QEvent.Type.DragMove):
+                if self._nav_drop_paths(obj.property('tab_index'), event.mimeData()):
+                    event.acceptProposedAction()
+                    if kind == QEvent.Type.DragEnter:
+                        self._hover_drop_button = obj
+                        QTimer.singleShot(450, lambda btn=obj: self._hover_drop_tab(btn))
+                    return True
+                event.ignore()
+                return True
+            if kind == QEvent.Type.DragLeave:
+                if getattr(self, '_hover_drop_button', None) is obj:
+                    self._hover_drop_button = None
+            if kind == QEvent.Type.Drop:
+                self._hover_drop_button = None
+                index = obj.property('tab_index')
+                paths = self._nav_drop_paths(index, event.mimeData())
+                if paths and self._import_drop_paths(index, paths):
+                    self._show_workspace_tab(index)
+                    event.setDropAction(Qt.DropAction.CopyAction)
+                    event.accept()
+                else:
+                    event.ignore()
+                return True
         if event.type() == QEvent.Type.KeyPress:
             if self.stacked.currentIndex() == 2:
                 # 混剪页中的文本输入必须优先获得完整的原生编辑按键：
@@ -680,7 +700,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
             if self.player.duration() > 0:
                 self.player.pause()
-                self.btn_play.setText("▶ 播放")
+                set_workbench_playback(self.btn_play, False)
                 target_ms = int(self.player.duration() * ratio)
                 self.player.setPosition(target_ms)
 
@@ -707,8 +727,8 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.nav_btns = []
         self._tab_index = {}  # btn → stacked index
 
-        # ── ✂ 剪辑工作台（首位）──
-        btn_editor = QPushButton("  ✂ 剪辑工作台")
+        # ── 剪辑工作台（首位）──
+        btn_editor = QPushButton(workbench_icon("clapperboard", "#65def1"), "剪辑工作台")
         btn_editor.setCheckable(True)
         btn_editor.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_editor.setProperty("tab_index", 5)
@@ -726,7 +746,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
         # ── 图片工作台（紧随剪辑工作台下方）──
         IMAGE_ACCENT = "#a78bfa"  # 与剪辑工作台(青色)区分的左侧颜色条
-        btn_image_edit = QPushButton("  🎨 图片工作台")
+        btn_image_edit = QPushButton(workbench_icon("image", "#c3aaff"), "图片工作台")
         btn_image_edit.setCheckable(True)
         btn_image_edit.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_image_edit.setProperty("tab_index", 6)
@@ -743,9 +763,9 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         side_lay.addWidget(btn_image_edit)
         side_lay.addSpacing(6)
 
-        # ── 🤖 AI 制片画布 ──
+        # ── AI 制片画布 ──
         AI_ACCENT = "#3d8ef8"
-        btn_ai = QPushButton("  🤖 AI 制片画布")
+        btn_ai = QPushButton(workbench_icon("workflow", "#91bcff"), "AI 制片画布")
         btn_ai.setCheckable(True)
         btn_ai.setCursor(Qt.CursorShape.PointingHandCursor)
         btn_ai.setProperty("tab_index", 7)
@@ -763,15 +783,15 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         side_lay.addSpacing(6)
 
         # ── 📹 视频部分 ──
-        grp_video = SidebarGroup("视频部分")
-        btn_tail = grp_video.add_button("尾页处理", 0)
-        btn_mix  = grp_video.add_button("视频混剪", 2)
-        btn_slide = grp_video.add_button("图片轮播", 3)
+        grp_video = SidebarGroup("视频部分", CUT_ACCENT)
+        btn_tail = grp_video.add_button("尾页处理", 0, "scissors")
+        btn_mix = grp_video.add_button("视频混剪", 2, "clapperboard")
+        btn_slide = grp_video.add_button("图片轮播", 3, "layers")
         side_lay.addWidget(grp_video)
 
         # ── 🖼️ 图片部分 ──
-        grp_image = SidebarGroup("图片部分")
-        btn_image = grp_image.add_button("图片处理", 1)
+        grp_image = SidebarGroup("图片部分", IMAGE_ACCENT)
+        btn_image = grp_image.add_button("图片处理", 1, "crop")
         side_lay.addWidget(grp_image)
 
         # AI 脚本的口播文案功能已迁入 AI 制片画布；旧工作台仅保留后台兼容。
@@ -782,7 +802,14 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 self._tab_index[btn] = idx
                 self.nav_btns.append(btn)
                 btn.clicked.connect(self.switch_tab)
+                btn.setAcceptDrops(idx in (0, 1, 2, 3, 7))
         side_lay.addStretch()
+
+        self.duo_delivery = DuoDeliveryDialog(self)
+        self._delivery_retry_button = None
+        self.duo_delivery.pendingChanged.connect(self._show_delivery_retry)
+        if self.duo_delivery.pending:
+            self._show_delivery_retry(True)
 
         # ── 👤 当前桌面账号 ──
         # 开发模式没有授权账号，因此默认隐藏；正式登录成功后由 main.py 注入。
@@ -981,53 +1008,42 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.update_log("已成功撤销上一步操作 (Ctrl+Z)。")
     def build_video_module(self):
         w = QWidget()
+        w.setObjectName("batchWorkbench")
+        w.setStyleSheet(batch_workbench_style(CUT_ACCENT))
         lay = QHBoxLayout(w)
 
         left_p = QWidget()
         ll = QVBoxLayout(left_p)
-        ll.addWidget(QLabel("视频队列 (Video Queue)", styleSheet="font-weight:bold; font-size:16px;"))
+        ll.addWidget(workbench_section_heading("视频队列", "clapperboard", CUT_ACCENT))
+        queue_hint = QLabel("可导入视频，或从文件夹拖到工作区。")
+        queue_hint.setStyleSheet("color:#a8abb8;font-size:11px;")
+        ll.addWidget(queue_hint)
 
         ctrl_lay = QHBoxLayout()
 
-        self.btn_add_v = QPushButton("➕ 导入视频")
+        self.btn_add_v = workbench_button("导入视频", "folder-open", accent=CUT_ACCENT)
         self.btn_add_v.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_add_v.setMinimumWidth(100)
         self.btn_add_v.clicked.connect(self.mock_import_video)
-        self.btn_select_all = QPushButton("全选/反选")
+        self.btn_select_all = workbench_button("全选 / 反选", "square-dashed", accent=CUT_ACCENT)
         self.btn_select_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_select_all.clicked.connect(self.toggle_select_all)
 
-        self.btn_analyze = QPushButton("智能解析所有断点")
+        self.btn_analyze = workbench_button("智能解析断点", "sparkles", "解析队列中所有视频的断点",
+                                           accent=CUT_ACCENT, primary=True)
         self.btn_analyze.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_analyze.setMinimumHeight(35)
         self.btn_analyze.setMinimumWidth(160)
         self.btn_analyze.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        self.btn_analyze.setStyleSheet("""
-            QPushButton {
-                background-color: #409eff;
-                color: white;
-                font-weight: bold;
-                border-radius: 4px;
-                border: 1px solid #3a8ee6;
-            }
-            QPushButton:hover {
-                background-color: #66b1ff;
-            }
-            QPushButton:pressed {
-                background-color: #3a8ee6;
-            }
-            QPushButton:disabled {
-                background-color: #a0cfff;
-            }
-        """)
-
         self.btn_analyze.clicked.connect(self.start_batch_analysis)
 
-        self.btn_clear_v = QPushButton("清空列表")
+        self.btn_clear_v = workbench_button("清空列表", "x", accent=CUT_ACCENT, quiet=True)
         self.btn_clear_v.clicked.connect(self.clear_video_list)
 
         btn_del_v = QPushButton("删除选中条目")
+        btn_del_v.setIcon(workbench_icon("trash-2", "#ffb1b8"))
+        btn_del_v.setObjectName("DangerBtn")
         btn_del_v.clicked.connect(self.delete_selected_video)
 
         ctrl_lay.addWidget(self.btn_add_v)
@@ -1040,6 +1056,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         ll.addLayout(ctrl_lay)
 
         self.v_table = QTableWidget(0, 5)
+        self.v_table.setAlternatingRowColors(True)
         self.v_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.v_table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.v_table.setHorizontalHeaderLabels(["选择", "文件名", "原比例", "AI解析状态", "导出执行状态"])
@@ -1055,10 +1072,10 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         right_p = QWidget()
         rl = QVBoxLayout(right_p)
 
-        rl.addWidget(QLabel("单条视频精修 (Inspector)", styleSheet="color:#00eaff; font-weight:bold;"))
+        rl.addWidget(workbench_section_heading("预览与单条精修", "sliders-horizontal", CUT_ACCENT))
         # 替换为这些行
         self.video_widget = CanvasPreviewContainer(self)
-        self.video_widget.setMinimumHeight(400)
+        self.video_widget.setMinimumHeight(260)
         rl.addWidget(self.video_widget, stretch=1)
 
         self.player = QMediaPlayer()
@@ -1071,18 +1088,18 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self._video_sink.videoFrameChanged.connect(self._on_video_frame_changed)
 
         play_lay = QHBoxLayout()
-        self.btn_play = QPushButton("▶ 播放/暂停")
+        self.btn_play = workbench_button("播放", "play", "播放 / 暂停", accent=CUT_ACCENT)
         self.btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_play.clicked.connect(self.toggle_play)
         play_lay.addWidget(self.btn_play)
 
-        self.btn_re_analyze = QPushButton("重新分析")
+        self.btn_re_analyze = workbench_button("重新分析", "redo-2", accent=CUT_ACCENT)
         self.btn_re_analyze.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_re_analyze.setToolTip("如果AI分析不准,点击此按钮强制重新扫描该视频")
         self.btn_re_analyze.clicked.connect(self.re_analyze_current)
         play_lay.addWidget(self.btn_re_analyze)
 
-        self.btn_show_cut = QPushButton("手动修正剪切点")
+        self.btn_show_cut = workbench_button("手动修正剪切点", "scissors", accent=CUT_ACCENT)
         self.btn_show_cut.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_show_cut.clicked.connect(self.toggle_timeline)
         play_lay.addWidget(self.btn_show_cut)
@@ -1122,25 +1139,9 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
         # 3. 统一替换尾页 (第1行, 横跨4列)
         self.global_tail_path = ""
-        self.btn_browse_tail = QPushButton("点击选择尾页视频文件")
+        self.btn_browse_tail = workbench_button("选择尾页视频", "folder-open", accent=CUT_ACCENT)
         self.btn_browse_tail.setFocusPolicy(Qt.FocusPolicy.NoFocus) # 锁死焦点
         self.btn_browse_tail.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_browse_tail.setStyleSheet("""
-            QPushButton {
-                text-align: left;
-                padding-left: 15px;
-                height: 30px;
-                border: 1px dashed #444;
-                border-radius: 4px;
-                background-color: #1e1e1e;
-                color: #888;
-            }
-            QPushButton:hover {
-                border: 1px solid #00eaff;
-                background-color: #252525;
-                color: #00eaff;
-            }
-        """)
         self.btn_browse_tail.clicked.connect(self.on_select_global_tail)
 
         vgl.addWidget(QLabel("替换尾页:"), 1, 0)
@@ -1148,10 +1149,9 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
 
         # 4. 透明 MOV 动态水印（整画布叠加，导出时循环）
         self.global_watermark_path = ""
-        self.btn_browse_watermark = QPushButton("点击选择透明 MOV 水印")
+        self.btn_browse_watermark = workbench_button("选择透明 MOV 水印", "layers", accent=CUT_ACCENT)
         self.btn_browse_watermark.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_browse_watermark.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.btn_browse_watermark.setStyleSheet(self.btn_browse_tail.styleSheet())
         self.btn_browse_watermark.setToolTip(
             "选择带 Alpha 通道的 MOV，导出时缩放到整个画布并循环叠加")
         self.btn_browse_watermark.clicked.connect(self.on_select_global_watermark)
@@ -1177,7 +1177,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.tail_auto_output = QLineEdit()
         self.tail_auto_output.setPlaceholderText("选择自动导出目录…")
         self.tail_auto_output.editingFinished.connect(self._save_tail_automation_preset)
-        self.btn_tail_auto_output = QPushButton("选择目录")
+        self.btn_tail_auto_output = workbench_button("选择目录", "folder-open", accent=CUT_ACCENT)
         self.btn_tail_auto_output.clicked.connect(self._select_tail_auto_output)
         vgl.addWidget(QLabel("自动输出:"), 4, 0)
         vgl.addWidget(self.tail_auto_output, 4, 1, 1, 2)
@@ -1188,7 +1188,9 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         vgl.addWidget(preset_hint, 5, 1, 1, 3)
 
         vg.setLayout(vgl)
-        rl.addWidget(vg)
+        settings_scroll = batch_options_scroll(vg)
+        settings_scroll.setMinimumHeight(125)
+        rl.addWidget(settings_scroll, 1)
         self._load_tail_automation_preset()
         self.tail_auto_mode.currentIndexChanged.connect(self._save_tail_automation_preset)
         self.tail_auto_export.stateChanged.connect(self._save_tail_automation_preset)
@@ -1198,7 +1200,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setMaximumHeight(80)
-        self.console.setStyleSheet("background-color: #000; color: #00eaff; border: 1px solid #333; font-family: 'Consolas';")
+        self.console.setPlaceholderText("分析与导出日志")
         rl.addWidget(self.console)
 
         rl.addStretch()
@@ -1215,25 +1217,27 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.export_progress.setVisible(False) # 默认隐藏,导出时显示
         rl.addWidget(self.export_progress)
 
-        self.btn_export_single = QPushButton("仅应用并导出当前选中")
+        self.btn_export_single = workbench_button("仅应用并导出当前选中", "upload", accent=CUT_ACCENT)
         self.btn_export_single.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_export_single.clicked.connect(self.export_single_video)
 
-        self.btn_apply_all = QPushButton("同步当前比例到所有视频")
+        self.btn_apply_all = workbench_button("同步当前比例到所有视频", "layout-grid", accent=CUT_ACCENT)
         self.btn_apply_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_apply_all.clicked.connect(self.apply_to_all)
 
         self.btn_stop_export = QPushButton("停止/取消输出")
+        self.btn_stop_export.setIcon(workbench_icon("square", "#ffb1b8"))
         self.btn_stop_export.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_stop_export.setObjectName("DangerBtn")
         self.btn_stop_export.clicked.connect(self.stop_export_task)
         self.btn_stop_export.setEnabled(False)
 
         self.btn_export_all = QPushButton("一键批量导出队列所有视频")
+        self.btn_export_all.setIcon(workbench_icon("upload", "#161b24"))
         self.btn_export_all.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_export_all.clicked.connect(self.start_batch_export)
         self.btn_export_all.setObjectName("PrimaryBtn")
-        self.btn_export_all.setFixedHeight(50)
+        self.btn_export_all.setFixedHeight(38)
 
         rl.addWidget(self.btn_export_single)
         rl.addWidget(self.btn_apply_all)
@@ -1519,7 +1523,9 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         self.export_progress.setVisible(False)
         self.export_progress.setValue(0)
 
-        QMessageBox.information(self, "完成", "所有视频处理完毕!")
+        paths = getattr(getattr(self, 'thread', None), 'completed_paths', ())
+        offer_duo_export(self, paths, "尾页处理", "尾页处理结束",
+                         f"本次成功导出 {len(paths)} 个视频。")
 
         if hasattr(self, 'cb_open_dir') and self.cb_open_dir.isChecked():
             out_dir = getattr(self, '_last_out_dir', '')
@@ -1560,9 +1566,69 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
     def switch_tab(self):
         btn = self.sender()
         idx = self._tab_index.get(btn, 0)
+        self._show_workspace_tab(idx)
+
+    def _show_workspace_tab(self, idx):
         for b in self.nav_btns:
-            b.setChecked(b == btn)
+            b.setChecked(b.property('tab_index') == idx)
         self.stacked.setCurrentIndex(idx)
+
+    def open_project_file(self, path):
+        """Route a project opened from Windows Explorer to its workbench."""
+        suffix = Path(path).suffix.lower()
+        if suffix == PIC_SUFFIX:
+            self._show_workspace_tab(6)
+            return self.image_editor.current_widget().open_project(path)
+        if suffix == VID_SUFFIX:
+            self._show_workspace_tab(5)
+            return self.editor_tab._load_project(path)
+        if suffix == AI_SUFFIX:
+            self._show_workspace_tab(7)
+            return self.production_canvas.open_canvas_project(path)
+        return False
+
+    def _hover_drop_tab(self, button):
+        if (getattr(self, '_hover_drop_button', None) is button
+                and button.rect().contains(button.mapFromGlobal(QCursor.pos()))):
+            self._show_workspace_tab(button.property('tab_index'))
+
+    def _nav_drop_paths(self, index, mime):
+        if not mime.hasUrls():
+            return []
+        paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+        if index in (0, 2):
+            exts = ('.mp4', '.mov', '.avi', '.mkv', '.webm', '.m4v',
+                    '.wmv', '.flv', '.ts') if index == 0 else (
+                        '.mp4', '.mov', '.avi', '.mkv')
+            return [path for path in paths if path.lower().endswith(exts)
+                    and os.path.isfile(path)]
+        if index in (1, 3):
+            exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tif', '.tiff', '.gif')
+            return [path for path in paths if path.lower().endswith(exts)
+                    and os.path.isfile(path)]
+        if index == 7 and hasattr(self, 'production_canvas'):
+            return [path for path in paths
+                    if self.production_canvas.media_node_type(path)
+                    and os.path.isfile(path)]
+        return []
+
+    def _import_drop_paths(self, index, paths):
+        if not paths:
+            return False
+        if index == 0:
+            self.execute_import(paths)
+        elif index == 1:
+            self._execute_img_import(paths)
+        elif index == 2:
+            self._mix_add_files('random', paths)
+        elif index == 3:
+            self._ss_add_images(paths)
+        elif index == 7:
+            return bool(self.production_canvas.import_media_paths(
+                paths, self.production_canvas._viewport_center()))
+        else:
+            return False
+        return True
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
@@ -1574,27 +1640,20 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             return
         tab = self.stacked.currentIndex()
 
-        # 图片轮播 Tab → 导入图片
-        if tab == 3:
-            self._ss_add_images(files)
-            return
-
-        # 图片处理 Tab → 导入图片
-        if tab == 1:
-            from core.slideshow_engine import is_image as _is_image
-            imgs = [f for f in files if _is_image(f)]
-            if imgs:
-                self._execute_img_import(imgs)
+        if tab in (0, 1, 2, 3, 7):
+            paths = self._nav_drop_paths(tab, event.mimeData())
+            if paths and self._import_drop_paths(tab, paths):
+                event.acceptProposedAction()
             return
 
         # 图片工作台：拖到画布、标签栏、属性栏或工作台空白处都能导入。
         if tab == 6:
-            image_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp', '.tiff', '.tif', '.gif')
-            images = [f for f in files if f.lower().endswith(image_exts)]
+            from core.image_import import SUPPORTED_SUFFIXES
+            images = [f for f in files if Path(f).suffix.lower() in SUPPORTED_SUFFIXES]
             doc = self.image_editor.current_widget() if hasattr(self, "image_editor") else None
             if doc is not None:
                 for path in images:
-                    doc.add_image_from_path(path)
+                    doc.add_image_from_path(path, from_drop=True)
                 if images:
                     event.acceptProposedAction()
             return
@@ -1605,10 +1664,7 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
                 self.editor_tab.media_lib.add_file(f)
             return
 
-        # 其他 Tab → 按视频导入
-        video_files = [f for f in files if f.lower().endswith(('.mp4', '.mov', '.avi'))]
-        if video_files:
-            self.execute_import(video_files)
+        event.ignore()
 
     def execute_import(self, files):
         """统一的导入执行函数,供按钮和拖拽共同调用,包含重复防呆"""
@@ -1950,10 +2006,10 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
     def toggle_play(self):
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
-            self.btn_play.setText("▶ 播放")
+            set_workbench_playback(self.btn_play, False)
         else:
             self.player.play()
-            self.btn_play.setText("⏸ 暂停")
+            set_workbench_playback(self.btn_play, True)
 
 
 
@@ -2043,6 +2099,15 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             imported = self.editor_tab.import_storyboard(
                 payload.get("board") or {},
                 audio_policy=str(payload.get("audio_policy") or "replace"))
+        elif payload.get("mode") == "media_batch":
+            imported = sum(int(self.editor_tab.import_canvas_media(item))
+                           for item in payload.get("items", [])
+                           if isinstance(item, dict))
+        elif payload.get("mode") == "agent_edit":
+            imported = self.editor_tab.apply_canvas_agent_edit(payload)
+        elif payload.get("mode") == "agent_project":
+            self.editor_tab.open_canvas_agent_project(str(payload.get("path") or ""))
+            return
         else:
             imported = int(self.editor_tab.import_canvas_media(payload))
         if not imported:
@@ -2325,10 +2390,13 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
             from PyQt6.QtWidgets import QVBoxLayout
 
             dlg = _SettingsDialog(self)
-            dlg.setWindowTitle("设置中心")
-            dlg.resize(820, 640)
-            dlg.setMinimumSize(720, 560)
-            dl = QVBoxLayout(dlg); dl.setContentsMargins(0, 0, 0, 0)
+            dlg.setWindowTitle("小欢ovo · 设置中心")
+            available = self.screen().availableGeometry()
+            dlg.setMinimumSize(min(680, available.width() - 24), min(500, available.height() - 64))
+            dlg.resize(min(880, available.width() - 24), min(728, available.height() - 64))
+            dlg.move(available.center() - dlg.rect().center())
+            dl = QVBoxLayout(dlg)
+            dl.setContentsMargins(0, 0, 0, 0)
             panel = SettingsPanel(dlg)
             dl.addWidget(panel)
             panel.settings_saved.connect(self._on_global_settings_saved)
@@ -2376,10 +2444,11 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         dialog = self._personal_center_dialog
         # Use the editor's normal unsaved-work decision before invalidating the
         # account.  Cancelling here leaves the current session fully intact.
-        if hasattr(self, "editor_tab") and not self.editor_tab._check_save_before_close():
+        if ((hasattr(self, "editor_tab") and not self.editor_tab._check_save_before_close())
+                or (hasattr(self, 'image_editor') and not self.image_editor.prepare_close())):
             if dialog is not None:
                 dialog.set_logout_pending(
-                    False, "已取消退出登录；请先处理未保存的剪辑工程。")
+                    False, "已取消退出登录，请先处理未保存的工程。")
             return
         self._account_logout_prepared = True
         self.logoutRequested.emit()
@@ -2416,10 +2485,31 @@ class UltimateEngine(QMainWindow, ImageHandler, MixHandler, SlideshowHandler, Im
         except Exception as exc:
             self.statusBar().showMessage(f"设置已保存，界面同步失败：{exc}", 5000)
 
+    def _show_delivery_retry(self, visible):
+        if visible and self._delivery_retry_button is None:
+            button = QPushButton("继续交付")
+            button.setToolTip("继续处理上一次向需求对接平台提交的成品")
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.clicked.connect(self.duo_delivery.show_submission)
+            self.statusBar().addPermanentWidget(button)
+            self._delivery_retry_button = button
+        if self._delivery_retry_button is not None:
+            self._delivery_retry_button.setVisible(visible)
+
     def closeEvent(self, event):
         """保存窗口几何 + 检查编辑器是否有未保存更改 + 清理自动保存"""
+        delivery = getattr(self, "duo_delivery", None)
+        if delivery is not None and delivery.busy:
+            event.ignore()
+            delivery.show_submission()
+            self.statusBar().showMessage("正在处理交付，请等当前操作结束再退出。", 5000)
+            return
         if (not self._account_logout_prepared and hasattr(self, 'editor_tab')
                 and not self.editor_tab._check_save_before_close()):
+            event.ignore()
+            return
+        if (not self._account_logout_prepared and hasattr(self, 'image_editor')
+                and not self.image_editor.prepare_close()):
             event.ignore()
             return
         if hasattr(self, 'editor_tab'):
@@ -2522,6 +2612,7 @@ class VideoExportThread(QThread):
         self._is_running = True
         self.success_count = 0
         self.failed_count = 0
+        self.completed_paths = []
 
     def stop(self):
         self._is_running = False
@@ -2563,6 +2654,9 @@ class VideoExportThread(QThread):
             # --- 后续逻辑保持不变 ---
             if success:
                 self.success_count += 1
+                completed = getattr(self.processor, 'last_completed_path', None)
+                if completed:
+                    self.completed_paths.append(completed)
                 self.log_signal.emit(f"STATUS_UPDATE:{row_idx}:已完成")
                 self.progress_signal.emit(int((i + 1) / total * 100))
             else:

@@ -1,0 +1,8 @@
+{
+  "server_ip": "auto",
+  "server_port": 8765,
+  "channel": "demo",
+  "expires_at": "2026-12-02T00:00:00+08:00",
+  "version_prefix": "1.0.0-demo",
+  "output_dir": "build/demo-2026-12-01"
+}

@@ -237,7 +237,6 @@ class VideoGenPanel(QWidget):
         self._first_last_toggle.setToolTip("勾选后，参考图1作为视频起始帧、参考图2作为结束帧，生成平滑过渡视频")
         self._first_last_toggle.setStyleSheet(
             "QCheckBox{color:#bbb;font-size:10px;padding:2px 4px;}"
-            "QCheckBox::indicator{width:12px;height:12px;}"
             "QToolTip{color:#fff;background:#2a2a2a;border:1px solid #3a3a3a;padding:2px 6px;}")
         fl_row.addWidget(self._first_last_toggle)
         fl_row.addStretch(1)

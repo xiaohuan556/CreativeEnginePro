@@ -14,6 +14,7 @@ from typing import Any, Iterable
 
 _ROLE_ORDER = {
     "composition": 0,
+    "subject": 0,
     "scene": 10,
     "character": 20,
     "element": 30,
@@ -56,11 +57,11 @@ def normalize_reference_assets(
             "label": str(raw.get("label") or f"参考图{index + 1}"),
             "name": str(raw.get("name") or ""),
             "version": max(0, int(raw.get("version") or 0)),
-            "weight": max(0.0, min(2.0, float(raw.get("weight") or 1.0))),
+            "weight": max(0.0, min(2.0, float(raw["weight"] if raw.get("weight") not in (None, "") else 1.0))),
             "required": bool(raw.get("required", raw.get("critical", False))),
             "mode": str(raw.get("mode") or "reference"),
-            "priority": int(raw.get("priority") or _ROLE_ORDER.get(role, 50)),
-            "order": int(raw.get("order") or index),
+            "priority": int(raw["priority"] if raw.get("priority") not in (None, "") else _ROLE_ORDER.get(role, 50)),
+            "order": int(raw["order"] if raw.get("order") not in (None, "") else index),
         })
     normalized.sort(key=lambda item: (
         item["priority"], _ROLE_ORDER.get(item["role"], 50), item["order"]))
@@ -80,6 +81,8 @@ def prompt_manifest(values: Iterable[dict[str, Any]] | None) -> str:
         return ""
     role_labels = {
         "composition": "构图底图",
+        "subject": "固定主图",
+        "source_image": "待处理原图",
         "scene": "场景",
         "character": "主体身份",
         "element": "指定元素",

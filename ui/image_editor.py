@@ -7,7 +7,7 @@ P2：模糊(整层/选区) + 羽化 + 剪切蒙版(clip) + 渐变/圆角/描边/
 """
 import os
 import sys
-import json
+import copy
 import math
 import time
 import pickle
@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QGraphicsView, QGraphicsScene, QGraphicsPixmapItem, QApplication,
     QSizePolicy, QFrame, QAbstractItemView, QMessageBox, QPlainTextEdit,
     QSplitter, QMenu, QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView,
-    QTabBar, QInputDialog, QStyle, QDialogButtonBox,
+    QTabBar, QInputDialog, QStyle, QDialogButtonBox, QScrollArea, QToolButton,
 )
 from PyQt6.QtGui import (
     QImage, QPixmap, QPainter, QColor, QFont, QPen, QBrush, QTransform,
@@ -38,6 +38,33 @@ from PyQt6 import sip
 
 ACCENT = "#3d8ef8"
 AUX = "#00eaff"
+from ui.image_workbench_ops import WorkbenchOperations, ADJUSTMENTS, apply_extra_adjustment
+from ui.duo_delivery import offer_duo_export
+from ui.image_workbench_widgets import CanvasNavigator, CommandSearchInput, command_match_score, CurveEditor, ScrubbableLabel
+from core.image_effects import apply_curves, mix_rgba, blur_rgba
+from ui.image_folders import ImageFolderOperations, walk_layers
+from ui.image_file_ops import ImageFileOperations
+from ui.image_commands import ImageCommandsOperations
+from ui.image_painting import ImagePaintingOperations
+from ui.image_adjustment_panel import AdjustmentPropertyPanel
+from ui.image_style_dialog import edit_layer_effects
+from core.image_layer_effects import apply_layer_effects
+from ui.image_layout_ops import ImageLayoutOperations
+from ui.image_selection_ops import ImageSelectionOperations, combine_selection_masks, selection_history
+from ui.image_text_panel import TextPropertyPanel,render_text,text_font
+from ui.image_text_interaction import TextInteractionOperations
+from ui.image_interaction_rendering import ImageInteractionRenderingOperations
+from core.image_history import ImageHistoryOperations
+from core.project_files import PIC_FILTER, PIC_SUFFIX, read_project
+from ui.image_recovery import ImageRecoveryOperations
+from ui.image_chrome import (ColorSwatchButton, EditorColorCard,
+                             ZoomControls, EditorToolButton, AdaptiveToolRail)
+from ui.widgets.workbench_controls import (
+    IMAGE_ACCENT, workbench_button, workbench_field_style, workbench_horizontal_strip, workbench_icon,
+    workbench_slider_style, workbench_tabs_style,
+)
+from ui.image_color_dialog import choose_color
+from ui.image_layer_marquee import LayerMarqueeOperations
 
 
 # ───────────────────────────── 工具枚举 ─────────────────────────────
@@ -59,6 +86,8 @@ class Tool(IntEnum):
     GRADIENT = 14        # 渐变工具（拖拽生成线性/径向渐变填充层）
     CLONE = 15           # 克隆图章（Alt 取源点，拖拽复制纹理）
     HEAL = 16            # 修复画笔（克隆 + 目标亮度/纹理混合）
+    OBJECT_SELECT = 17
+    SHAPE_LINE = 18
 
 
 class AIInpaintPromptDialog(QDialog):
@@ -278,12 +307,19 @@ class ImageLayer:
         self.x = 0.0  # 中心在画布中的坐标
         self.y = 0.0
         self.scale = 1.0
+        self.stretch_x = self.stretch_y = 1.
+        self.flip_x = self.flip_y = False
+        self.mask_linked = True
+        self.quad = []
         self.rotation = 0.0
         self.clip_to = None
         # text
         self.text = ""
         self.font_family = "Microsoft YaHei"
         self.font_size = 48
+        self.letter_spacing = 0
+        self.line_spacing = 100
+        self.text_box_explicit = False
         self.bold = False
         self.italic = False
         self.color = "#ffffff"
@@ -291,6 +327,9 @@ class ImageLayer:
         self.stroke_color = "#000000"  # 文本描边色
         # shape
         self.shape = "rect"
+        self.line_start,self.line_end = (0.,0.),(1.,1.)
+        self.line_style = int(Qt.PenStyle.SolidLine.value)
+        self.line_cap = int(Qt.PenCapStyle.SquareCap.value)
         self.rect = QRectF(0, 0, 100, 100)
         self.fill_color = "#3d8ef8"
         self.stroke_w = 0
@@ -341,6 +380,13 @@ class ImageLayer:
         # P4 调整图层：kind="adjust" 时生效，影响其下所有图层
         # {"type": "brightness_contrast"|"hsl", "brightness":0,"contrast":0,"hue":0,"saturation":0,"lightness":0}
         self.adjust = None
+        self.children = []
+        self.collapsed = True
+        self.frames = []
+        self.frame_durations = []
+        self.frame_index = 0
+        self.svg_source = ''
+        self.effects = {}
 
     @property
     def size(self):
@@ -350,7 +396,7 @@ class ImageLayer:
         t = QTransform()
         t.translate(self.x, self.y)
         t.rotate(self.rotation)
-        t.scale(self.scale, self.scale)
+        t.scale(self.scale*self.stretch_x*(-1 if self.flip_x else 1), self.scale*self.stretch_y*(-1 if self.flip_y else 1))
         # P3 自由变换：斜切 + 透视（可选）
         if self.skew_x != 0 or self.skew_y != 0:
             t.shear(self.skew_x, self.skew_y)
@@ -360,6 +406,13 @@ class ImageLayer:
             q = QTransform(1, self.perspective_y, 0, self.perspective_x, 1, 0, 0, 0, 1)
             t = q * t
         t.translate(-self.w / 2.0, -self.h / 2.0)
+        if self.quad:
+            import cv2
+            source = np.float32([[0,0],[self.w,0],[self.w,self.h],[0,self.h]])
+            target = np.float32([[x*self.w,y*self.h] for x,y in self.quad])
+            matrix = cv2.getPerspectiveTransform(source,target)
+            warp = QTransform(matrix[0,0],matrix[1,0],matrix[2,0],matrix[0,1],matrix[1,1],matrix[2,1],matrix[0,2],matrix[1,2],matrix[2,2])
+            t = warp*t
         return t
 
     def canvas_to_layer(self, cx, cy):
@@ -400,6 +453,8 @@ class ImageProject:
         self.h_guides = []   # P3 水平参考线（文档坐标 y 值）
         self.v_guides = []   # P3 垂直参考线（文档坐标 x 值）
         self.show_grid = False
+        self.grid_subdivisions = 1
+        self.snap_targets = dict(grid=True,guides=True,layers=True,canvas=True)
         self.grid_size = 60  # px
 
     def add_layer(self, layer, top=True):
@@ -528,6 +583,11 @@ class CanvasView(QGraphicsView):
         self.artboard_item = QGraphicsPixmapItem()
         self.artboard_item.setZValue(5)
         self.scene.addItem(self.artboard_item)
+        # Canvas gestures use our layer hit testing; never scan a full-size
+        # pixmap's alpha channel to construct QGraphicsItem collision masks.
+        for item in (self.composite_item, self.sel_item, self.shape_preview_item,
+                     self.handle_item, self.guide_item, self.artboard_item):
+            item.setShapeMode(QGraphicsPixmapItem.ShapeMode.BoundingRectShape)
         self.setAcceptDrops(True)
         # QGraphicsView 的实际接收面是 viewport；部分平台不会把 view 的设置自动下传。
         self.viewport().setAcceptDrops(True)
@@ -558,6 +618,7 @@ class CanvasView(QGraphicsView):
         self._guide_drag = None        # 'h'/'v'：正在从标尺拖出参考线
         self._guide_move = None        # ('h'/'v', idx)：正在拖动已有参考线
         self._brush_hover_pos = None   # 视口坐标；绘制笔刷/橡皮擦实际作用范围
+        self.navigator = CanvasNavigator(self)
 
     RULER_W = 20  # 标尺宽度(px, 视口坐标)
     PAN_MARGIN = 8000  # 场景四周留白(px)：保证可平移到画布外空白，不受 sceneRect 限制
@@ -566,9 +627,49 @@ class CanvasView(QGraphicsView):
     def canvas_pos(self, event):
         return self.mapToScene(int(event.position().x()), int(event.position().y()))
 
+    def viewportEvent(self, event):
+        if event.type() in (QEvent.Type.TabletPress, QEvent.Type.TabletMove, QEvent.Type.TabletRelease):
+            self.tabletEvent(event)
+            return True
+        return super().viewportEvent(event)
+
+    def tabletEvent(self, event):
+        if self.editor.tool not in (Tool.BRUSH, Tool.ERASER):
+            event.ignore()
+            return
+        event_types = {QEvent.Type.TabletPress: QEvent.Type.MouseButtonPress,
+                       QEvent.Type.TabletMove: QEvent.Type.MouseMove,
+                       QEvent.Type.TabletRelease: QEvent.Type.MouseButtonRelease}
+        if event.type() != QEvent.Type.TabletRelease:
+            self.editor._tablet_pressure = max(.01, min(1., event.pressure()))
+        button = Qt.MouseButton.NoButton if event.type() == QEvent.Type.TabletMove else Qt.MouseButton.LeftButton
+        buttons = Qt.MouseButton.NoButton if event.type() == QEvent.Type.TabletRelease else Qt.MouseButton.LeftButton
+        mouse = QMouseEvent(event_types[event.type()], event.position(), event.globalPosition(), button, buttons, event.modifiers())
+        if event.type() == QEvent.Type.TabletPress:
+            self.mousePressEvent(mouse)
+        elif event.type() == QEvent.Type.TabletMove:
+            self.mouseMoveEvent(mouse)
+        else:
+            self.mouseReleaseEvent(mouse)
+            self.editor._tablet_pressure = 1.
+        event.accept()
+
     # —— 标尺（PS 风格，绘制在视口顶部/左侧，Ctrl+R 切换）——
     def paintEvent(self, e):
         super().paintEvent(e)
+        self.editor._paint_layer_handles()
+        self.editor.paint_text_frame()
+        self.editor.paint_layer_selection()
+        if getattr(self.editor,'show_pixel_grid',True) and abs(self.transform().m11())>=8:
+            rect = self.mapToScene(self.viewport().rect()).boundingRect().intersected(self.composite_item.sceneBoundingRect())
+            if not rect.isEmpty():
+                painter = QPainter(self.viewport())
+                painter.setPen(QPen(QColor(255,255,255,40),1))
+                for x in range(math.floor(rect.left()),math.ceil(rect.right())+1):
+                    painter.drawLine(self.mapFromScene(QPointF(x,rect.top())),self.mapFromScene(QPointF(x,rect.bottom())))
+                for y in range(math.floor(rect.top()),math.ceil(rect.bottom())+1):
+                    painter.drawLine(self.mapFromScene(QPointF(rect.left(),y)),self.mapFromScene(QPointF(rect.right(),y)))
+                painter.end()
         # P5 智能参考线（拖动图层时显示的洋红对齐线，先于标尺绘制）
         try:
             self._paint_smart_guides()
@@ -759,18 +860,23 @@ class CanvasView(QGraphicsView):
         lbl = getattr(self.editor, "zoom_label", None)
         if lbl is not None:
             lbl.setText("%d%%" % int(self.transform().m11() * 100 + 0.5))
+        self.navigator.refresh()
 
     def wheelEvent(self, e: QWheelEvent):
         # 以视口中心为锚缩放：画布始终朝屏幕中心对称缩放，缩小也不会跑出视野
-        factor = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
-        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.scale(factor, factor)
-        self._update_zoom_label()
+        delta = e.angleDelta().y()
+        if delta:
+            self.zoom_by(1.15 ** max(-8., min(8., delta / 120.)))
+        elif e.pixelDelta().y():
+            self.zoom_by(1.0015 ** max(-600, min(600, e.pixelDelta().y())))
+        e.accept()
 
     def zoom_by(self, factor):
         """以视图中心缩放（供按钮 / 快捷键调用）。"""
+        current = max(abs(self.transform().m11()), 1e-9)
+        target = max(.01, min(32., current * factor))
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
-        self.scale(factor, factor)
+        self.scale(target / current, target / current)
         self._update_zoom_label()
 
     def fit_view(self):
@@ -808,6 +914,8 @@ class CanvasView(QGraphicsView):
                 self._guide_pre_snap = self.editor._snapshot()
                 self._guide_drag = "v"
                 return
+        if self.editor.begin_text_pointer(e):
+            return
         self._dragging = True
         self._start = self.canvas_pos(e)
         # P5 抓取已有参考线拖动（在标尺可见且靠近参考线时）
@@ -829,7 +937,8 @@ class CanvasView(QGraphicsView):
                 bbox = self.editor._layer_bbox(ly)
                 if bbox is None or not bbox.contains(self._start):
                     self.editor._end_text_edit(save=True)
-        self._start = self.editor._snap_pt(self._start) if self.editor.snap_on else self._start  # P3 网格/参考线吸附
+        if self.editor.tool in (Tool.MOVE,Tool.CROP,Tool.SELECT_RECT,Tool.SELECT_ELLIPSE,Tool.SHAPE_RECT,Tool.SHAPE_ELLIPSE,Tool.SHAPE_LINE):
+            self._start = self.editor._snap_pt(self._start)
         self._last = self._start
         tool = self.editor.tool
         if tool in (Tool.BRUSH, Tool.ERASER):
@@ -837,19 +946,21 @@ class CanvasView(QGraphicsView):
             self._set_canvas_cursor(self.editor._brush_cursor(painting=True))
             self.viewport().update()
         mods = e.modifiers()
-        self.editor._sel_combine = "add" if (mods & Qt.KeyboardModifier.ShiftModifier) else (
-            "sub" if (mods & Qt.KeyboardModifier.AltModifier) else "new")
+        # A polygon is one gesture: retain the mode chosen at its first vertex.
+        if tool != Tool.POLY_LASSO or not getattr(self, '_poly_pts', None):
+            self.editor._sel_combine = self.editor.selection_mode_for_modifiers(mods)
 
         # 变换手柄优先
         if tool == Tool.MOVE:
             handle = self.editor._hit_handle(self._start)
             if handle is not None:
                 self._handle_drag = handle
-                self._handle_pre_snap = self.editor._snapshot()   # pre-state：变换前的状态
+                self._handle_pre_snap = self.editor._snapshot(metadata_only=True)
                 self._handle_orig = {
                     "x": self.editor.active.x, "y": self.editor.active.y,
                     "scale": self.editor.active.scale,
                     "rotation": self.editor.active.rotation,
+                    'quad':copy.deepcopy(self.editor.active.quad),
                     "bbox": self.editor._layer_bbox(self.editor.active),
                     "start": QPointF(self._start),
                 }
@@ -857,37 +968,36 @@ class CanvasView(QGraphicsView):
         if tool == Tool.MOVE:
             # 点空处：清像素选区 + 清图层选择 + 隐藏手柄
             hit = self.editor._hit_test_at(self._start)
-            mods = QApplication.keyboardModifiers()
+            mods = e.modifiers()
             if hit is None:
-                # 画板模式：点中画板背景空白 → 拖动画板；未点中 → 切换/清空
+                # Empty-board drags select layers. Alt retains whole-board movement.
                 if self.editor.active_artboard is not None:
                     ab = self.editor._artboard_at(self._start)
                     if ab is not None:
                         # 点中任意画板：先激活（若不是当前），再直接拖拽该画板
                         if ab is not self.editor.active_artboard:
                             self.editor._set_active_artboard(ab)
-                        self.editor._push_undo("移动画板")
-                        self._artboard_drag = ab
-                        self.editor._invalidate_doc_bounds()  # 拖拽期间允许画布随画板扩大
-                        self._artboard_drag_start = (self._start.x(), self._start.y())
-                        self._artboard_drag_orig = (ab.x, ab.y)
-                        self._dragging = True
-                        return
-                if not (mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier)):
-                    self.editor._clear_selection()          # 像素选区
-                    self.editor._clear_layer_selection()     # 图层选择
-                    self.editor._show_handles = False
-                    self.editor._draw_handles()
-                    self._dragging = False
+                        if mods & Qt.KeyboardModifier.AltModifier:
+                            self.editor._push_undo("移动画板")
+                            self._artboard_drag = ab
+                            self.editor._invalidate_doc_bounds()
+                            self._artboard_drag_start = (self._start.x(), self._start.y())
+                            self._artboard_drag_orig = (ab.x, ab.y)
+                            self._dragging = True
+                            return
+                self.editor._begin_layer_marquee(e.position(), mods)
+                return
             else:
-                if mods & Qt.KeyboardModifier.ControlModifier:            # Ctrl/⌘：切换该层选中
+                if mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.MetaModifier):
                     self.editor._toggle_layer_select(hit)
                     self.editor._show_handles = (len(self.editor.selected) == 1)
                     self.editor._refresh_layers()
                     self.editor._draw_handles()
                     self._dragging = False
-                elif mods & Qt.KeyboardModifier.ShiftModifier:           # Shift：连续选
-                    self.editor._range_layer_select(hit)
+                elif mods & Qt.KeyboardModifier.ShiftModifier:
+                    if hit not in self.editor.selected:
+                        self.editor.selected.append(hit)
+                    self.editor.active = hit
                     self.editor._show_handles = (len(self.editor.selected) == 1)
                     self.editor._refresh_layers()
                     self.editor._draw_handles()
@@ -922,12 +1032,15 @@ class CanvasView(QGraphicsView):
             self.editor._wand(self._start, self.editor.tolerance,
                               self.editor._sel_combine)
             self._dragging = False
+        elif tool == Tool.OBJECT_SELECT:
+            self.editor.object_select(self._start)
+            self._dragging = False
         elif tool == Tool.QUICK_SELECT:
-            # 快速选择：Alt 按住 = 减选，否则加选
-            sub = bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)
-            self.editor._quick_select_begin(sub)
+            self.editor._quick_select_begin(mode=self.editor._sel_combine)
             self.editor._quick_select_point(self._start)
         elif tool in (Tool.BRUSH, Tool.ERASER):
+                self.editor._brush_last_point = (getattr(self.editor, '_brush_anchor', None)
+                                                 if mods & Qt.KeyboardModifier.ShiftModifier else None)
                 self.editor._push_undo("橡皮擦除" if tool == Tool.ERASER else "画笔绘制")
                 self.editor._stroke_point(self._start, e)
         elif tool in (Tool.CLONE, Tool.HEAL):
@@ -937,6 +1050,7 @@ class CanvasView(QGraphicsView):
                 self._set_canvas_cursor(self.editor._clone_cursor(alt=True))
             else:
                 self.editor._push_undo("克隆图章" if tool == Tool.CLONE else "修复画笔")
+                self.editor.begin_clone_stroke(self._start)
                 self.editor._clone_painting = True
                 self._set_canvas_cursor(self.editor._clone_cursor(painting=True))
                 self.editor._stroke_clone(self._start, e)
@@ -955,7 +1069,7 @@ class CanvasView(QGraphicsView):
                 self.editor._clear_layer_selection()
                 self.editor._refresh_layers()
             self._dragging = False
-        elif tool in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE):
+        elif tool in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE, Tool.SHAPE_LINE):
             self._pending_shape_rect = QRectF(self._start, self._start)
         elif tool == Tool.CROP:
             pass  # 记录起始点，拖拽时绘制裁剪预览
@@ -973,6 +1087,10 @@ class CanvasView(QGraphicsView):
             super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e: QMouseEvent):
+        if self.editor.update_text_pointer(e):
+            return
+        if self.editor._update_layer_marquee(e.position()):
+            return
         # 空格抓手模式：手动移动滚动条（不受 sceneRect 限制，画布边角自由拖）
         if self.editor._space_held:
             cur = e.position()
@@ -1013,6 +1131,10 @@ class CanvasView(QGraphicsView):
             return
         # 悬停时更新光标（非拖拽状态下）
         if not self._dragging and self._handle_drag is None:
+            text_cursor = self.editor.text_pointer_cursor(e.position())
+            if text_cursor is not None:
+                self._set_canvas_cursor(text_cursor)
+                return
             p = self.canvas_pos(e)
             handle = self.editor._hit_handle(p)
             # 靠近参考线 → 抓取光标
@@ -1038,6 +1160,14 @@ class CanvasView(QGraphicsView):
                 cursor = self.editor._gradient_cursor()
             elif self.editor.tool in (Tool.BRUSH, Tool.ERASER):
                 cursor = self.editor._brush_cursor()
+            elif self.editor.tool == Tool.MOVE and handle is not None:
+                cursor = {
+                    "nw": Qt.CursorShape.SizeFDiagCursor, "se": Qt.CursorShape.SizeFDiagCursor,
+                    "ne": Qt.CursorShape.SizeBDiagCursor, "sw": Qt.CursorShape.SizeBDiagCursor,
+                    "n": Qt.CursorShape.SizeVerCursor, "s": Qt.CursorShape.SizeVerCursor,
+                    "e": Qt.CursorShape.SizeHorCursor, "w": Qt.CursorShape.SizeHorCursor,
+                    "rotate": Qt.CursorShape.CrossCursor,
+                }[handle]
             else:
                 # 其他工具把手统一普通箭头
                 cursor = Qt.CursorShape.ArrowCursor
@@ -1046,7 +1176,8 @@ class CanvasView(QGraphicsView):
         if not self._dragging:
             return
         p = self.canvas_pos(e)
-        p = self.editor._snap_pt(p)  # P3 网格/参考线吸附
+        if self.editor.tool in (Tool.MOVE,Tool.CROP,Tool.SELECT_RECT,Tool.SELECT_ELLIPSE,Tool.SHAPE_RECT,Tool.SHAPE_ELLIPSE,Tool.SHAPE_LINE):
+            p = self.editor._snap_pt(p)
         tool = self.editor.tool
 
         # 手柄拖拽
@@ -1096,7 +1227,7 @@ class CanvasView(QGraphicsView):
                 self.editor._stroke_clone(p, e)
         elif tool == Tool.QUICK_SELECT:
             self.editor._quick_select_point(p)
-        elif tool in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE):
+        elif tool in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE, Tool.SHAPE_LINE):
             # Shift 约束正圆/正方形
             pt = p
             if e.modifiers() & Qt.KeyboardModifier.ShiftModifier:
@@ -1106,10 +1237,12 @@ class CanvasView(QGraphicsView):
                 dx = side if dx >= 0 else -side
                 dy = side if dy >= 0 else -side
                 pt = QPointF(self._start.x() + dx, self._start.y() + dy)
+            self.editor._line_direction = (pt.x()-self._start.x(),pt.y()-self._start.y())
             self._pending_shape_rect = QRectF(self._start, pt).normalized()
             self.editor._preview_shape(tool, self._pending_shape_rect)
         elif tool == Tool.CROP:
-            rect = QRectF(self._start, p).normalized()
+            rect = self.editor.crop_geometry(self._start, p, bool(e.modifiers() & Qt.KeyboardModifier.AltModifier))
+            self.editor._crop_rect = rect
             self.editor._preview_crop(rect)
         elif tool == Tool.GRADIENT:
             # 渐变：拖拽时实时显示「线段」指示（起点/终点圆点 + 连线 + 角度）
@@ -1119,6 +1252,10 @@ class CanvasView(QGraphicsView):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e: QMouseEvent):
+        if self.editor.finish_text_pointer(e):
+            return
+        if e.button() == Qt.MouseButton.LeftButton and self.editor._finish_layer_marquee(e.position()):
+            return
         # 空格抓手模式：交给 QGraphicsView 原生处理
         if self.editor._space_held:
             self._pan_last = None
@@ -1176,12 +1313,15 @@ class CanvasView(QGraphicsView):
             self._handle_drag = None
             self._handle_orig = {}
             self._dragging = False
+            if self.editor._clear_interaction_preview():
+                self.editor._redraw()
             self.editor._smart_guides = []   # P5 清除洋红参考线
             self.editor._rot_hud.hide()       # 隐藏旋转角度 HUD
             # 操作后入栈：仅当确有变化才记录，避免空拖拽产生无效撤销步
             if layer is not None and orig:
                 changed = ((layer.x, layer.y, layer.scale, layer.rotation) !=
                            (orig["x"], orig["y"], orig["scale"], orig["rotation"]))
+                changed = changed or layer.quad != orig.get('quad',[])
                 if changed:
                     self.editor._push_undo_snapshot("变换图层", self._handle_pre_snap)
             self.viewport().update()
@@ -1195,29 +1335,35 @@ class CanvasView(QGraphicsView):
         elif tool == Tool.SELECT_LASSO:
             self.editor._commit_lasso(self._lasso_pts, self.editor._sel_combine)
             self._lasso_pts = []
-        elif tool in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE):
+        elif tool in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE, Tool.SHAPE_LINE):
             self.editor._commit_shape(tool, self._pending_shape_rect)
             self._pending_shape_rect = None
         elif tool == Tool.CROP:
-            rect = QRectF(self._start, p).normalized()
-            self.editor._commit_crop(rect)
+            rect = self.editor.crop_geometry(self._start, p, bool(e.modifiers() & Qt.KeyboardModifier.AltModifier))
+            self.editor._crop_rect = rect
+            self.editor._preview_crop(rect)
         elif tool == Tool.GRADIENT:
             radial = bool(e.modifiers() & Qt.KeyboardModifier.ShiftModifier)
             self.editor._create_gradient_layer(self._start, p, radial)
             self.sel_item.setPixmap(QPixmap())  # 清除拖拽线段预览
         elif tool in (Tool.CLONE, Tool.HEAL):
             self.editor._clone_painting = False
+            self.editor._brush_last_point = None
             # 松开后：若仍按住 Alt → 维持「设源点」光标，否则回到常态
             self._set_canvas_cursor(
                 self.editor._clone_cursor(
                     alt=bool(e.modifiers() & Qt.KeyboardModifier.AltModifier)))
         elif tool in (Tool.BRUSH, Tool.ERASER):
+            self.editor._stroke_point(p, e, force=True)
+            self.editor._brush_anchor = QPointF(p)
+            self.editor._brush_last_point = None
             self._set_canvas_cursor(self.editor._brush_cursor())
             self._brush_hover_pos = QPointF(e.position())
             self.viewport().update()
         elif tool == Tool.POLY_LASSO:
             pass  # 多边形套索通过 Enter 或双击闭合
         elif tool == Tool.QUICK_SELECT:
+            self.editor._quick_select_point(p)
             self.editor._quick_select_end()
         self._dragging = False
         super().mouseReleaseEvent(e)
@@ -1265,22 +1411,24 @@ class CanvasView(QGraphicsView):
     def _has_supported_drop_image(mime) -> bool:
         if not mime.hasUrls():
             return False
-        supported = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif", ".gif"}
+        from core.image_import import SUPPORTED_SUFFIXES
+        supported = SUPPORTED_SUFFIXES
         return any(u.isLocalFile() and os.path.splitext(u.toLocalFile())[1].lower() in supported
                    for u in mime.urls())
 
     def dropEvent(self, e):
-        # 仅处理单张图片拖入 → 自动匹配画布尺寸
+        # 批量拖入时逐个导入，只有首张成功导入的图片可调整空画布。
         imported = False
         for u in e.mimeData().urls():
             p = u.toLocalFile()
             if not p:
                 continue
             ext = os.path.splitext(p)[1].lower()
-            if ext not in {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif", ".gif"}:
+            from core.image_import import SUPPORTED_SUFFIXES
+            if ext not in SUPPORTED_SUFFIXES:
                 continue
-            self.editor._drop_import_image(p)
-            imported = True
+            if self.editor.add_image_from_path(p, from_drop=True):
+                imported = True
         if imported:
             e.acceptProposedAction()
         else:
@@ -1307,27 +1455,6 @@ class CanvasView(QGraphicsView):
 
 
 # ───────────────────────────── 图层列表项 ─────────────────────────────
-def _draw_eye_icon(open_eye=True, size=18):
-    """绘制眼睛图标（开/关），避免 emoji 字体缺失导致按钮空白不可见。"""
-    pm = QPixmap(size, size)
-    pm.fill(QColor(0, 0, 0, 0))
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.RenderHint.Antialiasing)
-    pen = QPen(QColor("#cfd3dc"))
-    pen.setWidth(1)
-    p.setPen(pen)
-    if open_eye:
-        # 眼睛轮廓（杏仁形）
-        p.drawLine(2, size // 2, 5, size // 2)
-        p.drawEllipse(4, 4, size - 8, size - 8)
-        p.setBrush(QBrush(QColor("#cfd3dc")))
-        p.drawEllipse(size // 2 - 2, size // 2 - 2, 4, 4)
-    else:
-        p.drawLine(3, size // 2, size - 3, size // 2)
-    p.end()
-    return QIcon(pm)
-
-
 class LayerList(QListWidget):
     """图层面板列表：支持图层行拖拽重排序（上下移动 z-order）。"""
 
@@ -1367,10 +1494,6 @@ class LayerList(QListWidget):
         self._drop_row = -1
         self.viewport().update()
         if ed is None or getattr(ed, "_drag_layer", None) is None:
-            e.ignore()
-            return
-        if ed.project.artboards:
-            # 画板模式下暂不支持跨列表拖拽，保持 up/down 按钮
             e.ignore()
             return
         layer = ed._drag_layer
@@ -1423,16 +1546,24 @@ class LayerItemWidget(QWidget):
         self._press_pos = None        # 拖拽排序：按下起点
         self._can_drag = False        # 是否允许发起拖拽（点按钮时为 False）
         self._drag_started = False
+        self._pending_click_select = False
         lay = QHBoxLayout(self)
         lay.setContentsMargins(6, 4, 6, 4)
         lay.setSpacing(8)
+        if layer.kind == 'group':
+            disclosure = QPushButton('▸' if layer.collapsed else '▾')
+            disclosure.setFixedSize(22, 26)
+            disclosure.setToolTip('展开 / 收起文件夹')
+            def toggle_folder():
+                layer.collapsed = not layer.collapsed
+                QTimer.singleShot(0, editor._refresh_layers)
+            disclosure.clicked.connect(toggle_folder)
+            lay.addWidget(disclosure)
 
-        self.eye = QPushButton()
+        self.eye = workbench_button("", None, accent=IMAGE_ACCENT, quiet=True)
         self.eye.setFixedSize(26, 26)
-        self.eye.setIconSize(QSize(18, 18))
-        self.eye.setIcon(_draw_eye_icon(layer.visible))
-        self.eye.setStyleSheet("border:none;background:transparent;")
-        self.eye.setToolTip("显示 / 隐藏")
+        self.eye.setIconSize(QSize(16, 16))
+        self._update_eye_button()
         self.eye.clicked.connect(self._toggle_eye)
         lay.addWidget(self.eye)
 
@@ -1443,6 +1574,8 @@ class LayerItemWidget(QWidget):
 
         # P4 前缀标识：调整图层 ◐ / 智能对象 📦 / 编组 🗂
         prefix = ""
+        if layer.kind == 'group':
+            prefix = '文件夹 · '
         if layer.kind == "adjust":
             prefix = "◐ "
         elif getattr(layer, "smart", False):
@@ -1452,12 +1585,42 @@ class LayerItemWidget(QWidget):
         self.name = QLabel(prefix + layer.name)
         self.name.setStyleSheet("text-align:left;border:none;background:transparent;color:#aaa;")
         lay.addWidget(self.name, 1)
+        self.lock_button = workbench_button("", None, accent=IMAGE_ACCENT, quiet=True)
+        self.lock_button.setCheckable(True)
+        self.lock_button.setFixedSize(26, 26)
+        self.lock_button.setIconSize(QSize(16, 16))
+        self._update_lock_button()
+        self.lock_button.clicked.connect(self._toggle_lock)
+        lay.addWidget(self.lock_button)
+
+    def _toggle_lock(self, checked):
+        self.editor._push_undo("锁定图层" if checked else "解锁图层")
+        self.layer.locked = checked
+        self._update_lock_button()
+        self.editor._draw_handles()
 
     def _toggle_eye(self):
         self.editor._push_undo("切换图层可见性")
         self.layer.visible = not self.layer.visible
-        self.eye.setIcon(_draw_eye_icon(self.layer.visible))
+        self._update_eye_button()
         self.editor._redraw()
+
+    def _update_eye_button(self):
+        visible = self.layer.visible
+        label = "隐藏图层" if visible else "显示图层"
+        self.eye.setIcon(workbench_icon("eye" if visible else "eye-off",
+                                       "#dce4f4" if visible else "#8b8c99"))
+        self.eye.setAccessibleName(label)
+        self.eye.setToolTip(label)
+
+    def _update_lock_button(self):
+        locked = self.layer.locked
+        label = "解锁图层" if locked else "锁定图层"
+        self.lock_button.setChecked(locked)
+        self.lock_button.setIcon(workbench_icon("lock-keyhole" if locked else "lock-keyhole-open",
+                                               IMAGE_ACCENT if locked else "#8b8c99"))
+        self.lock_button.setAccessibleName(label)
+        self.lock_button.setToolTip(label)
 
     def mousePressEvent(self, e):
         """点击图层行主体即选中；双击文字层 → 直接编辑文字。
@@ -1480,6 +1643,15 @@ class LayerItemWidget(QWidget):
         self._drag_started = False
         layer = self.layer
         editor = self.editor
+        # Keep a multiselection intact while the pointer may start a drag.
+        # A plain click still collapses it on mouse release.
+        self._pending_click_select = (
+            len(editor.selected) > 1 and layer in editor.selected
+            and not (e.modifiers() & (Qt.KeyboardModifier.ControlModifier
+                                    | Qt.KeyboardModifier.ShiftModifier)))
+        if self._pending_click_select:
+            super().mousePressEvent(e)
+            return
         now = time.time()
         dbl_interval = QApplication.instance().doubleClickInterval() / 1000.0
 
@@ -1515,6 +1687,9 @@ class LayerItemWidget(QWidget):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
+        if self._pending_click_select and not self._drag_started:
+            self.editor._select_layer_interactive(self.layer)
+        self._pending_click_select = False
         self._can_drag = False
         self._press_pos = None
         self._drag_started = False
@@ -1522,10 +1697,14 @@ class LayerItemWidget(QWidget):
 
     def _start_drag(self):
         self._drag_started = True
+        self._pending_click_select = False
         ed = self.editor
         ed._drag_layer = self.layer
         mime = QMimeData()
         mime.setData(LayerList.LAYER_MIME, b"x")
+        exported_paths = ed._export_layers_for_drag(self.layer)
+        if exported_paths:
+            mime.setUrls([QUrl.fromLocalFile(path) for path in exported_paths])
         drag = QDrag(self)
         drag.setMimeData(mime)
         try:
@@ -1534,20 +1713,25 @@ class LayerItemWidget(QWidget):
             drag.setHotSpot(QPoint(int(pm.width() / 2), int(pm.height() / 2)))
         except Exception:
             pass
-        drag.exec(Qt.DropAction.MoveAction)
-        self._press_pos = None
-        self._drag_started = False
-        ed._drag_layer = None
+        result = Qt.DropAction.IgnoreAction
+        try:
+            result = drag.exec(
+                Qt.DropAction.CopyAction | Qt.DropAction.MoveAction,
+                Qt.DropAction.CopyAction)
+        finally:
+            # A local reorder clears _drag_layer. External targets keep the
+            # PNGs because their saved projects reference these paths.
+            if result == Qt.DropAction.IgnoreAction or ed._drag_layer is None:
+                for path in exported_paths:
+                    Path(path).unlink(missing_ok=True)
+            self._press_pos = None
+            self._drag_started = False
+            ed._drag_layer = None
 
     def refresh(self):
-        # 图层名：剪切蒙版加缩进箭头，锁定加锁图标
-        suffix = ""
-        if self.layer.clip:
-            suffix = " ↳"
-        if getattr(self.layer, 'locked', False):
-            suffix += " 🔒"
-        self.name.setText(self.layer.name + suffix)
-        self.eye.setIcon(_draw_eye_icon(self.layer.visible))
+        self.name.setText(self.layer.name + (" ↳" if self.layer.clip else ""))
+        self._update_eye_button()
+        self._update_lock_button()
         # 缩略图：用图层自身内容渲染并居中，保留透明通道
         pm = self.editor._layer_thumbnail(self.layer, 38)
         if not pm.isNull():
@@ -1562,16 +1746,15 @@ class LayerItemWidget(QWidget):
 
         供面板选中时频繁调用——widget 始终存活，避免在点击/拖拽中
         因重建列表而销毁正在交互的 widget（那是「点不动/拖不动」的根因）。"""
-        # 高亮：与剪辑工作台选中色保持一致（青色 #00eaff）
         # active 主图层最强，selected 次选稍弱，未选常规
         if self.layer is self.editor.active:
-            self.setStyleSheet("LayerItemWidget{background:#134b54;border-left:4px solid #00eaff;border-radius:2px;}")
+            self.setStyleSheet(f"LayerItemWidget{{background:#342c49;border-left:4px solid {IMAGE_ACCENT};border-radius:6px;}}")
             self.name.setStyleSheet("text-align:left;border:none;background:transparent;color:#ffffff;font-weight:bold;")
-            self.thumb.setStyleSheet("border:1px solid #00eaff;border-radius:2px;background:#1a1a1d;")
+            self.thumb.setStyleSheet(f"border:1px solid {IMAGE_ACCENT};border-radius:4px;background:#1a1a1d;")
         elif self.layer in self.editor.selected:
-            self.setStyleSheet("LayerItemWidget{background:#0e3a44;border-left:4px solid #0a8ea8;border-radius:2px;}")
+            self.setStyleSheet("LayerItemWidget{background:#2a253a;border-left:4px solid #7967a2;border-radius:6px;}")
             self.name.setStyleSheet("text-align:left;border:none;background:transparent;color:#e6f4fb;")
-            self.thumb.setStyleSheet("border:1px solid #0a8ea8;border-radius:2px;background:#1a1a1d;")
+            self.thumb.setStyleSheet("border:1px solid #7967a2;border-radius:4px;background:#1a1a1d;")
         else:
             self.setStyleSheet("LayerItemWidget{background:transparent;border-left:4px solid transparent;}")
             self.name.setStyleSheet("text-align:left;border:none;background:transparent;color:#aaa;")
@@ -2447,7 +2630,7 @@ class _AIEnhanceWorker(QThread):
 # 中文输入法组合文本，从根源上避免「子控件抢焦点导致无法输入」的问题。
 
 
-class ImageEditorWidget(QWidget):
+class ImageEditorWidget(LayerMarqueeOperations, ImageRecoveryOperations, ImageHistoryOperations, ImageInteractionRenderingOperations, TextInteractionOperations, ImageSelectionOperations, ImageLayoutOperations, ImagePaintingOperations, ImageCommandsOperations, ImageFileOperations, ImageFolderOperations, WorkbenchOperations, QWidget):
     add_layer_to_media_requested = pyqtSignal(str)  # 图层导出 PNG 路径 → 媒体库
 
     def __init__(self):
@@ -2460,7 +2643,18 @@ class ImageEditorWidget(QWidget):
         self.fg = QColor(255, 255, 255)   # 前景色（笔刷绘制色）
         self.bg = QColor(0, 0, 0)          # 背景色（橡皮擦为透明，BG 用于交换色等）
         self.brush_size = 20
+        self.brush_opacity = 100
+        self.brush_hardness = 100
+        self.brush_smoothing = 0
+        self.pressure_size = True
+        self.pressure_opacity = True
+        self._tablet_pressure = 1.
+        self.clone_aligned = True
+        self.clone_sample_all = False
+        self._crop_rect = None
         self.tolerance = 32
+        self.wand_contiguous = True
+        self.wand_sample_all = False
         self.feather = 0
         self.blur_radius = 5
         # 形状绘制默认样式（选项条控制，参考 PS 形状工具选项栏）
@@ -2469,10 +2663,14 @@ class ImageEditorWidget(QWidget):
         self.shape_stroke_on = False
         self.shape_stroke_color = QColor("#000000")
         self.shape_stroke_w = 2
+        self.shape_line_style = int(Qt.PenStyle.SolidLine.value)
+        self.shape_line_cap = int(Qt.PenCapStyle.SquareCap.value)
+        self.show_pixel_grid = True
         self.shape_gradient_on = False
         self.shape_grad_from = QColor("#3d8ef8")
         self.shape_grad_to = QColor("#00eaff")
         self._sel_combine = "new"
+        self.selection_mode = 'new'
         # 图层蒙版编辑模式：开启后画笔/橡皮擦写入当前图层的蒙版（黑=隐藏，白=显示）
         self._mask_edit = False
         # 线性历史记录（PS 风格）：支持点击任意历史状态跳转
@@ -2559,11 +2757,32 @@ class ImageEditorWidget(QWidget):
         self.installEventFilter(self)  # 全局 Delete/Backspace 删除活跃层（输入框内除外）
         self._init_ui()
         self.new_project(1080, 1080)
+        self.init_recovery()
 
     # ═══════ UI ═══════
     def _init_ui(self):
         # 全局 tooltip 样式：深色底白字
-        self.setStyleSheet("QToolTip{background:#2a2a30;color:#ffffff;border:1px solid #444;padding:4px 8px;border-radius:3px;font-size:12px;}")
+        self.setStyleSheet("""
+            QLabel, QCheckBox { color:#c2cad6; }
+            QDialog { background:#252830; }
+            QDialog QPushButton {
+                background:#333c49; color:#edf2f8; border:1px solid #4c596d;
+                border-radius:4px; padding:5px 14px;
+            }
+            QDialog QPushButton:hover { background:#40536d; }
+            QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QPlainTextEdit {
+                background:#252830; color:#e1e7ef; border:1px solid #3c424d;
+                border-radius:3px; padding:3px;
+            }
+            QLineEdit:focus, QSpinBox:focus, QComboBox:focus { border-color:#579fff; }
+            QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled { color:#858e9e; }
+            QComboBox QAbstractItemView { background:#252830;color:#e1e7ef;selection-background-color:#397ac7; }
+            QTabWidget, QTabBar { background:#1b1b1e; }
+            QTableWidget { background:#1b1f26; color:#d5ddea; gridline-color:#39414e; }
+            QHeaderView::section { background:#303744; color:#e1e7ef; padding:5px; border:1px solid #414b5c; }
+            QToolTip { background:#2a2a30;color:#ffffff;border:1px solid #444;
+                       padding:4px 8px;border-radius:3px;font-size:12px; }
+        """)
 
         self.view = CanvasView(self)
         self.view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -2583,23 +2802,39 @@ class ImageEditorWidget(QWidget):
 
         # ────── 顶部菜单栏：文件 / 编辑 / 选择 / 图层 ──────
         top_bar = self._build_top_menu_bar()
-        outer.addWidget(top_bar)
+        search_button = workbench_button("搜索操作", None, "搜索菜单功能 (Ctrl+K)，回车执行，Esc 关闭",
+                                         accent=IMAGE_ACCENT, quiet=True)
+        search_button.clicked.connect(self._search_commands)
+        top_bar.layout().addWidget(search_button)
+        outer.addWidget(workbench_horizontal_strip(top_bar))
+        search_action = QAction(self)
+        search_action.setShortcut("Ctrl+K")
+        search_action.setShortcutContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        search_action.triggered.connect(self._search_commands)
+        self.addAction(search_action)
 
         # ────── 选项条（随工具变化）──────
+        self._recovery_notice = QPushButton()
+        self._recovery_notice.setStyleSheet('background:#514428;color:#ffe1a0;padding:7px;')
+        self._recovery_notice.clicked.connect(self.show_recovery_dialog)
+        self._recovery_notice.hide()
+        outer.addWidget(self._recovery_notice)
         opt_bar = self._build_option_bar()
         outer.addWidget(opt_bar)
-        self._update_option_bar()
 
         # ────── 主体：左侧工具栏 | 画布 | 右侧（属性上 / 图层下）──────
         main_split = QSplitter(Qt.Orientation.Horizontal)
         self.main_split = main_split
-        main_split.setStyleSheet("QSplitter::handle{background:#2a2a2a;width:3px;}")
+        main_split.setHandleWidth(6)
+        main_split.setStyleSheet('QSplitter::handle{background:#252527;}'
+                                'QSplitter::handle:hover{background:#49494e;}')
         main_split.setOpaqueResize(True)
         main_split.setChildrenCollapsible(False)
 
         # 左侧：垂直工具栏
         left_toolbar = self._build_left_toolbar()
         main_split.addWidget(left_toolbar)
+        self._update_option_bar()
 
         # 中间：画布
         canvas_wrap = QFrame()
@@ -2616,19 +2851,17 @@ class ImageEditorWidget(QWidget):
         right_split.setChildrenCollapsible(False)
 
         right_panel = self._build_right_panel()
-        right_split.addWidget(right_panel)
+        property_scroll = QScrollArea()
+        property_scroll.setWidgetResizable(True)
+        property_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        property_scroll.setWidget(right_panel)
+        right_split.addWidget(property_scroll)
 
         # 图层面板 + 历史记录面板（PS 风格 Tab 切换）
         self._layer_panel = self._build_layers_panel()
         self._history_panel = self._build_history_panel()
         self._layer_history_tabs = QTabWidget()
-        self._layer_history_tabs.setStyleSheet(
-            "QTabWidget::pane{background:#1b1b1e;border:1px solid #2c2c2c;border-top:none;}"
-            "QTabBar::tab{background:#252528;color:#888;padding:4px 12px;font-size:11px;"
-            "border:1px solid #2c2c2c;border-bottom:none;}"
-            "QTabBar::tab:selected{background:#1b1b1e;color:#fff;}"
-            "QTabBar::tab:hover{color:#ccc;}"
-        )
+        self._layer_history_tabs.setStyleSheet(workbench_tabs_style(IMAGE_ACCENT))
         self._layer_history_tabs.addTab(self._layer_panel, "图层")
         self._layer_history_tabs.addTab(self._history_panel, "历史记录")
         right_split.addWidget(self._layer_history_tabs)
@@ -2636,11 +2869,17 @@ class ImageEditorWidget(QWidget):
         right_split.setSizes([380, 260])
         main_split.addWidget(right_split)
         self._right_split = right_split
+        self._focus_panels = [left_toolbar, right_split, opt_bar]
 
         # AI 生图已统一迁移到 AI 制片画布；图片工作台只保留像素级编辑。
         self._ai_image_panel = None
-        main_split.setSizes([44, 720, 260])
+        main_split.setStretchFactor(0, 0)
+        main_split.setStretchFactor(1, 1)
+        main_split.setStretchFactor(2, 0)
+        main_split.setSizes([164, 720, 280])
+        self._tool_rail.attach_splitter(main_split)
         outer.addWidget(main_split, 1)
+        outer.addWidget(self._build_gif_controls())
 
         # ────── 底部状态栏 ──────
         status = QWidget()
@@ -2658,10 +2897,72 @@ class ImageEditorWidget(QWidget):
         outer.addWidget(status)
 
         self.set_tool(Tool.MOVE)
+        self.install_tool_shortcuts()
+
+    def _search_commands(self):
+        """Discover existing menu commands without duplicating their behavior."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("搜索操作")
+        dialog.resize(560, 420)
+        layout = QVBoxLayout(dialog)
+        results = QListWidget()
+        query = CommandSearchInput(results)
+        query.setPlaceholderText("输入操作名称，例如：蒙版、导出、曲线…")
+        layout.addWidget(query)
+        layout.addWidget(results)
+        commands = []
+        seen = set()
+        for menu in self.findChildren(QMenu):
+            for action in menu.actions():
+                if action.isSeparator() or action.menu() or not action.text() or id(action) in seen:
+                    continue
+                seen.add(id(action))
+                commands.append((menu.title() or (menu.parent().text() if isinstance(menu.parent(), QPushButton) else "操作"), action))
+        for tool, button in self._tool_buttons.items():
+            action = QAction(button.text(), dialog)
+            action.triggered.connect(lambda _=False, t=tool: self.set_tool(t))
+            commands.append(("工具", action))
+
+        def refresh():
+            results.clear()
+            matches = []
+            for category, action in commands:
+                name = category + " › " + action.text().replace('&', '')
+                score = command_match_score(query.text(), name)
+                if score is not None:
+                    matches.append((score, name, action))
+            for _, name, action in sorted(matches, key=lambda match: -match[0]):
+                shortcut = action.shortcut().toString()
+                item = QListWidgetItem(name + ("    " + shortcut if shortcut else ""))
+                item.setData(Qt.ItemDataRole.UserRole, action)
+                if not action.isEnabled():
+                    item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEnabled)
+                results.addItem(item)
+            for row in range(results.count()):
+                if results.item(row).flags() & Qt.ItemFlag.ItemIsEnabled:
+                    results.setCurrentRow(row)
+                    break
+
+        def execute(*_):
+            item = results.currentItem()
+            if item is None:
+                return
+            action = item.data(Qt.ItemDataRole.UserRole)
+            if action.isEnabled():
+                dialog.accept()
+                action.trigger()
+
+        query.textChanged.connect(refresh)
+        query.returnPressed.connect(execute)
+        results.itemActivated.connect(execute)
+        refresh()
+        query.setFocus()
+        dialog.exec()
 
     def _section(self, title):
         w = QLabel(title)
-        w.setStyleSheet("color:#3d8ef8;font-weight:bold;font-size:12px;padding:6px 0 2px 0;")
+        w.setStyleSheet(f"color:{IMAGE_ACCENT};font-weight:600;font-size:12px;"
+                        "padding:7px 0 4px;border-bottom:1px solid #36313f;")
         return w
 
     def _sep_v(self):
@@ -2672,10 +2973,11 @@ class ImageEditorWidget(QWidget):
     def _build_top_menu_bar(self):
         """顶部菜单栏（PS 风格）：文件 / 编辑 / 选择 / 导出 下拉菜单"""
         bar = QWidget()
-        bar.setFixedHeight(34)
-        bar.setStyleSheet("background:#252528;border-bottom:1px solid #333;")
+        bar.setObjectName("imageMenuBar")
+        bar.setMinimumHeight(40)
+        bar.setStyleSheet("QWidget#imageMenuBar{background:#1c1e23;border-bottom:1px solid #30323b;}")
         l = QHBoxLayout(bar)
-        l.setContentsMargins(6, 2, 6, 2); l.setSpacing(1)
+        l.setContentsMargins(8, 2, 8, 2); l.setSpacing(2)
 
         # ── 文件 ──
         btn_file = self._menu_btn("文件")
@@ -2684,10 +2986,14 @@ class ImageEditorWidget(QWidget):
         self._add_menu_action(menu_file, "新建画布", self._on_new_canvas, "Ctrl+N")
         menu_file.addSeparator()
         self._add_menu_action(menu_file, "导入图片...", self.add_image_dialog, "Ctrl+I")
+        self._add_menu_action(menu_file, '导入报告', self.show_import_report)
+        self._add_menu_action(menu_file, '打开 Compositor 工程…', self.open_comp)
+        self._add_menu_action(menu_file, '载入外部更新（当前状态可撤销）', self.reload_comp_from_disk)
         self._add_menu_action(menu_file, "导入 PSD...", self.import_psd, "")
         menu_file.addSeparator()
         self._add_menu_action(menu_file, "保存工程", self.save_project, "Ctrl+S")
         self._add_menu_action(menu_file, "打开工程...", self.open_project, "Ctrl+O")
+        self._add_menu_action(menu_file, '恢复自动备份…', self.show_recovery_dialog)
         btn_file.setMenu(menu_file)
         l.addWidget(btn_file)
 
@@ -2698,11 +3004,14 @@ class ImageEditorWidget(QWidget):
         self._add_menu_action(menu_edit, "撤销", self.undo, "Ctrl+Z")
         self._add_menu_action(menu_edit, "重做", self.redo, "Ctrl+Y")
         menu_edit.addSeparator()
-        self._add_menu_action(menu_edit, "复制选区", self.copy_selection, "Ctrl+C")
+        self._add_menu_action(menu_edit, "复制选区 / 图层", self.copy_selection, "Ctrl+C")
+        self._add_menu_action(menu_edit, "复制合成图", self.copy_merged, "Ctrl+Shift+C")
         self._add_menu_action(menu_edit, "粘贴", self.paste_image, "Ctrl+V")
         menu_edit.addSeparator()
         self._add_menu_action(menu_edit, "自由变换", self._start_free_transform, "Ctrl+T")
+        self._add_menu_action(menu_edit, "精确变换…", self.exact_transform)
         self._add_menu_action(menu_edit, "变换复制", self._transform_copy, "Ctrl+Alt+T")
+        self._add_menu_action(menu_edit, '键盘快捷键…', self.edit_shortcuts)
         btn_edit.setMenu(menu_edit)
         l.addWidget(btn_edit)
 
@@ -2710,8 +3019,11 @@ class ImageEditorWidget(QWidget):
         btn_layer = self._menu_btn("图层")
         menu_layer = QMenu(btn_layer)
         menu_layer.setStyleSheet(self._menu_style())
+        self._add_menu_action(menu_layer, '图层效果…', lambda:edit_layer_effects(self))
         m_adj = menu_layer.addMenu("新建调整图层")
         m_adj.setStyleSheet(self._menu_style())
+        for kind, (label, _) in ADJUSTMENTS.items():
+            self._add_menu_action(m_adj, label + "…", lambda _=False, k=kind: self._add_adjust_layer(k))
         self._add_menu_action(m_adj, "亮度/对比度...",
                               lambda: self._add_adjust_layer("brightness_contrast"))
         self._add_menu_action(m_adj, "色相/饱和度...",
@@ -2724,6 +3036,15 @@ class ImageEditorWidget(QWidget):
                               lambda: self._add_adjust_layer("white_balance"))
         self._add_menu_action(m_adj, "色彩平衡...",
                               lambda: self._add_adjust_layer("color_balance"))
+        menu_layer.addSeparator()
+        masks = menu_layer.addMenu("蒙版操作")
+        self._add_menu_action(masks,'切换蒙版联动 / 独立',self.toggle_mask_link)
+        self._add_menu_action(masks, "柔化蒙版边缘…", self.blur_mask)
+        for label, operation in (("从选区创建蒙版", "selection"), ("反转蒙版", "invert"),
+                                 ("蒙版全部显示", "white"), ("蒙版全部隐藏", "black")):
+            self._add_menu_action(masks, label, lambda _=False, op=operation: self.mask_operation(op))
+        self._add_menu_action(menu_layer, "载入图层透明度为选区", self.load_layer_selection)
+        self._add_menu_action(menu_layer, "载入蒙版为选区", lambda: self.load_layer_selection(mask=True))
         menu_layer.addSeparator()
         self._add_menu_action(menu_layer, "图层编组", self._group_selected, "Ctrl+G")
         self._add_menu_action(menu_layer, "取消编组", self._ungroup_selected, "Ctrl+⇧+G")
@@ -2749,12 +3070,15 @@ class ImageEditorWidget(QWidget):
         btn_image = self._menu_btn("图像")
         menu_image = QMenu(btn_image)
         menu_image.setStyleSheet(self._menu_style())
+        self._add_menu_action(menu_image, '缩放图像尺寸（保留源像素）…', self.resize_image_dialog)
+        self._add_menu_action(menu_image, '按颜色或透明度裁切边缘…', self.trim_edges_dialog)
+        self._add_menu_action(menu_image, "裁切透明边缘（保留图层）", self.trim_transparent)
         m_rot_c = menu_image.addMenu("旋转画布")
         m_rot_c.setStyleSheet(self._menu_style())
         self._add_menu_action(m_rot_c, "顺时针 90°",
-                              lambda: self._rotate_canvas(-90, swap=True))
-        self._add_menu_action(m_rot_c, "逆时针 90°",
                               lambda: self._rotate_canvas(90, swap=True))
+        self._add_menu_action(m_rot_c, "逆时针 90°",
+                              lambda: self._rotate_canvas(-90, swap=True))
         self._add_menu_action(m_rot_c, "旋转 180°",
                               lambda: self._rotate_canvas(180, swap=False))
         self._add_menu_action(m_rot_c, "按角度旋转…",
@@ -2774,6 +3098,10 @@ class ImageEditorWidget(QWidget):
         btn_filter = self._menu_btn("滤镜")
         menu_filter = QMenu(btn_filter)
         menu_filter.setStyleSheet(self._menu_style())
+        live_filters = menu_filter.addMenu("新建无损滤镜层")
+        for kind, (label, _) in self.FILTERS.items():
+            self._add_menu_action(live_filters, label + "…", lambda _=False, k=kind: self.add_filter_layer(k))
+        self._add_menu_action(menu_filter, "再次应用上次滤镜", self.repeat_filter, "Ctrl+Alt+F")
         for _k in ("gaussian_blur", "motion_blur", "sharpen", "usm"):
             self._add_menu_action(menu_filter, self.FILTERS[_k][0] + "...",
                                   lambda _=False, k=_k: self._run_filter(k))
@@ -2792,7 +3120,11 @@ class ImageEditorWidget(QWidget):
         btn_sel = self._menu_btn("选择")
         menu_sel = QMenu(btn_sel)
         menu_sel.setStyleSheet(self._menu_style())
-        self._add_menu_action(menu_sel, "全选", self._select_all_layers, "Ctrl+A")
+        self._add_menu_action(menu_sel, "全选画布", self.select_canvas, "Ctrl+A")
+        self._add_menu_action(menu_sel, '选择主体（AI）', self.select_subject)
+        self._add_menu_action(menu_sel, "全选图层", self._select_all_layers)
+        self._add_menu_action(menu_sel, "扩展选区…", lambda: self.modify_selection(True))
+        self._add_menu_action(menu_sel, "收缩选区…", lambda: self.modify_selection(False))
         self._add_menu_action(menu_sel, "取消选区", self._clear_selection, "Ctrl+D")
         self._add_menu_action(menu_sel, "反选", self._invert_selection, "Ctrl+⇧+I")
         menu_sel.addSeparator()
@@ -2807,11 +3139,17 @@ class ImageEditorWidget(QWidget):
         btn_export = self._menu_btn("导出")
         menu_export = QMenu(btn_export)
         menu_export.setStyleSheet(self._menu_style())
+        self._add_menu_action(menu_export, '导出 Compositor 工程…', self.export_comp)
+        self._add_menu_action(menu_export, '导出动画 GIF…', self.export_gif)
+        self._add_menu_action(menu_export, '导出 PDF…', self.export_pdf)
+        self._add_menu_action(menu_export, '通道打包 PNG…', self.export_channel_pack)
+        self._add_menu_action(menu_layer, '拆分 RGBA 通道', self.split_channels)
         self._add_menu_action(menu_export, "导出 PNG...", self.export_png, "")
         self._add_menu_action(menu_export, "导出为…（JPG/WebP/质量）", self.export_as, "Ctrl+Shift+E")
         menu_export.addSeparator()
         self._add_menu_action(menu_export, "导出全部画板...", self.export_all_artboards, "")
         self._add_menu_action(menu_export, "批量导出多尺寸…", self.export_batch_multisize, "")
+        self._add_menu_action(menu_export, "模板批处理…", self.open_template_batch)
         btn_export.setMenu(menu_export)
         l.addWidget(btn_export)
 
@@ -2819,6 +3157,15 @@ class ImageEditorWidget(QWidget):
         btn_view = self._menu_btn("视图")
         menu_view = QMenu(btn_view)
         menu_view.setStyleSheet(self._menu_style())
+        navigator_action = menu_view.addAction("显示导航缩略图（300% 起）")
+        navigator_action.setCheckable(True)
+        navigator_action.setChecked(True)
+        navigator_action.toggled.connect(lambda enabled: self._set_navigator_enabled(enabled))
+        pixel_grid_action = self._add_menu_action(menu_view,'高倍缩放显示像素网格',self.toggle_pixel_grid)
+        pixel_grid_action.setCheckable(True)
+        pixel_grid_action.setChecked(self.show_pixel_grid)
+        self._add_menu_action(menu_view, "网格间距…", self.configure_grid)
+        self._add_menu_action(menu_view, "专注画布 / 恢复面板", self.toggle_focus_canvas)
         a_ruler = QAction("显示标尺", menu_view)
         a_ruler.setCheckable(True); a_ruler.setChecked(self.show_rulers)
         a_ruler.triggered.connect(lambda: self._toggle_rulers(a_ruler))
@@ -2852,25 +3199,15 @@ class ImageEditorWidget(QWidget):
         l.addSpacing(4)
 
         # 画板按钮
-        b_art = QPushButton("▦ 画板")
-        b_art.setStyleSheet(self._mini_btn2())
-        b_art.setToolTip("添加画板")
+        b_art = workbench_button("画板", "layout-grid", "添加画板", accent=IMAGE_ACCENT)
         b_art.clicked.connect(self._open_artboard_dialog)
         l.addWidget(b_art)
 
         l.addSpacing(4)
 
         # AI 抠图 —— 顶栏显眼按钮
-        ai_btn = QPushButton("🤖 AI")
-        ai_btn.setStyleSheet(
-            "QPushButton{"
-            "background:#3d8ef8;color:#fff;font-weight:bold;"
-            "border-radius:3px;padding:2px 10px;"
-            "}"
-            "QPushButton:hover{background:#5aa0ff;}"
-            "QPushButton:pressed{background:#2d7ed8;}"
-        )
-        ai_btn.setToolTip("AI 能力：抠图(BiRefNet/u2net) / 高清放大(Real-ESRGAN) / 人脸修复(CodeFormer)")
+        ai_btn = workbench_button("AI", "sparkles", "抠图 / 高清放大 / 人脸修复",
+                                  accent=IMAGE_ACCENT, primary=True)
         ai_menu = QMenu(ai_btn)
         ai_menu.setStyleSheet(self._menu_style())
         self._add_menu_action(ai_menu, "🤖 AI 抠图（移除背景）", self._ai_remove_bg)
@@ -2900,40 +3237,36 @@ class ImageEditorWidget(QWidget):
         l.addWidget(ai_btn)
 
         # 通用 AI 前后对比按钮
-        self._compare_btn = QPushButton("◑ 前后对比")
-        self._compare_btn.setStyleSheet(self._mini_btn())
-        self._compare_btn.setToolTip("完成 AI 修改后，点击切换查看「处理前 ↔ 当前结果」")
+        self._compare_btn = workbench_button("前后对比", "contrast",
+            "完成 AI 修改后，点击切换查看处理前和当前结果", accent=IMAGE_ACCENT)
         self._compare_btn.setCheckable(True)
         self._compare_btn.setEnabled(False)
         self._compare_btn.toggled.connect(self._on_compare_toggle)
         l.addWidget(self._compare_btn)
 
         l.addStretch()
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setStyleSheet("color:#aaa;font-size:12px;padding:0 6px;")
-        l.addWidget(self.zoom_label)
-        self.b_zoom_out = QPushButton("−"); self.b_zoom_out.setToolTip("缩小 Ctrl+-")
-        self.b_zoom_out.setFixedSize(26, 26); self.b_zoom_out.setStyleSheet(self._mini_btn())
-        self.b_zoom_out.clicked.connect(lambda: self.view.zoom_by(1/1.2))
-        self.b_zoom_in = QPushButton("+"); self.b_zoom_in.setToolTip("放大 Ctrl+=")
-        self.b_zoom_in.setFixedSize(26, 26); self.b_zoom_in.setStyleSheet(self._mini_btn())
-        self.b_zoom_in.clicked.connect(lambda: self.view.zoom_by(1.2))
-        self.b_fit = QPushButton("⊡"); self.b_fit.setToolTip("适应画布 Ctrl+0")
-        self.b_fit.setFixedSize(26, 26); self.b_fit.setStyleSheet(self._mini_btn())
-        self.b_fit.clicked.connect(self.view.fit_view)
-        l.addWidget(self.b_zoom_out); l.addWidget(self.b_zoom_in); l.addWidget(self.b_fit)
+        self._zoom_controls = ZoomControls(self.view)
+        self.zoom_label = self._zoom_controls.level
+        self.b_zoom_out, self.b_zoom_in, self.b_fit = (self._zoom_controls.out_button,
+            self._zoom_controls.in_button, self._zoom_controls.fit_button)
+        l.addWidget(self._zoom_controls)
         return bar
 
     def _build_option_bar(self):
         """工具选项条（随工具变化，参考 PS 选项栏）"""
         opt_bar = QWidget()
+        opt_bar.setObjectName("imageToolOptions")
         opt_bar.setFixedHeight(40)
-        opt_bar.setStyleSheet("background:#1e1e22;border-bottom:1px solid #2c2c2c;")
+        opt_bar.setStyleSheet("QWidget#imageToolOptions{background:#1c1e23;border-bottom:1px solid #30323b;}"
+                              + workbench_field_style(IMAGE_ACCENT))
         ol = QHBoxLayout(opt_bar)
         ol.setContentsMargins(10, 2, 10, 2); ol.setSpacing(6)
 
+        self._opt_tool_label = QLabel()
+        self._opt_tool_label.setStyleSheet(f"color:{IMAGE_ACCENT};font-size:12px;font-weight:600;padding-right:4px;")
+        ol.addWidget(self._opt_tool_label)
         self._opt_hint = QLabel("选择左侧工具以查看对应参数")
-        self._opt_hint.setStyleSheet("color:#888;font-size:12px;")
+        self._opt_hint.setStyleSheet("color:#a8abb8;font-size:12px;")
 
         # 笔刷
         self._ob_brush_lbl = QLabel("笔刷大小")
@@ -2941,7 +3274,7 @@ class ImageEditorWidget(QWidget):
                                       self._on_brush_size_slider)
         # 容差（魔棒）
         self._ob_tol_lbl = QLabel("容差")
-        self._ob_tol = self._slider(1, 150, self.tolerance,
+        self._ob_tol = self._slider(0, 255, self.tolerance,
                                     lambda v: setattr(self, "tolerance", v))
         # 羽化（选区）
         self._ob_feather_lbl = QLabel("羽化")
@@ -2984,22 +3317,87 @@ class ImageEditorWidget(QWidget):
         self._sh_grad_to_btn.clicked.connect(self._choose_shape_grad_to)
 
         def _mini_chk(c):
-            c.setStyleSheet("QCheckBox{color:#ccc;font-size:12px;spacing:3px;}"
-                            "QCheckBox::indicator{width:13px;height:13px;}"
-                            "QCheckBox::indicator:checked{background:#3d8ef8;border-radius:2px;}"
-                            "QCheckBox::indicator:unchecked{background:#333;border:1px solid #555;border-radius:2px;}")
+            c.setStyleSheet("QCheckBox{color:#ccc;font-size:12px;spacing:3px;}")
             return c
 
         for c in (self._sh_fill_chk, self._sh_stroke_chk, self._sh_grad_chk):
             _mini_chk(c)
 
         # 加入布局（可见性由 _update_option_bar 控制）
+        self._selection_controls = self.build_selection_mode_controls()
+        ol.addWidget(self._selection_controls)
+        self._wand_controls = QWidget()
+        wand_layout = QHBoxLayout(self._wand_controls)
+        wand_layout.setContentsMargins(0, 0, 0, 0)
+        for label, key in (('连续', 'wand_contiguous'), ('所有图层', 'wand_sample_all')):
+            check = QCheckBox(label)
+            check.setChecked(getattr(self, key))
+            check.toggled.connect(lambda checked, name=key: setattr(self, name, checked))
+            check.setToolTip('只选相连区域；关闭后选择整张图中相似的颜色' if key == 'wand_contiguous'
+                             else '按所有可见图层的合成颜色取样；关闭后只取样当前图片图层')
+            wand_layout.addWidget(check)
+        ol.addWidget(self._wand_controls)
         ol.addWidget(self._opt_hint)
         ol.addWidget(self._ob_brush_lbl); ol.addWidget(self._ob_brush)
         ol.addWidget(self._ob_tol_lbl); ol.addWidget(self._ob_tol)
         ol.addWidget(self._ob_feather_lbl); ol.addWidget(self._ob_feather)
         ol.addWidget(self._ob_blur_lbl); ol.addWidget(self._ob_blur)
         ol.addWidget(self.fg_btn)
+        self._brush_details = QWidget()
+        details = QHBoxLayout(self._brush_details)
+        details.setContentsMargins(0, 0, 0, 0)
+        for label, key in (("不透明度", "brush_opacity"), ("硬度", "brush_hardness"), ('平滑', 'brush_smoothing')):
+            details.addWidget(QLabel(label))
+            spin = QSpinBox()
+            spin.setRange(0, 100)
+            spin.setSuffix("%")
+            spin.setValue(getattr(self, key))
+            spin.valueChanged.connect(lambda value, k=key: setattr(self, k, value))
+            details.addWidget(spin)
+        ol.addWidget(self._brush_details)
+        for label, key in (('压感大小', 'pressure_size'), ('压感透明度', 'pressure_opacity')):
+            check = QCheckBox(label)
+            check.setChecked(getattr(self,key))
+            check.toggled.connect(lambda checked, name=key:setattr(self,name,checked))
+            details.addWidget(check)
+        self._clone_details = QWidget()
+        clone_layout = QHBoxLayout(self._clone_details)
+        clone_layout.setContentsMargins(0,0,0,0)
+        for label, key in (('对齐源点', 'clone_aligned'), ('取样所有可见图层', 'clone_sample_all')):
+            check = QCheckBox(label)
+            check.setChecked(getattr(self,key))
+            check.toggled.connect(lambda checked, name=key:setattr(self,name,checked))
+            clone_layout.addWidget(check)
+        ol.addWidget(self._clone_details)
+        self._line_controls = QWidget()
+        line_layout = QHBoxLayout(self._line_controls)
+        line_layout.setContentsMargins(0,0,0,0)
+        for attribute,choices in (('line_style',[('实线',1),('虚线',2),('点线',3)]),('line_cap',[('方形端点',16),('圆形端点',32)])):
+            combo = QComboBox()
+            for label,value in choices:
+                combo.addItem(label,value)
+            combo.currentIndexChanged.connect(lambda _,name=attribute,widget=combo:self.set_line_option(name,widget.currentData()))
+            line_layout.addWidget(combo)
+        ol.addWidget(self._line_controls)
+        self._crop_controls = QWidget()
+        crop_layout = QHBoxLayout(self._crop_controls)
+        crop_layout.setContentsMargins(0, 0, 0, 0)
+        self._crop_ratio = QComboBox()
+        for label, ratio in (("自由比例", None), ("1:1", 1.), ("3:4", 3/4), ("4:3", 4/3),
+                             ("9:16", 9/16), ("16:9", 16/9), ("2:3", 2/3), ("3:2", 3/2)):
+            self._crop_ratio.addItem(label, ratio)
+        self._crop_ratio.setToolTip("裁剪比例；按住 Alt 从中心对称裁剪")
+        self._crop_ratio.currentIndexChanged.connect(self.cancel_crop)
+        crop_layout.addWidget(self._crop_ratio)
+        self._crop_output = QComboBox()
+        self._crop_output.addItems(["当前文档 · 保留图层", "复制合成到新文档"])
+        crop_layout.addWidget(self._crop_output)
+        for label, callback in (("从选区", self.crop_from_selection), ("应用 ↵", self.apply_crop),
+                                ("取消 Esc", self.cancel_crop)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            crop_layout.addWidget(button)
+        ol.addWidget(self._crop_controls)
         # 形状组
         ol.addWidget(self._sep_v())
         ol.addWidget(self._sh_fill_chk); ol.addWidget(self._sh_fill_btn)
@@ -3011,70 +3409,103 @@ class ImageEditorWidget(QWidget):
         return opt_bar
 
     def _build_left_toolbar(self):
-        """左侧垂直工具栏"""
+        """Grouped tool rows with aligned icons, labels and shortcut badges."""
         tb = QFrame()
-        tb.setFixedWidth(44)
-        tb.setStyleSheet("background:#1e1e22;border-right:1px solid #2c2c2c;")
+        tb.setMinimumWidth(0)
+        tb.setStyleSheet('background:#1d1d20;border:0;')
         lay = QVBoxLayout(tb)
-        lay.setContentsMargins(4, 8, 4, 8); lay.setSpacing(6)
-
+        lay.setContentsMargins(8, 6, 8, 8); lay.setSpacing(2)
         self._tool_buttons = {}
-        tools = [
-            ("✋", Tool.MOVE, "移动 V"), ("▭", Tool.SELECT_RECT, "选框 M"),
-            ("◯", Tool.SELECT_ELLIPSE, "椭圆 ⇧M"), ("✎", Tool.SELECT_LASSO, "套索 L"),
-            ("⬠", Tool.POLY_LASSO, "多边形套索 P"), ("✸", Tool.WAND, "魔棒 W"),
-            ("🖌", Tool.QUICK_SELECT, "快速选择 A（拖拽扩选，Alt 减选）"), None,
-            ("🖌", Tool.BRUSH, "笔刷 B"), ("🧹", Tool.ERASER, "橡皮 E"),
-            ("T", Tool.TEXT, "文字 T"), ("▯", Tool.SHAPE_RECT, "矩形 R"),
-            ("○", Tool.SHAPE_ELLIPSE, "椭圆 O"),             ("💉", Tool.EYEDROPPER, "吸管 I"),
-            None,
-            ("✂", Tool.CROP, "裁剪 C"),
-            ("🌈", Tool.GRADIENT, "渐变 G"),
-            ("🩹", Tool.HEAL, "修复画笔 J（Alt 取源）"),
-            ("📋", Tool.CLONE, "克隆图章 S（Alt 取源）"),
+        headings = []
+        sections = [
+            ('选择', [
+                (Tool.MOVE, '移动', 'move', 'V', '拖动移动图层；空白处框选，Shift / Ctrl 点击多选'),
+                (Tool.SELECT_RECT, '矩形选框', 'select_rect', 'M', '拖动建立矩形选区'),
+                (Tool.SELECT_ELLIPSE, '椭圆选框', 'select_ellipse', 'Shift+M', '拖动建立椭圆选区'),
+                (Tool.SELECT_LASSO, '自由套索', 'lasso', 'L', '沿目标边缘拖动，自由建立选区'),
+                (Tool.POLY_LASSO, '多边形套索', 'polygon', 'P', '逐点点击，双击或 Enter 闭合'),
+                (Tool.WAND, '魔棒', 'wand', 'W', '点击选择相近颜色，顶部可设置选区组合方式'),
+                (Tool.OBJECT_SELECT, '对象选择', 'object', 'Q', '点击目标，识别并选择对象'),
+                (Tool.QUICK_SELECT, '快速选择', 'quick_select', 'A', '涂抹扩选；Shift 添加，Alt 减去'),
+            ]),
+            ('绘制', [
+                (Tool.BRUSH, '画笔', 'brush', 'B', '使用前景色绘制；方括号调整大小'),
+                (Tool.ERASER, '橡皮擦', 'eraser', 'E', '涂抹擦除像素'),
+                (Tool.TEXT, '文字', 'text', 'T', '双击编辑；拖动移动或调整文字框'),
+                (Tool.SHAPE_RECT, '矩形', 'rectangle', 'R', '拖动绘制矩形形状'),
+                (Tool.SHAPE_ELLIPSE, '椭圆', 'ellipse', 'O', '拖动绘制椭圆形状'),
+                (Tool.SHAPE_LINE, '直线', 'line', 'U', '拖动绘制直线，可调整描边和端点'),
+                (Tool.GRADIENT, '渐变', 'gradient', 'G', '拖动绘制渐变，Shift 使用径向渐变'),
+            ]),
+            ('修饰', [
+                (Tool.EYEDROPPER, '吸管', 'eyedropper', 'I', '从画布拾取前景色和填充色'),
+                (Tool.CROP, '裁剪', 'crop', 'C', '拖动裁剪区域，Enter 应用，Esc 取消'),
+                (Tool.HEAL, '修复画笔', 'heal', 'J', 'Alt 点击取源，再涂抹修复'),
+                (Tool.CLONE, '克隆图章', 'clone', 'S', 'Alt 点击取源，再涂抹复制'),
+            ]),
         ]
-        for item in tools:
-            if item is None:
-                sep = QFrame(); sep.setFixedHeight(1)
-                sep.setStyleSheet("background:#2c2c2c;border:none;")
-                lay.addWidget(sep)
-                continue
-            icon, tt, tip = item
-            b = QPushButton(icon)
-            b.setCheckable(True)
-            b.setToolTip(tip)
-            b.setFixedSize(34, 30)
-            b.setStyleSheet(
-                "QPushButton{font-size:14px;border:1px solid transparent;"
-                "border-radius:4px;background:transparent;color:#aaa;padding:0;}"
-                "QPushButton:hover{background:#3a3a3d;color:#fff;}"
-                "QPushButton:checked{background:#3d8ef8;color:#fff;border-color:#3d8ef8;}")
-            b.clicked.connect(lambda _c, t=tt: self.set_tool(t))
-            self._tool_buttons[tt] = b
-            lay.addWidget(b)
-        # 填充色块：吸管实时更新；点击可选色，决定新形状的填充颜色
-        lay.addSpacing(10)
-        sep_swatch = QFrame(); sep_swatch.setFixedHeight(1)
-        sep_swatch.setStyleSheet("background:#2c2c2c;border:none;")
-        lay.addWidget(sep_swatch)
-        lay.addSpacing(4)
-        self._swatch_btn = QPushButton()
-        self._swatch_btn.setFixedSize(30, 30)
-        self._swatch_btn.setToolTip("填充色：吸管吸取实时更新，点击可改（决定新形状填充色）")
-        self._swatch_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        ImageEditorWidget._update_color_btn(self._swatch_btn, self.shape_fill_color)
-        self._swatch_btn.clicked.connect(self._choose_shape_fill_color)
-        lay.addWidget(self._swatch_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        for index, (title, tools) in enumerate(sections):
+            if index:
+                lay.addSpacing(5)
+            heading = QWidget(); heading.setFixedHeight(20)
+            row = QHBoxLayout(heading); row.setContentsMargins(4, 0, 4, 0); row.setSpacing(8)
+            label = QLabel(title)
+            label.setStyleSheet('color:#77777f;background:transparent;font-size:10px;font-weight:600;')
+            row.addWidget(label)
+            line = QFrame(); line.setFixedHeight(1); line.setStyleSheet('background:#303034;border:0;')
+            row.addWidget(line, 1); lay.addWidget(heading)
+            headings.append((heading, label))
+            for tool, label, icon, shortcut, help_text in tools:
+                button = EditorToolButton(label, icon, shortcut, help_text)
+                button.clicked.connect(lambda checked=False, value=tool: self.set_tool(value))
+                self._tool_buttons[tool] = button
+                lay.addWidget(button)
+        # Keep colors visible while the tool list scrolls on shorter windows.
+        self._color_card = EditorColorCard(self)
+        self._swatch_btn = self._color_card.fill
         lay.addStretch()
-        return tb
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setWidget(tb)
+        scroll.setStyleSheet('QScrollArea{background:#1d1d20;border:0;}'
+            'QScrollBar:vertical{background:transparent;width:4px;margin:2px 0;}'
+            'QScrollBar::handle:vertical{background:#444449;min-height:28px;border-radius:2px;}'
+            'QScrollBar::handle:vertical:hover{background:#626269;}'
+            'QScrollBar::add-line:vertical,QScrollBar::sub-line:vertical{height:0;}'
+            'QScrollBar::add-page:vertical,QScrollBar::sub-page:vertical{background:transparent;}')
+        self._tool_rail = AdaptiveToolRail(scroll, tb, self._tool_buttons.values(), headings, self._color_card)
+        return self._tool_rail
 
     def _build_right_panel(self):
         """右侧属性面板（仅保留属性，无操作按钮）"""
         right_panel = QFrame()
-        right_panel.setFixedWidth(260)
-        right_panel.setStyleSheet("background:#1b1b1e;border-left:1px solid #2c2c2c;")
+        right_panel.setObjectName("imageProperties")
+        right_panel.setMinimumWidth(250)
+        right_panel.setStyleSheet(
+            "QFrame#imageProperties{background:#1c1e23;border-left:1px solid #30323b;}"
+            + workbench_field_style(IMAGE_ACCENT) + workbench_tabs_style(IMAGE_ACCENT))
         rl = QVBoxLayout(right_panel)
-        rl.setContentsMargins(10, 8, 10, 8); rl.setSpacing(4)
+        rl.setContentsMargins(10, 8, 10, 8); rl.setSpacing(6)
+        header = QHBoxLayout()
+        header.setSpacing(7)
+        header_icon = QLabel()
+        header_icon.setPixmap(workbench_icon("sliders-horizontal", IMAGE_ACCENT).pixmap(16, 16))
+        header.addWidget(header_icon)
+        header_label = QLabel("属性")
+        header_label.setStyleSheet("color:#ecedf3;font-size:13px;font-weight:600;")
+        header.addWidget(header_label, 1)
+        rl.addLayout(header)
+        self._active_context = QLabel("未选择图层")
+        self._active_context.setWordWrap(True)
+        self._active_context.setStyleSheet(f"color:{IMAGE_ACCENT};background:#312942;"
+                                           "padding:7px;border-radius:7px;")
+        rl.addWidget(self._active_context)
+        self._mask_exit = workbench_button("退出蒙版编辑", "x", accent=IMAGE_ACCENT)
+        self._mask_exit.clicked.connect(self._exit_mask_edit)
+        self._mask_exit.hide()
+        rl.addWidget(self._mask_exit)
 
         # AI 抠图状态（仍被 _ai_remove_bg 使用）
         self.ai_status = QLabel("")
@@ -3089,16 +3520,16 @@ class ImageEditorWidget(QWidget):
         self.cw = QSpinBox(); self.cw.setRange(1, 8000); self.cw.setValue(1080)
         self.ch = QSpinBox(); self.ch.setRange(1, 8000); self.ch.setValue(1080)
         self.cw.setFixedHeight(26); self.ch.setFixedHeight(26)
-        cs.addRow("宽 W", self.cw)
-        cs.addRow("高 H", self.ch)
+        cs.addRow(ScrubbableLabel('宽 W',self.cw),self.cw)
+        cs.addRow(ScrubbableLabel('高 H',self.ch),self.ch)
         self.cs = cs
         rl.addLayout(cs)
-        self.b_resize = QPushButton("应用尺寸"); self.b_resize.clicked.connect(self._apply_canvas_size)
-        self.b_resize.setStyleSheet(self._mini_btn2())
+        self.b_resize = workbench_button("应用尺寸", None, accent=IMAGE_ACCENT)
+        self.b_resize.clicked.connect(self._apply_canvas_size)
         rl.addWidget(self.b_resize)
         bgrow = QHBoxLayout()
-        self.bg_color_btn = QPushButton("背景色"); self.bg_color_btn.clicked.connect(self._choose_bg_color)
-        self.bg_color_btn.setStyleSheet(self._mini_btn2())
+        self.bg_color_btn = workbench_button("背景色", "palette", accent=IMAGE_ACCENT)
+        self.bg_color_btn.clicked.connect(self._choose_bg_color)
         bgrow.addWidget(self.bg_color_btn)
         self.trans_chk = QCheckBox("透明"); self.trans_chk.setChecked(True); self.trans_chk.toggled.connect(self._set_transparent)
         bgrow.addWidget(self.trans_chk); bgrow.addStretch()
@@ -3114,40 +3545,50 @@ class ImageEditorWidget(QWidget):
                                     "变亮", "滤色", "颜色减淡", "线性减淡",
                                     "叠加", "柔光", "强光", "亮光", "线性光",
                                     "差值", "排除", "色相", "饱和度", "颜色", "明度"])
-        self.blend_combo.setStyleSheet("QComboBox{background:#2a2a2e;color:#ccc;border:1px solid #3a3a3e;border-radius:3px;padding:2px 4px;font-size:11px;} QComboBox::drop-down{border:none;} QComboBox QAbstractItemView{background:#252528;color:#ccc;selection-background-color:#3d8ef8;}")
+        self.blend_combo.setAccessibleName("图层混合模式")
         self.blend_combo.currentTextChanged.connect(self._set_blend_mode)
         blend_row.addWidget(self.blend_combo)
         rl.addLayout(blend_row)
 
         # P4 对齐快捷按钮行（单选=对画布，多选=对选区包围盒）
+        self._align_reference = QComboBox()
+        self._align_reference.setAccessibleName("图层对齐参照")
+        for label,value in (('对齐参照：自动','auto'),('对齐参照：画布','canvas'),('对齐参照：图层','layers'),('对齐参照：像素选区','selection')):
+            self._align_reference.addItem(label,value)
+        rl.addWidget(self._align_reference)
         align_row = QHBoxLayout()
         align_row.setSpacing(2)
-        _align_btn_style = (
-            "QPushButton{font-size:12px;border:1px solid #333;border-radius:3px;"
-            "background:#2a2a2e;color:#aaa;padding:2px;}"
-            "QPushButton:hover{background:#3a3a3d;color:#fff;}")
-        for icon, mode, tip in (("⇤", "left", "左对齐"), ("⇹", "hcenter", "水平居中"),
-                                ("⇥", "right", "右对齐"), ("⤒", "top", "顶对齐"),
-                                ("⇕", "vcenter", "垂直居中"), ("⤓", "bottom", "底对齐")):
-            ab = QPushButton(icon)
-            ab.setFixedSize(28, 22)
-            ab.setToolTip(tip)
-            ab.setStyleSheet(_align_btn_style)
+        for icon, mode, tip in (
+            ("align-start-vertical", "left", "左对齐"), ("align-center-vertical", "hcenter", "水平居中"),
+            ("align-end-vertical", "right", "右对齐"), ("align-start-horizontal", "top", "顶对齐"),
+            ("align-center-horizontal", "vcenter", "垂直居中"), ("align-end-horizontal", "bottom", "底对齐"),
+        ):
+            ab = workbench_button("", icon, tip, accent=IMAGE_ACCENT)
+            ab.setFixedSize(28, 26)
             ab.clicked.connect(lambda _c, m=mode: self._align_layers(m))
             align_row.addWidget(ab)
         align_row.addStretch()
         rl.addLayout(align_row)
         rl.addWidget(QLabel("不透明度"))
         self.op_slider = QSlider(Qt.Orientation.Horizontal); self.op_slider.setRange(0, 100); self.op_slider.setValue(100)
+        self.op_slider.setAccessibleName("图层不透明度")
+        self.op_slider.setStyleSheet(workbench_slider_style(IMAGE_ACCENT))
         self.op_slider.sliderPressed.connect(self._begin_opacity_change)
         self.op_slider.sliderReleased.connect(self._end_opacity_change)
         self.op_slider.valueChanged.connect(self._set_active_opacity)
         rl.addWidget(self.op_slider)
 
         # 样式
+        self._text_property_panel = TextPropertyPanel(self)
+        rl.addWidget(self._text_property_panel)
+        self._adjust_property_panel = AdjustmentPropertyPanel(self)
+        rl.addWidget(self._adjust_property_panel)
         rl.addWidget(self._section("样式"))
         self.style_box = self._build_style_box()
         rl.addWidget(self.style_box)
+        effects_button = workbench_button("图层效果…", "sparkles", "描边 / 发光 / 叠色", accent=IMAGE_ACCENT)
+        effects_button.clicked.connect(lambda:edit_layer_effects(self))
+        rl.addWidget(effects_button)
 
         rl.addStretch()
         return right_panel
@@ -3161,6 +3602,9 @@ class ImageEditorWidget(QWidget):
 
         # 表头：图层 + 数量
         lhdr = QHBoxLayout()
+        layer_icon = QLabel()
+        layer_icon.setPixmap(workbench_icon("layers", "#a8abb8").pixmap(16, 16))
+        lhdr.addWidget(layer_icon)
         lhdr.addWidget(QLabel("图层"))
         lhdr.addStretch()
         self.layer_count = QLabel("0")
@@ -3175,6 +3619,8 @@ class ImageEditorWidget(QWidget):
         oprow.addWidget(op_lbl)
         self.layer_op_slider = QSlider(Qt.Orientation.Horizontal)
         self.layer_op_slider.setRange(0, 100); self.layer_op_slider.setValue(100)
+        self.layer_op_slider.setAccessibleName("图层不透明度")
+        self.layer_op_slider.setStyleSheet(workbench_slider_style(IMAGE_ACCENT))
         self.layer_op_slider.sliderPressed.connect(self._begin_opacity_change)
         self.layer_op_slider.sliderReleased.connect(self._end_opacity_change)
         self.layer_op_slider.valueChanged.connect(self._set_active_opacity)
@@ -3187,14 +3633,27 @@ class ImageEditorWidget(QWidget):
 
         # 选择工具条
         selbar = QHBoxLayout(); selbar.setSpacing(4)
-        b_all = QPushButton("全选"); b_all.setStyleSheet(self._mini_btn2())
+        b_all = workbench_button("全选", None, accent=IMAGE_ACCENT, quiet=True)
         b_all.clicked.connect(self._select_all_layers)
-        b_inv = QPushButton("反选"); b_inv.setStyleSheet(self._mini_btn2())
+        b_inv = workbench_button("反选", None, accent=IMAGE_ACCENT, quiet=True)
         b_inv.clicked.connect(self._invert_layer_selection)
-        b_clr = QPushButton("取消"); b_clr.setStyleSheet(self._mini_btn2())
+        b_clr = workbench_button("取消", None, accent=IMAGE_ACCENT, quiet=True)
         b_clr.clicked.connect(self._clear_layer_selection)
         selbar.addWidget(b_all); selbar.addWidget(b_inv); selbar.addWidget(b_clr)
         lp.addLayout(selbar)
+        filter_row = QHBoxLayout()
+        self._layer_search = QLineEdit()
+        self._layer_search.setPlaceholderText("搜索图层名称")
+        self._layer_search.setClearButtonEnabled(True)
+        self._layer_search.textChanged.connect(self._filter_layer_list)
+        filter_row.addWidget(self._layer_search, 1)
+        self._layer_kind = QComboBox()
+        for label, kind in (("全部", ""), ("图片", "image"), ("文字", "text"),
+                             ("形状", "shape"), ("调整", "adjust")):
+            self._layer_kind.addItem(label, kind)
+        self._layer_kind.currentIndexChanged.connect(self._filter_layer_list)
+        filter_row.addWidget(self._layer_kind)
+        lp.addLayout(filter_row)
 
         self.layer_list = LayerList(self)
         self.layer_list.setStyleSheet("QListWidget{background:#121215;border:1px solid #2a2a2d;border-radius:4px;}"
@@ -3279,6 +3738,7 @@ class ImageEditorWidget(QWidget):
 
     def _slider(self, lo, hi, val, cb):
         s = QSlider(Qt.Orientation.Horizontal); s.setRange(lo, hi); s.setValue(val); s.setFixedWidth(72)
+        s.setStyleSheet(workbench_slider_style(IMAGE_ACCENT))
         s.valueChanged.connect(cb)
         return s
 
@@ -3286,54 +3746,35 @@ class ImageEditorWidget(QWidget):
         return "QPushButton{font-size:14px;border:1px solid transparent;border-radius:4px;background:transparent;color:#aaa;}" \
                "QPushButton:hover{background:#3a3a3d;color:#fff;}"
 
-    def _mini_btn2(self):
-        return "QPushButton{border:1px solid #333;border-radius:3px;background:#252528;color:#ccc;padding:4px 6px;font-size:11px;}" \
-               "QPushButton:hover{background:#333;color:#fff;}"
-
     def _menu_style(self):
         """下拉菜单样式（深色主题）。"""
         return (
-            "QMenu{background:#252528;border:1px solid #444;padding:4px 0;}"
-            "QMenu::item{padding:6px 24px 6px 12px;color:#ccc;font-size:12px;}"
-            "QMenu::item:selected{background:#3d8ef8;color:#fff;}"
+            "QMenu{background:#252832;border:1px solid #494958;border-radius:7px;padding:4px;}"
+            "QMenu::item{padding:6px 24px 6px 12px;color:#ecedf3;font-size:12px;border-radius:4px;}"
+            "QMenu::item:selected{background:#423653;color:#f3eaff;}"
             "QMenu::separator{height:1px;background:#3a3a3d;margin:4px 12px;}"
         )
 
     def _menu_btn(self, text):
         """下拉菜单触发按钮（PS 风格）。"""
-        b = QPushButton(text)
-        b.setStyleSheet(
-            "QPushButton{border:1px solid transparent;border-radius:3px;"
-            "background:transparent;color:#ccc;padding:4px 8px;font-size:11px;}"
-            "QPushButton:hover{background:#3a3a3d;color:#fff;}"
-            "QPushButton:pressed{background:#3d8ef8;}"
-        )
-        return b
+        icons = {"文件": "folder-open", "编辑": "pencil", "图层": "layers", "图像": "image",
+                 "滤镜": "sliders-horizontal", "选择": "square-dashed", "导出": "upload",
+                 "视图": "eye", "窗口": "panel-top"}
+        return workbench_button(text, icons.get(text), accent=IMAGE_ACCENT, quiet=True)
 
-    @staticmethod
-    def _add_menu_action(menu, text, fn, shortcut=""):
-        """向下拉菜单添加一个动作项。"""
-        label = f"{text}\t{shortcut}" if shortcut else text
-        a = menu.addAction(label)
-        a.triggered.connect(fn)
-        return a
+    def _add_menu_action(self, menu, text, fn, shortcut=""):
+        return self.register_command(menu, text, fn, shortcut)
 
     @staticmethod
     def _color_btn(color, tooltip=""):
-        """创建 26x20 颜色块按钮，背景即颜色，无文字。"""
-        b = QPushButton("")
-        b.setFixedSize(26, 20)
-        b.setToolTip(tooltip)
-        _style = (
-            f"QPushButton{{background:{color.name()};border:1px solid #555;border-radius:2px;}}"
-            "QPushButton:hover{border-color:#aaa;}"
-        )
-        b.setStyleSheet(_style)
-        return b
+        return ColorSwatchButton(color, tooltip)
 
     @staticmethod
     def _update_color_btn(btn, color):
         """更新颜色块按钮的背景色。"""
+        if isinstance(btn, ColorSwatchButton):
+            btn.set_color(color)
+            return
         btn.setStyleSheet(
             f"QPushButton{{background:{color.name()};border:1px solid #555;border-radius:2px;}}"
             "QPushButton:hover{border-color:#aaa;}"
@@ -3350,6 +3791,15 @@ class ImageEditorWidget(QWidget):
                 host.tab.setTabText(idx, self.doc_name)
 
     def new_project(self, w=1080, h=1080):
+        if hasattr(self, '_recovery_id'):
+            self.autosave_recovery(force=True)
+            self._start_recovery_session()
+        self._clear_interaction_preview()
+        self._move_olds = None
+        self.view._handle_drag = None
+        self.view._layer_marquee = None
+        self.detach_comp()
+        self.stop_text_session()
         self._property_history_timer.stop()
         self._pending_property_history = None
         if hasattr(self, "_compare_before_image"):
@@ -3389,88 +3839,17 @@ class ImageEditorWidget(QWidget):
             self.set_doc_name(name)
 
     def add_image_dialog(self):
-        paths, _ = QFileDialog.getOpenFileNames(self, "导入图片", "",
-                                                "图片 (*.png *.jpg *.jpeg *.bmp *.webp)")
+        from core.image_import import ASSET_FILTER
+        paths, _ = QFileDialog.getOpenFileNames(self, "导入图片或文档", "", ASSET_FILTER)
         for p in paths:
             self.add_image_from_path(p)
-
-    def _drop_import_image(self, path):
-        """拖入图片：按图片尺寸自动调整画布大小，并作为第 1 个图层。"""
-        try:
-            from PIL import Image as PILImage
-            pim = PILImage.open(path)
-            iw, ih = pim.size
-            arr = np.array(pim.convert("RGBA"), dtype=np.uint8)
-        except Exception:
-            qimg = QImage(path)
-            if qimg.isNull():
-                if hasattr(self, "update_log"):
-                    self.update_log(f"无法读取图片: {os.path.basename(path)}")
-                return
-            qimg = qimg.convertToFormat(QImage.Format.Format_RGBA8888)
-            iw, ih = qimg.width(), qimg.height()
-            arr = numpy_from_qimage(qimg)
-        self._push_undo("拖入图片（自动匹配画布）")
-        self._set_canvas_size(iw, ih)
-        layer = ImageLayer(os.path.basename(path), pixels=arr,
-                          w=iw, h=ih, kind="image")
-        layer.scale = 1.0
-        layer.x = iw / 2.0
-        layer.y = ih / 2.0
-        self.project.add_layer(layer)
-        self._redraw()
-        if hasattr(self, "update_log"):
-            self.update_log(f"已拖入图片，画布自动设为 {iw}×{ih}")
-
-    def add_image_from_path(self, path):
-        img = QImage(path)
-        if img.isNull():
-            return
-        img = img.convertToFormat(QImage.Format.Format_RGBA8888)
-        arr = numpy_from_qimage(img)
-        iw, ih = arr.shape[1], arr.shape[0]
-        layer = ImageLayer(os.path.basename(path), pixels=arr,
-                          w=iw, h=ih, kind="image")
-        self._push_undo("导入图片")
-        ab = self.active_artboard
-        if self.project.artboards and ab is None:
-            ab = self.project.artboards[0]
-            self.active_artboard = ab
-        if ab is not None:
-            # 画板模式：缩放到适应画板（不改动画板尺寸，与 PS 一致）
-            sc = min(ab.w / iw, ab.h / ih, 1.0) * 0.9
-            layer.scale = sc
-            layer.x = ab.w / 2.0
-            layer.y = ab.h / 2.0
-            ab.layers.append(layer)
-        else:
-            # 传统单画布：仅在「画布完全为空（尚无任何图层）」时自动匹配图片尺寸；
-            # 其余情况（含复制/粘贴/再次导入）保持当前画布、把新图缩放居中，
-            # 避免破坏已有合成，也不会在每次复制后改动画布大小。
-            has_content = len(self.project.layers) > 0
-            if not has_content:
-                self._set_canvas_size(iw, ih)
-                layer.scale = 1.0
-                layer.x = iw / 2.0
-                layer.y = ih / 2.0
-            else:
-                cw, ch = self.project.w, self.project.h
-                sc = min(cw / iw, ch / ih, 1.0) * 0.9
-                layer.scale = sc
-                layer.x = cw / 2.0
-                layer.y = ch / 2.0
-            self.project.add_layer(layer)
-        self.set_active(layer)
-        self._refresh_layers()
-        self._redraw()
 
     _SELECTION_ORIGIN_MIME = "application/x-creativeenginepro-selection-origin"
 
     def copy_selection(self):
         """复制当前像素选区的真实 RGBA 内容，不包含棋盘格或选区外画面。"""
         if self.selection is None or not self.selection.any():
-            self.status_tool.setText("请先框选需要复制的区域")
-            return False
+            return self.copy_layers()
         if self.active_artboard is not None:
             image = self._render_artboard(self.active_artboard)
         else:
@@ -3494,6 +3873,8 @@ class ImageEditorWidget(QWidget):
 
     def paste_image(self):
         """从系统剪贴板粘贴图片（如截图 / 从文件复制的图片）。"""
+        if self.paste_layers():
+            return
         cb = QApplication.clipboard()
         img = cb.image()
         if img.isNull():
@@ -3559,13 +3940,13 @@ class ImageEditorWidget(QWidget):
     def _swap_colors(self):
         """交换前景色和背景色（PS: X 键）。"""
         self.fg, self.bg = self.bg, self.fg
-        self._update_color_btn(self.fg_btn, self.fg)
+        self._sync_color_ui()
 
     def _default_colors(self):
         """恢复默认前景/背景色（PS: D 键）—— 黑/白。"""
         self.fg = QColor(255, 255, 255)
         self.bg = QColor(0, 0, 0)
-        self._update_color_btn(self.fg_btn, self.fg)
+        self._sync_color_ui()
 
     def _adjust_brush_size(self, delta):
         """调整笔刷大小（PS: [ / ] 键）。"""
@@ -3591,9 +3972,15 @@ class ImageEditorWidget(QWidget):
         self.view.zoom_by(factor)
 
     def keyPressEvent(self, e):
+        if e.key() == Qt.Key.Key_Escape and self._finish_layer_marquee(cancel=True):
+            e.accept()
+            return
         # 文字编辑态：直接捕获键入，不进入快捷键分发（Esc/Enter 等由 _text_edit_key 处理）
         if self._text_editing:
             self._text_edit_key(e)
+            return
+        if self.suppress_remapped_key(e):
+            e.accept()
             return
         # Delete/Backspace 由 eventFilter 统一处理（含子控件焦点情况），避免重复删除
         ctrl = e.modifiers() & Qt.KeyboardModifier.ControlModifier
@@ -3615,6 +4002,12 @@ class ImageEditorWidget(QWidget):
                 return
 
         # ── 编辑快捷键 ──
+        if self.tool == Tool.CROP and e.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Escape):
+            if e.key() == Qt.Key.Key_Escape:
+                self.cancel_crop()
+            else:
+                self.apply_crop()
+            return
         if ctrl and e.key() == Qt.Key.Key_Z:
             if shift:
                 self.redo()
@@ -3624,15 +4017,21 @@ class ImageEditorWidget(QWidget):
         if ctrl and e.key() == Qt.Key.Key_Y:
             self.redo()
             return
+        if ctrl and alt and e.key() == Qt.Key.Key_F:
+            self.repeat_filter()
+            return
         if ctrl and e.key() == Qt.Key.Key_A:
-            self._select_all_layers()
+            self.select_canvas()
             return
         if ctrl and e.key() == Qt.Key.Key_C:
             fw = QApplication.focusWidget()
             if isinstance(fw, (QLineEdit, QPlainTextEdit, QSpinBox, QComboBox)):
                 super().keyPressEvent(e)
                 return
-            self.copy_selection()
+            if shift:
+                self.copy_merged()
+            else:
+                self.copy_selection()
             return
         if ctrl and e.key() == Qt.Key.Key_V:
             fw = QApplication.focusWidget()
@@ -3720,6 +4119,12 @@ class ImageEditorWidget(QWidget):
             return
 
         # ── PS 颜色快捷键 ──
+        if e.key() == Qt.Key.Key_F and not e.modifiers():
+            self.toggle_focus_canvas()
+            return
+        if e.key() == Qt.Key.Key_Escape and getattr(self, '_canvas_focused', False):
+            self.toggle_focus_canvas()
+            return
         if e.key() == Qt.Key.Key_D and not e.modifiers():
             self._default_colors()
             return
@@ -3762,13 +4167,9 @@ class ImageEditorWidget(QWidget):
             return
 
         # ── 工具快捷键（无修饰键，PS 风格）──
-        # PS: G = 油漆桶 → 有选区时直接填充前景色，无选区时提示先用魔棒
+        # G selects the gradient tool, matching the toolbar label.
         if e.key() == Qt.Key.Key_G and not e.modifiers():
-            if self.selection is not None and self.selection.any():
-                self.fill_selection()
-            else:
-                QMessageBox.information(self, "提示",
-                    "油漆桶需要先有选区。\n请用魔棒(W)点击创建选区，再按 G 填充。")
+            self.set_tool(Tool.GRADIENT)
             return
         key_map = {
             Qt.Key.Key_V: Tool.MOVE,
@@ -3784,6 +4185,8 @@ class ImageEditorWidget(QWidget):
             Qt.Key.Key_I: Tool.EYEDROPPER,
             Qt.Key.Key_C: Tool.CROP,
             Qt.Key.Key_A: Tool.QUICK_SELECT,      # PS 近似: A = 快速选择
+            Qt.Key.Key_J: Tool.HEAL,
+            Qt.Key.Key_S: Tool.CLONE,
         }
         t = key_map.get(e.key())
         if t is not None and not e.modifiers():
@@ -3804,6 +4207,16 @@ class ImageEditorWidget(QWidget):
         super().keyReleaseEvent(e)
 
     def eventFilter(self, obj, e):
+        if e.type() in (QEvent.Type.KeyPress, QEvent.Type.ShortcutOverride):
+            if isinstance(obj, QWidget) and obj is not self and not self.isAncestorOf(obj):
+                return False
+            if e.type() == QEvent.Type.ShortcutOverride:
+                focused = QApplication.focusWidget()
+                editing = isinstance(focused, (QLineEdit, QPlainTextEdit, QSpinBox, QComboBox))
+                native = e.key() in (Qt.Key.Key_C, Qt.Key.Key_V, Qt.Key.Key_X, Qt.Key.Key_A, Qt.Key.Key_Z, Qt.Key.Key_Y)
+                if self._text_editing or editing and (not e.modifiers() or e.text().isprintable() or native and e.modifiers() & Qt.KeyboardModifier.ControlModifier):
+                    e.accept()
+                    return True
         """全局捕获 Delete/Backspace：
         - 画布上有像素选区（魔棒/矩形/椭圆/套索）时，删除选区内的像素（仿 PS：Delete 清选区）；
         - 否则删除选中的图层；
@@ -3858,11 +4271,6 @@ class ImageEditorWidget(QWidget):
         self._sync_props()
 
     # ───── 画板上下文辅助 ─────
-    def _ctx_layers(self):
-        """当前可编辑的图层列表：画板模式下为激活画板的图层，否则整画布。"""
-        if self.active_artboard is not None:
-            return self.active_artboard.layers
-        return self.project.layers
 
     def _ctx_size(self):
         if self.active_artboard is not None:
@@ -3877,27 +4285,8 @@ class ImageEditorWidget(QWidget):
                            pt.y() - ty - self.active_artboard.y)
         return QPointF(pt.x(), pt.y())
 
-    def _all_layers(self):
-        """所有图层（跨画板 / 整画布），用于序列化与合并。"""
-        if self.project.artboards:
-            layers = []
-            for ab in self.project.artboards:
-                layers.extend(ab.layers)
-            return layers
-        return list(self.project.layers)
 
-    def _active_artboard_of(self, layer):
-        for ab in self.project.artboards:
-            if layer in ab.layers:
-                return ab
-        return None
 
-    def _parent_list_of(self, layer):
-        """返回承载该图层的列表（画板.layers 或 project.layers）。"""
-        ab = self._active_artboard_of(layer)
-        if ab is not None:
-            return ab.layers
-        return self.project.layers
 
     def _set_active_artboard(self, ab):
         if ab is not None and ab not in self.project.artboards:
@@ -3997,6 +4386,14 @@ class ImageEditorWidget(QWidget):
     def _select_layer_only(self, layer):
         """单选：清空其它，仅选中该层（active=主图层）。
         若该层属于编组，则联动选中同组所有层（PS 组行为：整组一起移动）。"""
+        if self._text_editing and layer is not self._text_edit_layer:
+            self._end_text_edit(save=True)
+        board = self._active_artboard_of(layer) if layer is not None else None
+        if board is not None and board is not self.active_artboard:
+            self.active_artboard = board
+            self.selection = self.sel_alpha = self._sel_base = None
+        if layer is not self.active:
+            self._mask_edit = False
         self.selected = [layer] if layer is not None else []
         self.active = layer
         self._anchor = layer
@@ -4009,20 +4406,8 @@ class ImageEditorWidget(QWidget):
         self._show_handles = (len(self.selected) == 1)
 
     # ═══════ P4 图层编组 ═══════
-    def _group_selected(self):
-        """Ctrl+G：把选中的 ≥2 个图层编为一组（同组联动选中/移动）。"""
-        sel = [l for l in self.selected if l is not None and l.kind != "adjust"]
-        if len(sel) < 2:
-            QMessageBox.information(self, "提示", "请按住 Ctrl 点选至少 2 个图层再编组。")
-            return
-        self._push_undo("图层编组")
-        self._group_counter = getattr(self, "_group_counter", 0) + 1
-        gid = self._group_counter
-        for l in sel:
-            l.group_id = gid
-        self._refresh_layers()
 
-    def _ungroup_selected(self):
+    def _ungroup_legacy(self):
         """Ctrl+Shift+G：解散选中图层所属的编组。"""
         gids = {getattr(l, "group_id", None) for l in self.selected} - {None}
         if not gids:
@@ -4124,62 +4509,7 @@ class ImageEditorWidget(QWidget):
         self._show_handles = (len(self.selected) == 1)
 
     # ═══════ P4 对齐 / 分布 ═══════
-    def _align_layers(self, mode):
-        """对齐选中图层。多选：相对选区包围盒；单选：相对画布/画板。
-        mode: left|hcenter|right|top|vcenter|bottom"""
-        sel = [l for l in self.selected
-               if l is not None and l.kind != "adjust" and not getattr(l, "locked", False)]
-        if not sel:
-            return
-        boxes = {id(l): self._layer_bbox(l) for l in sel}
-        if len(sel) == 1:
-            cw, ch = self._ctx_size()
-            ref = QRectF(0, 0, cw, ch)
-        else:
-            ref = QRectF(boxes[id(sel[0])])
-            for l in sel[1:]:
-                ref = ref.united(boxes[id(l)])
-        self._push_undo("对齐图层")
-        for l in sel:
-            b = boxes[id(l)]
-            if mode == "left":
-                l.x += ref.left() - b.left()
-            elif mode == "hcenter":
-                l.x += ref.center().x() - b.center().x()
-            elif mode == "right":
-                l.x += ref.right() - b.right()
-            elif mode == "top":
-                l.y += ref.top() - b.top()
-            elif mode == "vcenter":
-                l.y += ref.center().y() - b.center().y()
-            elif mode == "bottom":
-                l.y += ref.bottom() - b.bottom()
-        self._redraw()
-        self._sync_props()
 
-    def _distribute_layers(self, axis):
-        """均匀分布选中图层（需 ≥3 个）。axis: h|v"""
-        sel = [l for l in self.selected
-               if l is not None and l.kind != "adjust" and not getattr(l, "locked", False)]
-        if len(sel) < 3:
-            QMessageBox.information(self, "提示", "分布需要至少选中 3 个图层。")
-            return
-        key = (lambda l: self._layer_bbox(l).center().x()) if axis == "h" \
-            else (lambda l: self._layer_bbox(l).center().y())
-        sel.sort(key=key)
-        first, last = key(sel[0]), key(sel[-1])
-        if abs(last - first) < 1e-3:
-            return
-        self._push_undo("分布图层")
-        step = (last - first) / (len(sel) - 1)
-        for i, l in enumerate(sel[1:-1], start=1):
-            target = first + step * i
-            if axis == "h":
-                l.x += target - self._layer_bbox(l).center().x()
-            else:
-                l.y += target - self._layer_bbox(l).center().y()
-        self._redraw()
-        self._sync_props()
 
     def _clear_layer_selection(self):
         """取消所有图层选择。"""
@@ -4336,6 +4666,9 @@ class ImageEditorWidget(QWidget):
         return QCursor(pm, 6, 26)
 
     def set_tool(self, t):
+        self._finish_layer_marquee(cancel=True)
+        if self.tool == Tool.CROP and t != Tool.CROP:
+            self.cancel_crop()
         # 切换工具时先收尾正在编辑的文字（PS 行为：换工具即落定当前文字层；
         # 新建层若尚未输入则直接丢弃，不留空图层）
         if self._text_editing:
@@ -4356,6 +4689,8 @@ class ImageEditorWidget(QWidget):
                       Tool.SHAPE_ELLIPSE: "椭圆 O", Tool.EYEDROPPER: "吸管 I",
                       Tool.GRADIENT: "渐变 G", Tool.CROP: "裁剪 C"}
         self.status_tool.setText(tool_names.get(t, ""))
+        if t not in tool_names:
+            self.status_tool.setText(self._tool_buttons[t].toolTip())
         if t == Tool.MOVE:
             cursor = Qt.CursorShape.OpenHandCursor
         elif t in (Tool.BRUSH, Tool.ERASER):
@@ -4376,10 +4711,31 @@ class ImageEditorWidget(QWidget):
             self.view._brush_hover_pos = None
         self.view.viewport().update()
         self._update_option_bar()
+        if t == Tool.CROP:
+            self.crop_from_selection()
 
     def _update_option_bar(self):
         """选项条只显示当前工具相关的参数，避免一堆无关滑块堆在一起。"""
         t = self.tool
+        tool_button = self._tool_buttons[t]
+        self._opt_tool_label.setText(tool_button.label)
+        self._opt_tool_label.setToolTip(tool_button.toolTip())
+        self._brush_details.setVisible(t in (Tool.BRUSH, Tool.ERASER))
+        self._clone_details.setVisible(t in (Tool.CLONE, Tool.HEAL))
+        self._line_controls.setVisible(t==Tool.SHAPE_LINE)
+        self._crop_controls.setVisible(t == Tool.CROP)
+        self._selection_controls.setVisible(t in (Tool.SELECT_RECT, Tool.SELECT_ELLIPSE,
+            Tool.SELECT_LASSO, Tool.POLY_LASSO, Tool.WAND, Tool.QUICK_SELECT, Tool.OBJECT_SELECT))
+        self._wand_controls.setVisible(t == Tool.WAND)
+        hints = {
+            Tool.MOVE: "空白拖动框选 · Shift / Ctrl 点击多选 · Alt 拖动画板",
+            Tool.TEXT: "文字：双击编辑；拖动移动，拖方块调整编辑框",
+            Tool.CROP: "拖动预览 · Alt 中心裁剪",
+            Tool.EYEDROPPER: "吸管：点击画布取色",
+            Tool.POLY_LASSO: "多边形套索：逐点点击，双击结束",
+            Tool.QUICK_SELECT: "拖动选择；Shift 添加，Alt 减去，Shift+Alt 交叉",
+        }
+        self._opt_hint.setText(hints.get(t, "选择工具后，在画布上拖动操作"))
         for w in (self._opt_hint, self._ob_brush_lbl, self._ob_brush,
                   self._ob_tol_lbl, self._ob_tol,
                   self._ob_feather_lbl, self._ob_feather,
@@ -4389,16 +4745,16 @@ class ImageEditorWidget(QWidget):
                   self._sh_stroke_w, self._sh_stroke_btn,
                   self._sh_grad_chk, self._sh_grad_from_btn, self._sh_grad_to_btn):
             w.setVisible(False)
-        if t in (Tool.BRUSH, Tool.ERASER):
+        if t in (Tool.BRUSH, Tool.ERASER, Tool.CLONE, Tool.HEAL, Tool.QUICK_SELECT):
             self._ob_brush_lbl.setVisible(True); self._ob_brush.setVisible(True)
             if t == Tool.BRUSH:
                 self.fg_btn.setVisible(True)          # 橡皮擦成透明，不用前景色
-        elif t == Tool.WAND:
+        elif t in (Tool.WAND,Tool.OBJECT_SELECT):
             self._ob_tol_lbl.setVisible(True); self._ob_tol.setVisible(True)
-        elif t in (Tool.SELECT_RECT, Tool.SELECT_ELLIPSE, Tool.SELECT_LASSO):
+        elif t in (Tool.SELECT_RECT, Tool.SELECT_ELLIPSE, Tool.SELECT_LASSO, Tool.POLY_LASSO):
             self._ob_feather_lbl.setVisible(True); self._ob_feather.setVisible(True)
             self._ob_blur_lbl.setVisible(True); self._ob_blur.setVisible(True)  # 选区模糊半径
-        elif t in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE):
+        elif t in (Tool.SHAPE_RECT, Tool.SHAPE_ELLIPSE, Tool.SHAPE_LINE):
             # 形状工具不需要选区蚂蚁线 → 切过来就清掉旧选区
             if self.selection is not None:
                 self.selection = None
@@ -4422,41 +4778,7 @@ class ImageEditorWidget(QWidget):
         else:
             self._opt_hint.setVisible(True)
 
-    def _drop_layer_at(self, layer, target_row):
-        """拖拽排序落点：把 layer 移到列表第 target_row 个位置（0=最顶层）。
 
-        仅支持整画布模式（project.layers）。列表显示是 reversed(self.project.layers)，
-        故把 layer 从「列表顺序」移除后插入 target_row，再反转写回底层优先的 project.layers。
-        """
-        if self.project.artboards:
-            return
-        lst = self.project.layers
-        if layer not in lst:
-            return
-        order = list(reversed(lst))          # 列表顺序（顶层在前）
-        order.remove(layer)
-        target_row = max(0, min(int(target_row), len(order)))
-        order.insert(target_row, layer)
-        self._push_undo("调整图层顺序")
-        self.project.layers = list(reversed(order))
-        self._refresh_layers()
-        self._redraw()
-
-    def _find_next_after(self, removed):
-        """删除图层后找到下一个候选活跃层：优先选紧跟被删层下方的，否则最顶层。"""
-        layers = self._ctx_layers()
-        if not layers:
-            return None
-        # 找到被删层中位置最低的（离画布底部最近）
-        min_idx = len(layers)
-        for ly in removed:
-            if ly in layers:
-                min_idx = min(min_idx, layers.index(ly))
-        # 选紧挨在被删层下方的（小一号索引），否则最顶层
-        idx = min_idx - 1
-        if 0 <= idx < len(layers):
-            return layers[idx]
-        return layers[-1] if layers else None
 
     def _delete_selected(self):
         """删除当前选中的所有图层（一次撤销）。"""
@@ -4500,39 +4822,6 @@ class ImageEditorWidget(QWidget):
             self._refresh_layers()
             self._redraw()
 
-    def _duplicate_layer(self, layer):
-        self._push_undo("复制图层")
-        new = ImageLayer(layer.name + " 副本")
-        for attr in ("kind", "w", "h", "opacity", "visible", "blend",
-                     "x", "y", "scale", "rotation",
-                     "text", "font_family", "font_size", "bold", "italic",
-                     "color", "align", "stroke_w", "stroke_color",
-                     "shape", "fill_color", "filled", "radius", "gradient",
-                     "grad_from", "grad_to", "grad_angle", "clip", "shadow", "shadow_dx",
-                     "shadow_dy", "shadow_blur", "shadow_color", "shadow_opacity",
-                     "skew_x", "skew_y", "perspective_x", "perspective_y",
-                     "inner_shadow", "inner_shadow_dx", "inner_shadow_dy",
-                     "inner_shadow_blur", "inner_shadow_color", "inner_shadow_opacity",
-                     "outer_glow", "outer_glow_size", "outer_glow_color", "outer_glow_opacity",
-                     "bevel_emboss", "bevel_size", "bevel_highlight", "bevel_shadow", "bevel_depth",
-                     "locked", "group_id", "smart"):
-            if hasattr(layer, attr):
-                setattr(new, attr, getattr(layer, attr))
-        if layer.kind == "image" and layer.pixels is not None:
-            new.pixels = layer.pixels.copy()
-        if layer.mask is not None:
-            new.mask = layer.mask.copy()
-        if layer.rect:
-            new.rect = QRectF(layer.rect)
-        if getattr(layer, "adjust", None):
-            new.adjust = dict(layer.adjust)
-        if getattr(layer, "smart_source", None):
-            new.smart_source = list(layer.smart_source)
-        parent = self._parent_list_of(layer)
-        parent.append(new)
-        self.set_active(new)
-        self._refresh_layers()
-        self._redraw()
 
     def _select_layer_interactive(self, layer):
         """图层面板点击选中：单选 / Ctrl 多选 / Shift 连续选（仿 PS）。
@@ -4603,6 +4892,11 @@ class ImageEditorWidget(QWidget):
             return
         layer = w.layer
         del_action = menu.addAction("删除图层")
+        folder_menu = menu.addMenu('移入文件夹')
+        for folder in self._all_layers():
+            if folder.kind == 'group' and folder not in list(walk_layers([layer])):
+                folder_menu.addAction(folder.name, lambda _=False, destination=folder: self.move_layer_into(layer, destination))
+        menu.addAction('移出到画板顶层', lambda: self.move_layer_into(layer))
         dup_action = menu.addAction("复制图层")
         # 文字层：编辑文字
         edit_text_a = None
@@ -4614,12 +4908,13 @@ class ImageEditorWidget(QWidget):
         clip_action = menu.addAction(clip_label)
         # 图层蒙版
         mask_actions = []
-        if layer.kind == "image" and layer.pixels is not None:
+        if layer.kind in ("image", "adjust", "text", "shape", "group"):
             if layer.mask is None:
                 mask_actions.append(("添加图层蒙版", lambda: self._add_layer_mask(layer)))
             else:
                 mask_actions.append(("删除图层蒙版", lambda: self._remove_layer_mask(layer)))
-                mask_actions.append(("应用图层蒙版", lambda: self._apply_layer_mask(layer)))
+                if layer.kind == 'image':
+                    mask_actions.append(("应用图层蒙版", lambda: self._apply_layer_mask(layer)))
                 editing = getattr(self, "_mask_edit", False)
                 mask_actions.append(
                     ("退出蒙版编辑" if editing else "进入蒙版编辑（画笔涂抹）",
@@ -4633,7 +4928,7 @@ class ImageEditorWidget(QWidget):
             ai_action = menu.addAction("🤖 AI抠图")
         # 栅格化（文字/形状转为像素图层）
         rasterize_a = None
-        if layer.kind in ("text", "shape"):
+        if layer.kind in ("text", "shape", "group", "svg"):
             rasterize_a = menu.addAction("栅格化图层")
         # P4 智能对象
         smart_a = None
@@ -4651,7 +4946,7 @@ class ImageEditorWidget(QWidget):
         ungroup_a = None
         if len([ly for ly in self.selected if ly is not None]) >= 2:
             group_a = menu.addAction("🗂 图层编组 (Ctrl+G)")
-        if getattr(layer, "group_id", None) is not None:
+        if layer.kind == 'group' or getattr(layer, "group_id", None) is not None:
             ungroup_a = menu.addAction("取消编组 (Ctrl+Shift+G)")
         # 翻转
         menu.addSeparator()
@@ -4736,6 +5031,35 @@ class ImageEditorWidget(QWidget):
             crop = np.ascontiguousarray(arr[y0:y1 + 1, x0:x1 + 1])
         qimage_from_numpy(crop).save(path, "PNG")
 
+    def _export_layers_for_drag(self, anchor):
+        """Render selected layers to persistent images for other workbenches."""
+        from uuid import uuid4
+        from utils.app_paths import user_data_root
+
+        selected = self.selected if anchor in self.selected else [anchor]
+        layers = [layer for layer in self._ctx_layers()
+                  if layer in selected and layer.kind in
+                  {"image", "shape", "text", "svg", "group"}]
+        if not layers:
+            return []
+        folder = user_data_root() / "dragged_layers"
+        folder.mkdir(parents=True, exist_ok=True)
+        paths = []
+        try:
+            for layer in layers:
+                path = folder / f"layer_{uuid4().hex}.png"
+                self._export_layer_to_png(layer, str(path))
+                if not path.is_file():
+                    raise OSError(f"无法保存图层图片：{layer.name}")
+                paths.append(str(path))
+        except Exception:
+            import logging
+            for path in paths:
+                Path(path).unlink(missing_ok=True)
+            logging.exception("export selected layers for drag failed")
+            return []
+        return paths
+
     def _add_layer_to_media_library(self, layer):
         """将当前图层导出为带透明通道的 PNG，并联动添加到视频素材库。"""
         import time as _time
@@ -4774,51 +5098,6 @@ class ImageEditorWidget(QWidget):
         except Exception as error:
             QMessageBox.warning(self, "推送失败", str(error))
 
-    def _refresh_layers(self):
-        self.layer_list.clear()
-        if self.project.artboards:
-            # 画板模式：每个画板一个分组头 + 内嵌子图层（顶层画板在前）
-            for ab in reversed(self.project.artboards):
-                hitem = QListWidgetItem()
-                hw = ArtboardHeaderWidget(ab, self)
-                hitem.setSizeHint(hw.sizeHint())
-                self.layer_list.addItem(hitem)
-                self.layer_list.setItemWidget(hitem, hw)
-                hw.refresh()
-                if ab is self.active_artboard:
-                    hitem.setSelected(True)
-                if ab.collapsed:
-                    continue
-                for layer in reversed(ab.layers):
-                    item = QListWidgetItem()
-                    w = LayerItemWidget(layer, self)
-                    item.setSizeHint(w.sizeHint())
-                    item.setData(Qt.ItemDataRole.UserRole, layer)
-                    self.layer_list.addItem(item)
-                    self.layer_list.setItemWidget(item, w)
-                    w.refresh()
-                    if layer is self.active or layer in self.selected:
-                        item.setSelected(True)
-            self.layer_count.setText(str(len(self._all_layers())))
-            if self.active_artboard is not None:
-                self.status_size.setText(f"{self.active_artboard.w} × {self.active_artboard.h}")
-            else:
-                self.status_size.setText(f"{self.project.w} × {self.project.h}")
-        else:
-            # 顶层在上
-            for layer in reversed(self.project.layers):
-                item = QListWidgetItem()
-                w = LayerItemWidget(layer, self)
-                item.setSizeHint(w.sizeHint())
-                item.setData(Qt.ItemDataRole.UserRole, layer)
-                self.layer_list.addItem(item)
-                self.layer_list.setItemWidget(item, w)
-                w.refresh()  # 应用高亮样式
-                if layer is self.active or layer in self.selected:
-                    item.setSelected(True)  # 联动列表自带的选中高亮，确保有可见反馈
-            self.layer_count.setText(str(len(self.project.layers)))
-            self.status_size.setText(f"{self.project.w} × {self.project.h}")
-        self._sync_props()
 
     def _update_layer_highlights(self):
         """仅刷新图层面板选中高亮，不重建 widget。
@@ -4938,6 +5217,19 @@ class ImageEditorWidget(QWidget):
             self._redraw()
 
     def _sync_props(self):
+        self._sync_gif_controls()
+        self._text_property_panel.sync(self.active)
+        self._adjust_property_panel.sync(self.active)
+        if hasattr(self, "_active_context"):
+            layer = self.active
+            editing = bool(layer and layer.mask is not None and self._mask_edit)
+            self._active_context.setText(
+                ("正在编辑蒙版 · " if editing else "当前图层 · ") + layer.name
+                if layer else "未选择图层 · 点击画布或图层列表选择")
+            self._mask_exit.setVisible(editing)
+            self.blend_combo.setEnabled(layer is not None)
+            self.op_slider.setEnabled(layer is not None)
+            self.style_box.setEnabled(layer is not None)
         if self.active:
             v = int(self.active.opacity * 100)
             self.op_slider.blockSignals(True)
@@ -5058,10 +5350,15 @@ class ImageEditorWidget(QWidget):
         self._feather_selection(self.feather)
 
     def _on_feather_slider(self, v):
-        """羽化滑块实时改动：更新数值并在有选区时实时预览软边（选区为临时状态，不记历史）。"""
+        if self.selection is not None and v != self.feather:
+            self._queue_property_undo('羽化选区')
         self.feather = v
         if self.selection is not None:
-            self._feather_selection(v)
+            self._selection_history_depth = getattr(self, '_selection_history_depth', 0) + 1
+            try:
+                self._feather_selection(v)
+            finally:
+                self._selection_history_depth -= 1
 
     def _build_style_box(self):
         box = QWidget()
@@ -5246,7 +5543,7 @@ class ImageEditorWidget(QWidget):
             self._redraw()
 
     def _pick_style_color(self, target, btn):
-        c = QColorDialog.getColor(self._style_color_current(target), self)
+        c = choose_color(self._style_color_current(target), self, '图层样式颜色')
         if not c.isValid():
             return
         self._push_undo("更改图层样式颜色")
@@ -5324,7 +5621,7 @@ class ImageEditorWidget(QWidget):
 
     # ═══════ 渲染 ═══════
     def _layer_content(self, layer):
-        if layer.kind == "image":
+        if layer.kind in ("image", "svg"):
             return qimage_from_numpy(layer.pixels)
         if layer.kind == "text":
             return self._render_text(layer)
@@ -5355,36 +5652,7 @@ class ImageEditorWidget(QWidget):
         return QPixmap.fromImage(result)
 
     def _render_text(self, layer):
-        img = QImage(max(1, layer.w), max(1, layer.h), QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        f = QFont(layer.font_family, layer.font_size)
-        f.setBold(layer.bold)
-        f.setItalic(layer.italic)
-        p.setFont(f)
-        rect = QRectF(0, 0, layer.w, layer.h)
-        flags = layer.align | int(Qt.TextFlag.TextWordWrap)
-        if layer.stroke_w > 0:
-            p.setPen(QPen(QColor(layer.stroke_color if hasattr(layer, "stroke_color") else "#000000"),
-                      layer.stroke_w, Qt.PenStyle.SolidLine,
-                      Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            p.drawText(rect, flags, layer.text)
-        # 填充：渐变或纯色（填充描边之上的文本主体）
-        if getattr(layer, "gradient", False):
-            ang = math.radians(getattr(layer, "grad_angle", 0))
-            cx, cy = layer.w / 2.0, layer.h / 2.0
-            dx = math.cos(ang) * layer.w / 2.0
-            dy = math.sin(ang) * layer.h / 2.0
-            g = QLinearGradient(cx - dx, cy - dy, cx + dx, cy + dy)
-            g.setColorAt(0, QColor(layer.grad_from))
-            g.setColorAt(1, QColor(layer.grad_to))
-            p.setPen(QPen(QBrush(g), 1))
-        else:
-            p.setPen(QColor(layer.color))
-        p.drawText(rect, flags, layer.text)
-        p.end()
-        return img
+        return render_text(layer)
 
     def _render_shape(self, layer):
         img = QImage(max(1, layer.w), max(1, layer.h), QImage.Format.Format_ARGB32)
@@ -5407,7 +5675,14 @@ class ImageEditorWidget(QWidget):
         else:
             p.setBrush(Qt.BrushStyle.NoBrush)
         r = layer.rect
-        if layer.shape == "rect":
+        if layer.shape == 'line':
+            pen = QPen(QColor(layer.color if layer.stroke_on else layer.fill_color),max(1,layer.stroke_w or 3))
+            pen.setStyle(Qt.PenStyle(layer.line_style))
+            pen.setCapStyle(Qt.PenCapStyle(layer.line_cap))
+            p.setPen(pen)
+            p.drawLine(QPointF(r.x()+r.width()*layer.line_start[0],r.y()+r.height()*layer.line_start[1]),
+                       QPointF(r.x()+r.width()*layer.line_end[0],r.y()+r.height()*layer.line_end[1]))
+        elif layer.shape == "rect":
             if layer.radius > 0:
                 p.drawRoundedRect(r, layer.radius, layer.radius)
             else:
@@ -5444,54 +5719,6 @@ class ImageEditorWidget(QWidget):
                     lambda col: np.convolve(col, kernel, mode="same"), 0, out[:, :, c]))
         return out.astype(np.uint8)
 
-    def _render_composite(self, for_export=False):
-        if self.project.artboards:
-            return self._render_doc_composite(for_export=for_export)
-        cw, ch = self.project.w, self.project.h
-        out = QImage(cw, ch, QImage.Format.Format_ARGB32)
-        out.fill(Qt.GlobalColor.transparent)
-        p = QPainter(out)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if not self.project.transparent:
-            p.fillRect(0, 0, cw, ch, self.project.bg_color)
-        elif not for_export:
-            self._paint_checker(p, cw, ch)
-        layers = self.project.layers
-        # 预渲染每个可见层到画布尺寸缓冲
-        rendered = []
-        for layer in layers:
-            if not layer.visible or layer.kind == "adjust":
-                rendered.append(None)
-                continue
-            rendered.append(self._render_layer_canvas(layer))
-        # 自底向上合成，处理剪切蒙版 / 调整图层 / 混合模式
-        for i, layer in enumerate(layers):
-            # P4 调整图层：对下方累积结果应用色彩调整
-            if layer.kind == "adjust" and layer.visible:
-                p.end()
-                out = self._apply_adjustment(out, layer)
-                p = QPainter(out)
-                p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                continue
-            img = rendered[i]
-            if img is None:
-                continue
-            if layer.clip and i > 0:
-                # 找到正下方最近的非剪切可见层作为蒙版基底
-                base = None
-                for j in range(i - 1, -1, -1):
-                    if not layers[j].visible or layers[j].clip:
-                        continue
-                    base = rendered[j]
-                    break
-                if base is not None:
-                    arr = numpy_from_qimage(img)
-                    balpha = numpy_from_qimage(base)[:, :, 3].astype(np.int32)
-                    arr[:, :, 3] = (arr[:, :, 3].astype(np.int32) * balpha // 255).astype(np.uint8)
-                    img = qimage_from_numpy(arr)
-            out, p = self._draw_blended(out, p, img, layer)
-        p.end()
-        return out
 
     def _draw_blended(self, out, p, img, layer):
         """按图层混合模式把 img 画到 out 上；返回（可能被替换的）out 和 painter。"""
@@ -5550,46 +5777,6 @@ class ImageEditorWidget(QWidget):
         """添加/删除/拖动画板时调用，使缓存失效（下次 _doc_bounds() 重新计算）。"""
         self._cached_doc_bounds = None
 
-    def _render_artboard(self, ab):
-        """把单个画板内的图层合成到画板尺寸的缓冲（自动裁剪到画板范围）。"""
-        out = QImage(ab.w, ab.h, QImage.Format.Format_ARGB32)
-        out.fill(Qt.GlobalColor.transparent)
-        p = QPainter(out)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        if not ab.transparent:
-            p.fillRect(0, 0, ab.w, ab.h, ab.bg_color)
-        layers = ab.layers
-        rendered = []
-        for layer in layers:
-            if not layer.visible or layer.kind == "adjust":
-                rendered.append(None)
-                continue
-            rendered.append(self._render_layer_canvas(layer, ab.w, ab.h))
-        for i, layer in enumerate(layers):
-            if layer.kind == "adjust" and layer.visible:
-                p.end()
-                out = self._apply_adjustment(out, layer)
-                p = QPainter(out)
-                p.setRenderHint(QPainter.RenderHint.Antialiasing)
-                continue
-            img = rendered[i]
-            if img is None:
-                continue
-            if layer.clip and i > 0:
-                base = None
-                for j in range(i - 1, -1, -1):
-                    if not layers[j].visible or layers[j].clip:
-                        continue
-                    base = rendered[j]
-                    break
-                if base is not None:
-                    arr = numpy_from_qimage(img)
-                    balpha = numpy_from_qimage(base)[:, :, 3].astype(np.int32)
-                    arr[:, :, 3] = (arr[:, :, 3].astype(np.int32) * balpha // 255).astype(np.uint8)
-                    img = qimage_from_numpy(arr)
-            out, p = self._draw_blended(out, p, img, layer)
-        p.end()
-        return out
 
     def _render_doc_composite(self, for_export=False):
         dw, dh = self._doc_bounds()
@@ -5617,6 +5804,8 @@ class ImageEditorWidget(QWidget):
         return out
 
     def _render_layer_canvas(self, layer, cw=None, ch=None):
+        if layer.kind == 'group':
+            return self.render_folder(layer, cw, ch)
         """把单个层按自身变换/不透明度渲染到指定尺寸 QImage（默认整画布）。"""
         # 正在编辑的文字层：合成时留透明，避免与编辑态叠加框（含相同文字）重复绘制
         if self._text_editing and layer is self._text_edit_layer:
@@ -5630,41 +5819,49 @@ class ImageEditorWidget(QWidget):
         img.fill(Qt.GlobalColor.transparent)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setOpacity(layer.opacity)
+        p.setOpacity(1.)
         p.setTransform(layer.canvas_transform())
         content = self._layer_content(layer)
         if content is not None:
-            if layer.shadow and layer.kind in ("shape", "text"):
-                self._draw_shadow(p, layer, content)
-            p.drawImage(0, 0, content)
+            if layer.kind == 'svg' and layer.svg_source:
+                import base64
+                from PyQt6.QtCore import QByteArray
+                from PyQt6.QtSvg import QSvgRenderer
+                renderer = QSvgRenderer(QByteArray(base64.b64decode(layer.svg_source)))
+                renderer.render(p, QRectF(0, 0, layer.w, layer.h))
+            else:
+                p.drawImage(0, 0, content)
         p.end()
+        from core.image_layer_effects import has_layer_effects
+        if layer.mask is None and layer.opacity == 1. and not has_layer_effects(layer):
+            return img
         # P3 图层蒙版：应用到 alpha 通道
-        if layer.mask is not None and layer.kind == "image":
+        if layer.mask is not None:
             arr = numpy_from_qimage(img)
             mh, mw = layer.mask.shape
             if mh == arr.shape[0] and mw == arr.shape[1]:
                 mask_f = layer.mask.astype(np.float32) / 255.0
                 arr[:, :, 3] = (arr[:, :, 3].astype(np.float32) * mask_f).astype(np.uint8)
                 img = qimage_from_numpy(arr)
-        # P3 外发光 (outer glow)
-        if layer.outer_glow and content is not None and layer.outer_glow_size > 0:
-            glow = self._render_outer_glow(layer, content)
-            if glow is not None:
-                gp = QPainter(img)
-                gp.setCompositionMode(QPainter.CompositionMode.CompositionMode_DestinationOver)
-                gp.drawImage(0, 0, glow)
-                gp.end()
-        return img
+        return qimage_from_numpy(apply_layer_effects(numpy_from_qimage(img), layer))
 
     # ═══════ P4 调整图层 ═══════
     def _apply_adjustment(self, img, layer):
         """把调整图层的色彩调整应用到累积合成结果上（不透明度=强度）。"""
         adj = layer.adjust or {}
         arr = numpy_from_qimage(img)
+        if adj.get('type') == 'filter':
+            filtered = self._filter_apply(arr, adj['filter'], adj.get('params', {}))
+            strength = max(0., min(1., layer.opacity))
+            if layer.mask is not None and layer.mask.shape == arr.shape[:2]:
+                strength *= layer.mask[:, :, None].astype(np.float32) / 255
+            return qimage_from_numpy(mix_rgba(arr, filtered, strength))
         orig_rgb = arr[:, :, :3].copy()
         rgb = arr[:, :, :3].astype(np.float32)
         t = adj.get("type", "brightness_contrast")
-        if t == "brightness_contrast":
+        if t in ADJUSTMENTS:
+            rgb = apply_extra_adjustment(rgb, t, adj, arr[:, :, 3])
+        elif t == "brightness_contrast":
             b = float(adj.get("brightness", 0))   # -100..100
             c = float(adj.get("contrast", 0))     # -100..100
             rgb = (rgb - 127.5) * (1.0 + c / 100.0) + 127.5 + b * 1.275
@@ -5692,7 +5889,9 @@ class ImageEditorWidget(QWidget):
             w_hi = lum
             w_mid = 4 * lum * (1 - lum)
             delta = (sh * w_sh + mid * w_mid + hi * w_hi) * 80.0
-            rgb = np.clip(rgb + delta[:, None], 0, 255)
+            rgb = np.clip(rgb + delta[:, :, None], 0, 255)
+            if adj.get('channels'):
+                rgb = apply_curves(rgb, adj['channels'])
         elif t == "white_balance":
             temp = float(adj.get("temperature", 0)) / 100.0   # 负=冷(蓝)，正=暖(黄)
             tint = float(adj.get("tint", 0)) / 100.0          # 负=绿，正=洋红
@@ -5723,8 +5922,10 @@ class ImageEditorWidget(QWidget):
                 pass
         # 调整层不透明度 = 调整强度
         op = max(0.0, min(1.0, layer.opacity))
-        if op < 1.0:
-            rgb = rgb * op + orig_rgb.astype(np.float32) * (1.0 - op)
+        strength = op
+        if layer.mask is not None and layer.mask.shape == arr.shape[:2]:
+            strength = op * layer.mask[:, :, None].astype(np.float32) / 255
+        rgb = rgb * strength + orig_rgb.astype(np.float32) * (1.0 - strength)
         arr[:, :, :3] = np.clip(rgb, 0, 255).astype(np.uint8)
         return qimage_from_numpy(arr)
 
@@ -5748,6 +5949,9 @@ class ImageEditorWidget(QWidget):
             "color_balance": {"cyan_red": 0, "mag_green": 0, "yel_blue": 0},
         }
         name = names.get(kind, kind)
+        if kind in ADJUSTMENTS:
+            name, specs = ADJUSTMENTS[kind]
+            defaults[kind] = {key: default for key, _, _, _, default in specs}
         l = ImageLayer(name, kind="adjust", w=1, h=1)
         l.adjust = {"type": kind}
         l.adjust.update(defaults.get(kind, {}))
@@ -5757,14 +5961,18 @@ class ImageEditorWidget(QWidget):
         self._select_layer_only(l)
         self._refresh_layers()
         self._redraw()
-        self._edit_adjust_layer(l)
+        if kind == 'curves':
+            self._edit_adjust_layer(l)
 
     def _edit_adjust_layer(self, layer):
         """调整图层参数对话框（滑块实时预览，取消可还原）。"""
-        if layer.kind != "adjust" or layer.adjust is None:
+        if layer.kind != "adjust" or layer.adjust is None or layer.locked:
+            return
+        if layer.adjust.get('type') == 'filter':
+            self.edit_filter_layer(layer)
             return
         from PyQt6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout
-        backup = dict(layer.adjust)
+        backup = copy.deepcopy(layer.adjust)
         dlg = QDialog(self)
         dlg.setWindowTitle(f"调整图层 — {layer.name}")
         dlg.setStyleSheet("QDialog{background:#252528;} QLabel{color:#ccc;font-size:12px;}")
@@ -5786,6 +5994,51 @@ class ImageEditorWidget(QWidget):
                               ("yel_blue", "黄—蓝", -100, 100)],
         }
         params = ADJ_PARAMS.get(t, [])
+        if t in ADJUSTMENTS:
+            params = [(key, label, lo, hi) for key, label, lo, hi, _ in ADJUSTMENTS[t][1]]
+        before = self._snapshot()
+        if t == 'curves':
+            if not any(layer.adjust.get(key, 0) for key in ('shadows', 'midtones', 'highlights')):
+                params = []
+            channel = QComboBox()
+            for label, key in (("RGB 总曲线", 'rgb'), ('红通道', 'red'), ('绿通道', 'green'), ('蓝通道', 'blue')):
+                channel.addItem(label, key)
+            form.addRow('通道', channel)
+            graph = CurveEditor()
+            graph.setObjectName('curveEditor')
+            form.addRow(graph)
+            point_x, point_y = QSpinBox(), QSpinBox()
+            for spin in (point_x, point_y):
+                spin.setRange(0, 255)
+                spin.setEnabled(False)
+            point_x.setObjectName('curveInput')
+            point_y.setObjectName('curveOutput')
+            form.addRow('控制点输入', point_x)
+            form.addRow('控制点输出', point_y)
+            def sync_point(point):
+                for index, spin in enumerate((point_x, point_y)):
+                    spin.blockSignals(True)
+                    spin.setEnabled(point is not None and (index == 1 or graph.selected not in (0, len(graph.points) - 1)))
+                    if point is not None:
+                        spin.setValue(round(point[index]))
+                    spin.blockSignals(False)
+            graph.selectionChanged.connect(sync_point)
+            point_x.valueChanged.connect(lambda value: graph.update_selected_point(x=value))
+            point_y.valueChanged.connect(lambda value: graph.update_selected_point(y=value))
+            form.addRow(QLabel('点击加点 · 拖动调节 · 右键删除中间点（最多 32 点）'))
+            def sync_curve():
+                graph.set_points(layer.adjust.get('channels', {}).get(channel.currentData(), [[0, 0], [255, 255]]), channel.currentData())
+            def change_curve(points):
+                channels = copy.deepcopy(layer.adjust.get('channels', {}))
+                channels[channel.currentData()] = points
+                layer.adjust['channels'] = channels
+                self._redraw()
+            graph.pointsChanged.connect(change_curve)
+            channel.currentIndexChanged.connect(sync_curve)
+            reset_curve = QPushButton('重置当前通道')
+            reset_curve.clicked.connect(lambda: (change_curve([[0, 0], [255, 255]]), sync_curve()))
+            form.addRow(reset_curve)
+            sync_curve()
         for key, label, lo, hi in params:
             row = QHBoxLayout()
             sld = QSlider(Qt.Orientation.Horizontal)
@@ -5807,12 +6060,16 @@ class ImageEditorWidget(QWidget):
             form.addRow(label, row)
         btns = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
                                 QDialogButtonBox.StandardButton.Cancel)
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText('应用')
+        btns.button(QDialogButtonBox.StandardButton.Cancel).setText('取消')
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         form.addRow(btns)
         if dlg.exec() != QDialog.DialogCode.Accepted:
             layer.adjust = backup
             self._redraw()
+        elif layer.adjust != backup:
+            self._push_undo_snapshot("修改调整图层", before)
 
     def _draw_shadow(self, p, layer, content):
         col = QColor(layer.shadow_color)
@@ -5858,15 +6115,25 @@ class ImageEditorWidget(QWidget):
             return None
 
     def _paint_checker(self, p, w, h):
-        s = 12
-        c1 = QColor(58, 58, 58)
-        c2 = QColor(40, 40, 40)
-        for y in range(0, h, s):
-            for x in range(0, w, s):
-                col = c1 if ((x // s + y // s) % 2 == 0) else c2
-                p.fillRect(x, y, min(s, w - x), min(s, h - y), col)
+        if not hasattr(self, '_checker_brush'):
+            tile = QPixmap(24, 24)
+            tile.fill(QColor(58, 58, 58))
+            painter = QPainter(tile)
+            painter.fillRect(12, 0, 12, 12, QColor(40, 40, 40))
+            painter.fillRect(0, 12, 12, 12, QColor(40, 40, 40))
+            painter.end()
+            self._checker_brush = QBrush(tile)
+        p.fillRect(0, 0, w, h, self._checker_brush)
 
     def _redraw(self):
+        self._display_generation = getattr(self, '_display_generation', 0) + 1
+        # The view is reused when the last document closes or its last board is removed.
+        if not self.project.artboards and not self.view.artboard_item.pixmap().isNull():
+            self._draw_artboards()
+        if self._redraw_interaction_preview():
+            return
+        if self._request_full_resolution_render():
+            return
         img = self._render_composite(for_export=False)
         if self._compare_active and self._compare_before_image is not None:
             try:
@@ -5885,7 +6152,9 @@ class ImageEditorWidget(QWidget):
         # （导致输入/删除时画布上看不到任何变化，只有提交后才显示）。
         if self._text_editing:
             self._draw_text_editor(img)
+        self.view.composite_item.setTransform(QTransform())
         self.view.composite_item.setPixmap(QPixmap.fromImage(img))
+        self.view.navigator.set_document(self.view.composite_item.pixmap())
         if self.project.artboards:
             dw, dh = self._doc_bounds()
             M = self.view.PAN_MARGIN
@@ -5903,7 +6172,7 @@ class ImageEditorWidget(QWidget):
     HANDLE_SIZE = 7
     ROTATE_HANDLE_DIST = 28
 
-    def _layer_bbox(self, layer):
+    def _leaf_bbox(self, layer):
         """返回图层在画布空间的包围盒（考虑变换）"""
         if not layer:
             return None
@@ -5914,29 +6183,40 @@ class ImageEditorWidget(QWidget):
         return QRectF(min(xs), min(ys), max(xs) - min(xs), max(ys) - min(ys))
 
     def _draw_handles(self):
+        self.view.handle_item.setPixmap(QPixmap())
+        self.view.viewport().update()
+
+    def _paint_layer_handles(self):
+        """Paint small transform controls in the viewport, not a document-sized bitmap."""
+        if not self._ft_active and self.tool in (Tool.SELECT_RECT, Tool.SELECT_ELLIPSE,
+                Tool.SELECT_LASSO, Tool.POLY_LASSO, Tool.WAND, Tool.QUICK_SELECT, Tool.OBJECT_SELECT):
+            return
+        if self._text_editing or self.active is not None and self.active.kind=='text' and not self._ft_active:
+            return
         """只在 _show_handles=True 且有活跃图层时显示变换手柄"""
         if not self._show_handles or not self.active or not self.active.visible:
-            self.view.handle_item.setPixmap(QPixmap())
             return
         bbox = self._layer_bbox(self.active)
         if bbox is None or bbox.width() < 4 or bbox.height() < 4:
-            self.view.handle_item.setPixmap(QPixmap())
             return
         cw, ch = self._ctx_size()
         w, h = cw, ch
-        img = QImage(w, h, QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
+        p = QPainter(self.view.viewport())
+        p.setWorldTransform(self.view.viewportTransform())
+        if self.active_artboard is not None:
+            sx, sy = self._ab_screen(self.active_artboard)
+            p.translate(sx, sy)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         # 包围盒虚线
         pen = QPen(QColor("#3d8ef8"), 1.0)
         pen.setStyle(Qt.PenStyle.DashLine)
         pen.setDashPattern([4, 3])
+        pen.setCosmetic(True)
         p.setPen(pen)
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.drawRect(bbox)
         # 8 个角/边手柄
-        hs = self.HANDLE_SIZE / 2.0
+        zoom = abs(self.view.viewportTransform().m11())
         l, r, t, b = bbox.left(), bbox.right(), bbox.top(), bbox.bottom()
         cx, cy = bbox.center().x(), bbox.center().y()
         handles = {
@@ -5944,9 +6224,12 @@ class ImageEditorWidget(QWidget):
             "e": QPointF(r, cy), "se": QPointF(r, b), "s": QPointF(cx, b),
             "sw": QPointF(l, b), "w": QPointF(l, cy),
         }
-        p.setPen(QPen(QColor("#3d8ef8"), 2))
+        handle_pen = QPen(QColor("#3d8ef8"), 1)
+        handle_pen.setCosmetic(True)
+        p.setPen(handle_pen)
         p.setBrush(QBrush(QColor(255, 255, 255)))
         for name, pt in handles.items():
+            hs = (10 if len(name) == 2 else self.HANDLE_SIZE) / (2 * zoom)
             p.drawRect(QRectF(pt.x() - hs, pt.y() - hs, hs * 2, hs * 2))
         # 旋转锚点（圆，在上方）
         rp = QPointF(cx, t - self.ROTATE_HANDLE_DIST)
@@ -5976,13 +6259,6 @@ class ImageEditorWidget(QWidget):
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.drawText(badge, Qt.AlignmentFlag.AlignCenter, name)
         p.end()
-        self.view.handle_item.setPixmap(QPixmap.fromImage(img))
-        # 画板模式下手柄叠加层需偏移到画板在文档中的位置
-        if self.active_artboard is not None:
-            sx, sy = self._ab_screen(self.active_artboard)
-            self.view.handle_item.setOffset(sx, sy)
-        else:
-            self.view.handle_item.setOffset(0, 0)
 
     def _show_rot_hud(self, deg):
         """旋转时实时显示当前角度（画布顶部居中 HUD）。"""
@@ -5995,15 +6271,17 @@ class ImageEditorWidget(QWidget):
         self._rot_hud.show()
 
     def _hit_handle(self, pt):
+        if self.active is not None and self.active.kind=='text' and not self._ft_active:
+            return None
         """检测点击位置是否在手柄上，返回手柄名或 None。画板模式下 pt 需转为本地坐标。"""
-        if not self.active or not self.active.visible:
+        if not self._show_handles or not self.active or not self.active.visible:
             return None
         bbox = self._layer_bbox(self.active)
-        if bbox is None:
+        if bbox is None or bbox.width() < 4 or bbox.height() < 4:
             return None
         # 画板模式下 pt 是文档坐标，转为画板本地坐标以匹配 bbox（画板本地空间）
         pt = self._doc_to_local(pt)
-        hs = self.HANDLE_SIZE / 2.0 + 4  # 容错
+        zoom = abs(self.view.viewportTransform().m11())
         l, r, t, b = bbox.left(), bbox.right(), bbox.top(), bbox.bottom()
         cx, cy = bbox.center().x(), bbox.center().y()
         handles = {
@@ -6011,45 +6289,19 @@ class ImageEditorWidget(QWidget):
             "e": QPointF(r, cy), "se": QPointF(r, b), "s": QPointF(cx, b),
             "sw": QPointF(l, b), "w": QPointF(l, cy),
         }
+        targets = []
         for name, hp in handles.items():
-            if abs(pt.x() - hp.x()) < hs and abs(pt.y() - hp.y()) < hs:
-                return name
-        rp = QPointF(cx, t - self.ROTATE_HANDLE_DIST)
-        if (pt.x() - rp.x())**2 + (pt.y() - rp.y())**2 < hs**2:
-            return "rotate"
-        return None
+            dx, dy = (pt.x() - hp.x()) * zoom, (pt.y() - hp.y()) * zoom
+            radius = 12 if len(name) == 2 else 8
+            if max(abs(dx), abs(dy)) <= radius:
+                targets.append((dx * dx + dy * dy, name))
+        rotation_y = t - self.ROTATE_HANDLE_DIST
+        rotation_distance = ((pt.x() - cx)**2 + (pt.y() - rotation_y)**2) * zoom**2
+        if rotation_distance <= max(6, 4 * zoom)**2:
+            targets.append((rotation_distance, "rotate"))
+        return min(targets)[1] if targets else None
 
     # ═══════ P3 参考线 / 网格 ═══════
-    def _draw_guides_and_grid(self):
-        """绘制网格线 + 参考线（叠在画布之上）。"""
-        if not self.project.show_grid and not self.project.h_guides and not self.project.v_guides:
-            self.view.guide_item.setPixmap(QPixmap())
-            return
-        ctx_w, ctx_h = self._ctx_size()
-        img = QImage(ctx_w, ctx_h, QImage.Format.Format_ARGB32)
-        img.fill(Qt.GlobalColor.transparent)
-        p = QPainter(img)
-
-        # 网格
-        if self.project.show_grid:
-            gs = self.project.grid_size
-            grid_pen = QPen(QColor(255, 255, 255, 25), 0.5)
-            p.setPen(grid_pen)
-            for x in range(gs, ctx_w, gs):
-                p.drawLine(x, 0, x, ctx_h)
-            for y in range(gs, ctx_h, gs):
-                p.drawLine(0, y, ctx_w, y)
-
-        # 参考线（青色半透明）
-        guide_pen = QPen(QColor(0, 234, 255, 180), 1.0)
-        p.setPen(guide_pen)
-        for y in self.project.h_guides:
-            p.drawLine(0, int(y), ctx_w, int(y))
-        for x in self.project.v_guides:
-            p.drawLine(int(x), 0, int(x), ctx_h)
-
-        p.end()
-        self.view.guide_item.setPixmap(QPixmap.fromImage(img))
 
     def _hit_guide(self, pt, tol=6.0):
         """命中已有参考线？返回 ('h', idx) / ('v', idx) / None（pt 为画布坐标）"""
@@ -6061,31 +6313,6 @@ class ImageEditorWidget(QWidget):
                 return ('v', i)
         return None
 
-    def _snap_pt(self, pt, snap_dist=8):
-        """将点吸附到最近的参考线或网格交叉点。"""
-        best = QPointF(pt)
-        best_dist = snap_dist
-        # 水平参考线
-        for gy in self.project.h_guides:
-            d = abs(pt.y() - gy)
-            if d < best_dist:
-                best = QPointF(pt.x(), gy)
-                best_dist = d
-        # 垂直参考线
-        for gx in self.project.v_guides:
-            d = abs(pt.x() - gx)
-            if d < best_dist:
-                best = QPointF(gx, pt.y())
-                best_dist = d
-        # 网格线
-        if self.project.show_grid:
-            gs = self.project.grid_size
-            nx = round(pt.x() / gs) * gs
-            ny = round(pt.y() / gs) * gs
-            d = ((pt.x() - nx)**2 + (pt.y() - ny)**2)**0.5
-            if d < best_dist:
-                best = QPointF(nx, ny)
-        return best
 
     def _toggle_grid(self):
         self._push_undo("切换网格")
@@ -6144,45 +6371,6 @@ class ImageEditorWidget(QWidget):
         self._redraw()
 
     # ───────── P5 智能参考线（拖动/变换时吸附对齐） ─────────
-    def _snap_bbox_lines(self, cand_xs, cand_ys, exclude=None):
-        """给定移动对象的一组候选 X 线 / Y 线（文档坐标），找最近目标并吸附。
-        返回 (dx, dy, guides)：dx/dy 为需要追加到对象位置的偏移，
-        guides 为 [('v', x), ('h', y)] 要绘制的对齐线（洋红）。"""
-        exclude = exclude or set()
-        zoom = self.view.transform().m11() or 1.0
-        thresh = max(4.0, 8.0 / zoom)   # 屏幕上约 8px 吸附阈值
-        ctx_w, ctx_h = self._ctx_size()
-        # 目标线：画布（文档）中心 / 边缘
-        txs = [0.0, ctx_w / 2.0, ctx_w]
-        tys = [0.0, ctx_h / 2.0, ctx_h]
-        for l in self._ctx_layers():
-            if l in exclude:
-                continue
-            b = self._layer_bbox(l)
-            if b is None:
-                continue
-            txs.extend([b.left(), (b.left() + b.right()) / 2, b.right()])
-            tys.extend([b.top(), (b.top() + b.bottom()) / 2, b.bottom()])
-        best_dx, best_adx = 0.0, thresh
-        chosen_x = None
-        for cx in cand_xs:
-            for tx in txs:
-                d = abs(cx - tx)
-                if d < best_adx:
-                    best_adx = d; best_dx = tx - cx; chosen_x = tx
-        best_dy, best_ady = 0.0, thresh
-        chosen_y = None
-        for cy in cand_ys:
-            for ty in tys:
-                d = abs(cy - ty)
-                if d < best_ady:
-                    best_ady = d; best_dy = ty - cy; chosen_y = ty
-        guides = []
-        if chosen_x is not None:
-            guides.append(("v", chosen_x))
-        if chosen_y is not None:
-            guides.append(("h", chosen_y))
-        return best_dx, best_dy, guides
 
     # ───────── 画板叠加层（边框 + 名称标签，不进入导出） ─────────
     def _draw_artboards(self):
@@ -6251,7 +6439,7 @@ class ImageEditorWidget(QWidget):
         try:
             import cv2
             sel_u8 = self.selection.astype(np.uint8) * 255
-            contours, _ = cv2.findContours(sel_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            contours, _ = cv2.findContours(sel_u8, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
             p = QPainter(img)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
             p.setBrush(Qt.BrushStyle.NoBrush)
@@ -6263,12 +6451,12 @@ class ImageEditorWidget(QWidget):
                 if not poly.isClosed():
                     poly.append(poly.first())
                 # 白+黑双色蚂蚁线（仿 PS，随时间平移）：黑色底层 + 白色半周期偏移上层
-                pen_b = QPen(QColor(0, 0, 0, 200), 1.0, Qt.PenStyle.DashLine)
-                pen_b.setDashPattern([4, 4])
+                pen_b = QPen(QColor(0, 0, 0, 220), 0.65, Qt.PenStyle.DashLine, Qt.PenCapStyle.FlatCap)
+                pen_b.setDashPattern([5, 5])
                 pen_b.setDashOffset(phase)
-                pen_w = QPen(QColor(255, 255, 255, 240), 1.0, Qt.PenStyle.DashLine)
-                pen_w.setDashPattern([4, 4])
-                pen_w.setDashOffset(phase + 4)   # 半周期偏移 → 白色落在黑色间隙
+                pen_w = QPen(QColor(255, 255, 255, 240), 0.65, Qt.PenStyle.DashLine, Qt.PenCapStyle.FlatCap)
+                pen_w.setDashPattern([5, 5])
+                pen_w.setDashOffset(phase + 5)   # 半周期偏移 → 白色落在黑色间隙
                 p.setPen(pen_b); p.drawPolygon(poly)
                 p.setPen(pen_w); p.drawPolygon(poly)
             p.end()
@@ -6279,7 +6467,7 @@ class ImageEditorWidget(QWidget):
             edges[:, 1:] |= self.selection[:, 1:] != self.selection[:, :-1]
             ys, xs = np.where(edges)
             p = QPainter(img)
-            pen_b = QPen(QColor(0, 0, 0, 200)); pen_b.setWidth(1)
+            pen_b = QPen(QColor(0, 0, 0, 220)); pen_b.setWidth(1)
             pen_w = QPen(QColor(255, 255, 255, 240)); pen_w.setWidth(1)
             for y, x in zip(ys.tolist(), xs.tolist()):
                 # 半周期交错：白点落在黑点间隙（仿 PS 蚂蚁线）
@@ -6308,35 +6496,17 @@ class ImageEditorWidget(QWidget):
             self._sel_timer.stop()
 
     # ═══════ 选区 ═══════
-    def _hit_test(self, pt):
-        """自顶向下检测哪个图层被点击（忽略完全透明的区域）"""
-        if self.selection is not None:
-            return self.active  # 有选区时算点中活跃层
-        lp0 = self._doc_to_local(pt)
-        for layer in reversed(self._ctx_layers()):
-            if not layer.visible:
-                continue
-            lp = layer.canvas_to_layer(lp0.x(), lp0.y())
-            if lp is None:
-                continue
-            lx, ly = int(round(lp[0])), int(round(lp[1]))
-            if 0 <= lx < layer.w and 0 <= ly < layer.h:
-                if layer.kind == "image" and layer.pixels is not None:
-                    if layer.pixels[ly, lx, 3] > 0:
-                        self.set_active(layer)
-                        return layer
-                else:
-                    self.set_active(layer)
-                    return layer
-        return None
 
-    def _clear_selection(self):
+    @selection_history('取消选区')
+    def _clear_selection(self, checked=False):
         self.selection = None
         self.sel_alpha = None
+        self._sel_base = None
         self._sel_preview_base = None
         self._redraw_selection()
 
-    def _invert_selection(self):
+    @selection_history('反选选区')
+    def _invert_selection(self, checked=False):
         """反选：画布内已选↔未选互换（参考 PS 选区反选）。"""
         if self.selection is None:
             return
@@ -6359,6 +6529,7 @@ class ImageEditorWidget(QWidget):
             menu.addSeparator()
             menu.addAction("🗑 删除选区", lambda: self.delete_selection(silent=True))
             menu.addAction("🎨 填充选区", self.fill_selection)
+            menu.addAction("内容识别填充", self._content_aware_fill)
             menu.addAction("🔁 反选选区", self._invert_selection)
             menu.addAction("🌫 羽化选区", self._feather_sel)
             menu.addAction("🌫 模糊选区", self._blur_sel)
@@ -6441,7 +6612,7 @@ class ImageEditorWidget(QWidget):
         self._finish_ai_compare()
         self.status_tool.setText("AI 局部修改完成")
 
-    def _handle_move(self, name, pt, orig):
+    def _handle_leaf_move(self, name, pt, orig):
         """拖拽变换手柄：旋转 / 缩放。画板模式下 pt 是文档坐标，需转为本地坐标。"""
         layer = self.active
         if not layer or not orig.get("bbox"):
@@ -6468,13 +6639,13 @@ class ImageEditorWidget(QWidget):
         # 新边界（缺省保持原值，被拖动的那条边跟随鼠标）
         n_left, n_top, n_right, n_bottom = left, top, right, bottom
         if "w" in name:   # 西边（nw / sw / w）
-            n_left = pt.x()
+            n_left = left + pt.x() - start.x()
         if "e" in name:   # 东边（ne / se / e）
-            n_right = pt.x()
+            n_right = right + pt.x() - start.x()
         if "n" in name:   # 北边（nw / ne / n）
-            n_top = pt.y()
+            n_top = top + pt.y() - start.y()
         if "s" in name:   # 南边（sw / se / s）
-            n_bottom = pt.y()
+            n_bottom = bottom + pt.y() - start.y()
 
         nw = max(n_right - n_left, 1.0)
         nh = max(n_bottom - n_top, 1.0)
@@ -6542,13 +6713,10 @@ class ImageEditorWidget(QWidget):
             self._smart_guides = []
         self._redraw()
 
+    @selection_history(lambda self, mask, mode: {'new': '新建选区', 'add': '添加选区',
+                                               'sub': '减去选区', 'intersect': '交叉选区'}[mode])
     def _combine_mask(self, mask, mode):
-        if self.selection is None or mode == "new":
-            self.selection = mask.copy()
-        elif mode == "add":
-            self.selection = self.selection | mask
-        elif mode == "sub":
-            self.selection = self.selection & (~mask)
+        self.selection = combine_selection_masks(self.selection, mask, mode)
         self.sel_alpha = None  # 重新选区后羽化权重失效
         self._sel_base = self.selection.copy()  # 记录羽化前原始二值选区
 
@@ -6559,7 +6727,8 @@ class ImageEditorWidget(QWidget):
         x1, y1 = int(max(a.x(), b.x())), int(max(a.y(), b.y()))
         w, h = self._ctx_size()
         mask = np.zeros((h, w), bool)
-        mask[max(0, y0):min(h, y1), max(0, x0):min(w, x1)] = True
+        mask[max(0, min(h, y0)):max(0, min(h, y1)),
+             max(0, min(w, x0)):max(0, min(w, x1))] = True
         if tool == Tool.SELECT_ELLIPSE and x1 > x0 and y1 > y0:
             yy, xx = np.mgrid[0:h, 0:w]
             cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
@@ -6588,14 +6757,14 @@ class ImageEditorWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         # 叠加模式(Shift/Alt)：画入拖拽开始时冻结的已提交选区底图（绝不回读 sel_item，避免逐帧累积残影）
         base = getattr(self, "_sel_preview_base", None)
-        if getattr(self, "_sel_combine", "new") in ("add", "sub") and base is not None and not base.isNull():
+        if getattr(self, "_sel_combine", "new") in ("add", "sub", "intersect") and base is not None and not base.isNull():
             p.drawImage(0, 0, base.toImage())
         # 白+黑双色蚂蚁线（仿 PS）
         phase = self._sel_phase % 20
-        pen_b = QPen(QColor(0, 0, 0, 200), 1.0, Qt.PenStyle.DashLine)
-        pen_b.setDashPattern([4, 4]); pen_b.setDashOffset(phase)
-        pen_w = QPen(QColor(255, 255, 255, 240), 1.0, Qt.PenStyle.DashLine)
-        pen_w.setDashPattern([4, 4]); pen_w.setDashOffset(phase + 4)
+        pen_b = QPen(QColor(0, 0, 0, 220), 0.65, Qt.PenStyle.DashLine, Qt.PenCapStyle.FlatCap)
+        pen_b.setDashPattern([5, 5]); pen_b.setDashOffset(phase)
+        pen_w = QPen(QColor(255, 255, 255, 240), 0.65, Qt.PenStyle.DashLine, Qt.PenCapStyle.FlatCap)
+        pen_w.setDashPattern([5, 5]); pen_w.setDashOffset(phase + 5)
         r = QRectF(float(x0), float(y0), float(x1 - x0), float(y1 - y0))
         if tool == Tool.SELECT_RECT:
             p.setPen(pen_b); p.drawRect(r)
@@ -6621,14 +6790,14 @@ class ImageEditorWidget(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         # 叠加模式(Shift/Alt)：画入拖拽开始时冻结的已提交选区底图（绝不回读 sel_item）
         base = getattr(self, "_sel_preview_base", None)
-        if getattr(self, "_sel_combine", "new") in ("add", "sub") and base is not None and not base.isNull():
+        if getattr(self, "_sel_combine", "new") in ("add", "sub", "intersect") and base is not None and not base.isNull():
             p.drawImage(0, 0, base.toImage())
         # 白+黑双色蚂蚁线（仿 PS）
         phase = self._sel_phase % 20
-        pen_b = QPen(QColor(0, 0, 0, 200), 1.0, Qt.PenStyle.DashLine)
-        pen_b.setDashPattern([4, 4]); pen_b.setDashOffset(phase)
-        pen_w = QPen(QColor(255, 255, 255, 240), 1.0, Qt.PenStyle.DashLine)
-        pen_w.setDashPattern([4, 4]); pen_w.setDashOffset(phase + 4)
+        pen_b = QPen(QColor(0, 0, 0, 220), 0.65, Qt.PenStyle.DashLine, Qt.PenCapStyle.FlatCap)
+        pen_b.setDashPattern([5, 5]); pen_b.setDashOffset(phase)
+        pen_w = QPen(QColor(255, 255, 255, 240), 0.65, Qt.PenStyle.DashLine, Qt.PenCapStyle.FlatCap)
+        pen_w.setDashPattern([5, 5]); pen_w.setDashOffset(phase + 5)
         poly = QPolygonF([QPointF(pt.x(), pt.y()) for pt in pts])
         p.setPen(pen_b); p.drawPolyline(poly)
         p.setPen(pen_w); p.drawPolyline(poly)
@@ -6838,6 +7007,17 @@ class ImageEditorWidget(QWidget):
         self._redraw_selection()
 
     def _wand(self, pt, tol, mode):
+        if self.wand_sample_all:
+            image = self._render_artboard(self.active_artboard) if self.active_artboard else self._render_composite(True)
+            pixels = numpy_from_qimage(image)
+            point = self._doc_to_local(pt)
+            x, y = int(math.floor(point.x())), int(math.floor(point.y()))
+            if not (0 <= x < pixels.shape[1] and 0 <= y < pixels.shape[0]):
+                return
+            self._combine_mask(self.wand_region(pixels, y, x, tol), mode)
+            self._sel_preview_base = None
+            self._redraw_selection()
+            return
         layer = self.active
         if not layer or layer.kind != "image" or layer.pixels is None:
             QMessageBox.information(self, "提示", "请先选中一个图片图层再用魔棒。")
@@ -6847,7 +7027,9 @@ class ImageEditorWidget(QWidget):
         if lp is None:
             return
         lx, ly = int(round(lp[0])), int(round(lp[1]))
-        mask_layer = self._flood(layer.pixels, ly, lx, tol)
+        if not (0 <= lx < layer.w and 0 <= ly < layer.h):
+            return
+        mask_layer = self.wand_region(layer.pixels, ly, lx, tol)
         # 变换回画布空间
         w, h = self._ctx_size()
         tmp = np.zeros((layer.h, layer.w, 4), np.uint8)
@@ -6878,88 +7060,62 @@ class ImageEditorWidget(QWidget):
             # cv2.floodFill 逐通道容差 + FIXED_RANGE（始终对比种子点），
             # 与 PS 魔棒行为接近，且底层 C++ 实现比纯 Python 栈式循环快两个数量级
             flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+            transparent = px[sy, sx, 3] == 0
+            valid = px[:, :, 3] == 0 if transparent else px[:, :, 3] > 0
+            flood_mask[1:-1, 1:-1][~valid] = 1
             lo = (tol,) * 3
             hi = (tol,) * 3
             flags = 4 | (255 << 8) | cv2.FLOODFILL_MASK_ONLY | cv2.FLOODFILL_FIXED_RANGE
             # px 为 RGBA，取前 3 通道做 flood fill（cv2 按 BGR 解释但不影响逐通道容差判断）
-            cv2.floodFill(px[:, :, :3], flood_mask, (sx, sy), 0, lo, hi, flags)
-            mask = flood_mask[1:-1, 1:-1].astype(bool)
+            # An RGB slice of RGBA is not contiguous; OpenCV rejects it.
+            rgb = np.zeros((h, w), np.uint8) if transparent else np.ascontiguousarray(px[:, :, :3])
+            cv2.floodFill(rgb, flood_mask, (sx, sy), 0, lo, hi, flags)
+            mask = flood_mask[1:-1, 1:-1] == 255
         except Exception:
-            # 纯 Python fallback（保留原有欧氏距离判定，容差行为略有不同但可用）
+            # Match native fixed-range tolerance and transparency behavior.
+            transparent = px[sy, sx, 3] == 0
+            valid = px[:, :, 3] == 0 if transparent else px[:, :, 3] > 0
             target = px[sy, sx, :3].astype(np.int32)
-            tol2 = tol * tol * 3
             stack = [(sy, sx)]
             while stack:
                 y, x = stack.pop()
-                if not (0 <= x < w and 0 <= y < h) or mask[y, x]:
+                if not (0 <= x < w and 0 <= y < h) or mask[y, x] or not valid[y, x]:
                     continue
                 d = px[y, x, :3].astype(np.int32) - target
-                if np.dot(d, d) <= tol2:
+                if transparent or np.all(np.abs(d) <= tol):
                     mask[y, x] = True
                     stack.append((y + 1, x)); stack.append((y - 1, x))
                     stack.append((y, x + 1)); stack.append((y, x - 1))
         return mask
 
     # ═══════ P5 快速选择工具（笔刷式智能选区） ═══════
-    def _quick_select_begin(self, subtract=False):
-        """开始一次快速选择拖拽。subtract=True 为减选（Alt）。"""
-        self._qs_subtract = subtract
+    def _quick_select_begin(self, subtract=False, mode=None):
+        """Freeze the starting selection; combine the whole stroke against it."""
+        self._qs_mode = mode if mode is not None else ('sub' if subtract else self._sel_combine)
+        self._qs_base = None if self.selection is None else self.selection.copy()
+        self._qs_before = self._snapshot(metadata_only=True)
+        self._qs_source_layer = None
+        self._qs_last_point = None
         self._qs_mask = None          # 本次拖拽累积的画布空间 mask
         self._qs_visited = set()      # 去重：避免同一点重复 floodFill
 
     def _quick_select_point(self, pt):
-        """笔刷经过一点：以该点为种子做局部 floodFill，并入累积 mask。"""
-        layer = self.active
-        if not layer or layer.kind != "image" or layer.pixels is None:
-            return
-        local_pt = self._doc_to_local(pt)
-        lp = layer.canvas_to_layer(local_pt.x(), local_pt.y())
-        if lp is None:
-            return
-        lx, ly = int(round(lp[0])), int(round(lp[1]))
-        if not (0 <= lx < layer.w and 0 <= ly < layer.h):
-            return
-        # 网格去重（8px 格子内只取一次种子，避免每个 move 事件都 flood）
-        key = (lx // 8, ly // 8)
-        if key in self._qs_visited:
-            return
-        self._qs_visited.add(key)
-        # 快速选择容差比魔棒略宽（PS 行为：更"智能"更贪婪）
-        tol = max(self.tolerance, 24)
-        mask_layer = self._flood(layer.pixels, ly, lx, tol)
-        if not mask_layer.any():
-            return
-        # 层空间 → 画布空间
-        w, h = self._ctx_size()
-        tmp = np.zeros((layer.h, layer.w, 4), np.uint8)
-        tmp[mask_layer] = 255
-        q = qimage_from_numpy(tmp)
-        canvas_mask = QImage(w, h, QImage.Format.Format_ARGB32)
-        canvas_mask.fill(Qt.GlobalColor.transparent)
-        pp = QPainter(canvas_mask)
-        pp.setTransform(layer.canvas_transform())
-        pp.drawImage(0, 0, q)
-        pp.end()
-        m = numpy_from_qimage(canvas_mask)[:, :, 3] > 0
-        self._qs_mask = m if self._qs_mask is None else (self._qs_mask | m)
-        # 实时预览：临时合并显示
-        if self._qs_subtract and self.selection is not None:
-            preview = self.selection & ~self._qs_mask
-        elif self.selection is not None:
-            preview = self.selection | self._qs_mask
-        else:
-            preview = self._qs_mask
-        self.selection = preview
-        self.sel_alpha = None
-        self._redraw_selection()
+        self.quick_select_brush_point(pt)
 
     def _quick_select_end(self):
         """拖拽结束：mask 已在 _quick_select_point 实时合并，仅清理状态。"""
         self._qs_mask = None
         self._qs_visited = set()
+        self._qs_base = None
+        self._qs_source_layer = None
+        self._qs_rgb = self._qs_flood = self._qs_layer_mask = None
         if self.selection is not None and not self.selection.any():
             self.selection = None
+            self._sel_base = None
             self._redraw_selection()
+        if getattr(self, '_qs_before', None) is not None:
+            self.commit_selection_history(self._qs_before, '快速选择')
+            self._qs_before = None
 
     # ═══════ 选区操作 ═══════
     def delete_selection(self, silent=False):
@@ -6987,7 +7143,7 @@ class ImageEditorWidget(QWidget):
             QMessageBox.information(self, "提示", "请先选中一个图片图层再填充选区。")
             return
         # 弹出颜色选择器，默认当前前景色
-        c = QColorDialog.getColor(self.fg, self, "选择填充颜色")
+        c = choose_color(self.fg, self, '选择填充颜色')
         if not c.isValid():
             return
         self.fg = c
@@ -7039,23 +7195,11 @@ class ImageEditorWidget(QWidget):
     def _filter_apply(px, kind, params):
         """对 RGBA numpy 数组应用滤镜，返回新数组。cv2 缺失时对不支持的滤镜抛异常。"""
         import cv2
+        if kind in ('gaussian_blur', 'motion_blur'):
+            return blur_rgba(px, kind, params)
         out = px.copy()
         rgb = out[:, :, :3]
-        if kind == "gaussian_blur":
-            r = int(params["radius"]) | 1  # 奇数核
-            out = cv2.GaussianBlur(out, (r * 2 + 1, r * 2 + 1), 0)
-        elif kind == "motion_blur":
-            size = max(3, int(params["size"]))
-            ang = float(params["angle"])
-            k = np.zeros((size, size), np.float32)
-            k[size // 2, :] = 1.0
-            M = cv2.getRotationMatrix2D((size / 2 - 0.5, size / 2 - 0.5), ang, 1.0)
-            k = cv2.warpAffine(k, M, (size, size))
-            s = k.sum()
-            if s > 0:
-                k /= s
-            out = cv2.filter2D(out, -1, k)
-        elif kind in ("sharpen", "usm"):
+        if kind in ("sharpen", "usm"):
             r = int(params.get("radius", 3)) | 1
             a = float(params["amount"]) / 100.0
             blur = cv2.GaussianBlur(rgb, (r * 2 + 1, r * 2 + 1), 0)
@@ -7063,7 +7207,7 @@ class ImageEditorWidget(QWidget):
             out[:, :, :3] = sharp
         elif kind == "noise":
             amt = float(params["amount"])
-            noise = np.random.normal(0, amt, rgb.shape).astype(np.float32)
+            noise = np.random.default_rng(int(params.get('seed', 0))).normal(0, amt, rgb.shape).astype(np.float32)
             out[:, :, :3] = np.clip(rgb.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         elif kind == "denoise":
             s = max(1, min(30, int(params["strength"])))
@@ -7086,42 +7230,11 @@ class ImageEditorWidget(QWidget):
             out[:, :, :3] = 255 - rgb
         return out
 
-    def _confine_to_selection(self, layer, original, transformed):
-        """选区约束：有选区时把 transformed（整层滤镜结果）按选区软边混入 original，
-        选区外保持原样；无选区或选区不覆盖该图层时直接返回 transformed（维持原整层行为）。
-        original / transformed 均为图层本地 RGBA 数组；selection 为画布空间 bool(H,W)。
-        """
-        sel = self.selection
-        if sel is None or not sel.any():
-            return transformed
-        # 选区是画布坐标，图层可能有偏移/缩放 → 映射到图层本地坐标
-        bbox = self._layer_bbox(layer)
-        x0 = int(round(bbox.left())); y0 = int(round(bbox.top()))
-        x1 = int(round(bbox.right())); y1 = int(round(bbox.bottom()))
-        ch, cw = sel.shape
-        cx0, cy0 = max(0, x0), max(0, y0)
-        cx1, cy1 = min(cw, x1), min(ch, y1)
-        if cx1 <= cx0 or cy1 <= cy0:
-            return original   # 选区未覆盖该图层 → 整层不动
-        lx0, ly0 = cx0 - x0, cy0 - y0
-        lx1, ly1 = cx1 - x0, cy1 - y0
-        # 软边 alpha（画布空间）：sel_alpha 存在则用羽化边缘，否则用硬边选区
-        if self.sel_alpha is not None:
-            a = self.sel_alpha.astype(np.float32)
-        else:
-            a = sel.astype(np.float32)
-        sub_a = a[cy0:cy1, cx0:cx1][:, :, None] if a.ndim == 3 else a[cy0:cy1, cx0:cx1][:, :, None]
-        src_sub = original[ly0:ly1, lx0:lx1].astype(np.float32)
-        dst_sub = transformed[ly0:ly1, lx0:lx1].astype(np.float32)
-        blended = src_sub * (1.0 - sub_a) + dst_sub * sub_a
-        out = original.copy()
-        out[ly0:ly1, lx0:lx1] = blended.astype(np.uint8)
-        return out
 
     def _run_filter(self, kind):
         """滤镜入口：非图片层先栅格化；带参数的弹实时预览对话框。"""
         layer = self.active
-        if layer is None or layer.kind == "adjust":
+        if layer is None or layer.kind == "adjust" or layer.locked:
             QMessageBox.information(self, "提示", "请先选中一个图层再应用滤镜。")
             return
         name, spec = self.FILTERS[kind]
@@ -7139,6 +7252,7 @@ class ImageEditorWidget(QWidget):
             try:
                 filt = self._filter_apply(original, kind, {})
                 layer.pixels = self._confine_to_selection(layer, original, filt)
+                self._last_filter = (kind, {})
             except Exception as ex:
                 layer.pixels = original
                 QMessageBox.warning(self, "滤镜失败", str(ex))
@@ -7194,7 +7308,12 @@ class ImageEditorWidget(QWidget):
         lay.addLayout(bl)
         dlg.resize(360, dlg.sizeHint().height())
         _do_preview()  # 初始预览
-        if dlg.exec() != QDialog.DialogCode.Accepted:
+        accepted = dlg.exec() == QDialog.DialogCode.Accepted
+        dlg._preview_timer.stop()
+        if accepted:
+            _do_preview()
+            self._last_filter = (kind, {k: s.value() for k, s in sliders.items()})
+        else:
             layer.pixels = original           # 取消 → 还原
             if pushed:
                 self._history.pop(); self._history_idx -= 1
@@ -7220,8 +7339,8 @@ class ImageEditorWidget(QWidget):
         layer.pixels = base.astype(np.uint8)
         self._redraw()
 
+    @selection_history('羽化选区')
     def _feather_selection(self, radius, push_undo=False):
-        # 注：选区是临时状态，不进撤销历史（与 PS 一致）；push_undo 仅保留接口兼容
         if self.selection is None:
             QMessageBox.information(self, "提示", "请先创建选区。")
             return
@@ -7252,128 +7371,12 @@ class ImageEditorWidget(QWidget):
             self.selection = self._sel_base.copy()
         self._redraw_selection()
     # ═══════ 笔刷 / 橡皮 ═══════
-    def _stroke_point(self, pt, event=None):
-        layer = self.active
-        if not layer or layer.kind != "image" or layer.pixels is None:
-            return
-        if getattr(layer, 'locked', False):
-            return  # 锁定图层不可绘制
-        # ── 蒙版编辑模式：画笔/橡皮写入图层的黑白蒙版 ──
-        if getattr(self, "_mask_edit", False) and layer.mask is not None:
-            ctx_w, ctx_h = self._ctx_size()
-            local_pt = self._doc_to_local(pt)
-            r = self.brush_size / 2.0
-            cx, cy = local_pt.x(), local_pt.y()
-            has_sel = self.selection is not None
-            x0, y0 = int(cx - r), int(cy - r)
-            x1, y1 = int(cx + r), int(cy + r)
-            mh, mw = layer.mask.shape
-            val = 255 if self.tool == Tool.BRUSH else 0
-            for yy in range(max(0, y0), min(ctx_h, y1 + 1)):
-                for xx in range(max(0, x0), min(ctx_w, x1 + 1)):
-                    if (xx - cx) ** 2 + (yy - cy) ** 2 > r * r:
-                        continue
-                    if has_sel and not self.selection[yy, xx]:
-                        continue
-                    if 0 <= yy < mh and 0 <= xx < mw:
-                        layer.mask[yy, xx] = val
-            self._redraw()
-            return
-        # 画板模式下 pt 是文档坐标，需转为画板本地坐标
-        ctx_w, ctx_h = self._ctx_size()
-        local_pt = self._doc_to_local(pt)
-        r = self.brush_size / 2.0 / max(layer.scale, 0.01)
-        cx, cy = local_pt.x(), local_pt.y()
-        has_sel = self.selection is not None
-        x0, y0 = int(cx - r), int(cy - r)
-        x1, y1 = int(cx + r), int(cy + r)
-        for yy in range(max(0, y0), min(ctx_h, y1 + 1)):
-            for xx in range(max(0, x0), min(ctx_w, x1 + 1)):
-                if (xx - cx) ** 2 + (yy - cy) ** 2 > r * r:
-                    continue
-                # 有选区时只影响选区内（选区坐标也是画板本地）
-                if has_sel and self.selection[yy, xx]:
-                    pass  # 选区命中，继续
-                elif has_sel:
-                    continue
-                lp = layer.canvas_to_layer(xx, yy)
-                if lp is None:
-                    continue
-                lx, ly = int(round(lp[0])), int(round(lp[1]))
-                if 0 <= lx < layer.w and 0 <= ly < layer.h:
-                    if self.tool == Tool.BRUSH:
-                        layer.pixels[ly, lx] = (self.fg.red(), self.fg.green(),
-                                                self.fg.blue(), 255)
-                    else:
-                        layer.pixels[ly, lx] = (0, 0, 0, 0)
-        self._redraw()
 
     # ═══════ 克隆图章 / 修复画笔 ═══════
-    def _set_clone_source(self, pt):
-        """Alt+点击 设置克隆源点（图层本地坐标）。"""
-        layer = self.active
-        if not layer or layer.kind != "image" or layer.pixels is None:
-            return
-        local_pt = self._doc_to_local(pt)
-        lp = layer.canvas_to_layer(local_pt.x(), local_pt.y())
-        if lp is None:
-            return
-        self._clone_src_local = (int(round(lp[0])), int(round(lp[1])))
-        self._clone_offset = None  # 笔触开始时按当前位置计算偏移（对齐模式）
-        self._clone_source_warned = False
 
-    def _stroke_clone(self, pt, event=None):
-        layer = self.active
-        if not layer or layer.kind != "image" or layer.pixels is None:
-            return
-        if getattr(layer, 'locked', False):
-            return
-        if not hasattr(self, "_clone_src_local") or self._clone_src_local is None:
-            if not getattr(self, "_clone_source_warned", False):
-                self._clone_source_warned = True
-                QMessageBox.information(self, "提示", "请先按住 Alt 点击 设置克隆源点。")
-            return
-        ctx_w, ctx_h = self._ctx_size()
-        local_pt = self._doc_to_local(pt)
-        r = self.brush_size / 2.0 / max(layer.scale, 0.01)
-        cx, cy = local_pt.x(), local_pt.y()
-        has_sel = self.selection is not None
-        is_heal = (self.tool == Tool.HEAL)
-        for yy in range(int(max(0, cy - r)), int(min(ctx_h, cy + r + 1))):
-            for xx in range(int(max(0, cx - r)), int(min(ctx_w, cx + r + 1))):
-                if (xx - cx) ** 2 + (yy - cy) ** 2 > r * r:
-                    continue
-                if has_sel and not self.selection[yy, xx]:
-                    continue
-                lp = layer.canvas_to_layer(xx, yy)
-                if lp is None:
-                    continue
-                lx, ly = int(round(lp[0])), int(round(lp[1]))
-                if not (0 <= lx < layer.w and 0 <= ly < layer.h):
-                    continue
-                if self._clone_offset is None:
-                    self._clone_offset = (self._clone_src_local[0] - lx,
-                                          self._clone_src_local[1] - ly)
-                slx, sly = lx + self._clone_offset[0], ly + self._clone_offset[1]
-                if 0 <= slx < layer.w and 0 <= sly < layer.h:
-                    if is_heal:
-                        src = layer.pixels[sly, slx].astype(np.float32)
-                        dst = layer.pixels[ly, lx].astype(np.float32)
-                        src_lum = src[:3].mean(); dst_lum = dst[:3].mean()
-                        if dst_lum > 1 and src_lum > 0:
-                            mixed = np.clip(src[:3] * (dst_lum / src_lum), 0, 255)
-                            out = mixed * 0.6 + dst[:3] * 0.4
-                        else:
-                            out = src[:3]
-                        out_px = np.clip(np.concatenate([out, [dst[3]]])
-                                         if dst.shape[0] == 4 else out, 0, 255).astype(np.uint8)
-                        layer.pixels[ly, lx] = out_px
-                    else:
-                        layer.pixels[ly, lx] = layer.pixels[sly, slx]
-        self._redraw()
 
     def _content_aware_fill(self):
-        """对当前选区做内容识别填充（cv2 inpaint）。需先建立选区。"""
+        """用附近匹配的背景纹理修复当前选区。"""
         layer = self.active
         if not layer or layer.kind != "image" or layer.pixels is None:
             QMessageBox.information(self, "提示", "请选中一个图片图层，并建立选区。")
@@ -7386,45 +7389,46 @@ class ImageEditorWidget(QWidget):
         except Exception:
             QMessageBox.information(self, "提示", "opencv 不可用，无法内容识别填充。")
             return
-        src = np.ascontiguousarray(layer.pixels)
-        h, w = src.shape[:2]
-        # 选区是画布坐标，图层可能有偏移/缩放，需把选区映射到图层本地坐标再 inpaint
-        bbox = self._layer_bbox(layer)
-        x0 = int(round(bbox.left())); y0 = int(round(bbox.top()))
-        x1 = int(round(bbox.right())); y1 = int(round(bbox.bottom()))
-        ch, cw = self.selection.shape
-        cx0, cy0 = max(0, x0), max(0, y0)
-        cx1, cy1 = min(cw, x1), min(ch, y1)
-        if cx1 <= cx0 or cy1 <= cy0:
-            QMessageBox.information(self, "提示", "选区未覆盖该图层。")
+        from core.image_effects import pixel_matrix
+
+        inverse, valid = layer.canvas_transform().inverted()
+        if not valid:
+            QMessageBox.information(self, "提示", "当前图层变换无法用于填充。")
             return
-        lx0, ly0 = cx0 - x0, cy0 - y0
-        lx1, ly1 = cx1 - x0, cy1 - y0
-        sub_mask = self.selection[cy0:cy1, cx0:cx1]
-        sub = src[ly0:ly1, lx0:lx1]
-        mask = sub_mask.astype(np.uint8) * 255
-        if mask.sum() == 0:
+        matrix = [[inverse.m11(), inverse.m21(), inverse.m31()],
+                  [inverse.m12(), inverse.m22(), inverse.m32()],
+                  [inverse.m13(), inverse.m23(), inverse.m33()]]
+        height, width = layer.pixels.shape[:2]
+        mask = cv2.warpPerspective(
+            self.selection.astype(np.uint8), pixel_matrix(matrix),
+            (width, height), flags=cv2.INTER_NEAREST)
+        if not mask.any():
             QMessageBox.information(self, "提示", "选区内没有该图层的像素。")
             return
-        self._push_undo("内容识别填充")   # pre-state：填充前入栈，确保逐步撤销
-        filled = cv2.inpaint(sub[:, :, :3], mask, 3, cv2.INPAINT_TELEA)
-        sub[:, :, :3] = filled
-        # 填充区域内 alpha 设为不透明，避免残留透明
-        sub[mask > 0, 3] = 255
-        src[ly0:ly1, lx0:lx1] = sub
-        layer.pixels = src
+        if mask.all():
+            QMessageBox.information(self, "提示", "请缩小选区，保留一些周围像素供填充参考。")
+            return
+
+        try:
+            from core.content_aware_fill import fill_from_background
+
+            filled = fill_from_background(layer.pixels[:, :, :3], mask,
+                                          valid=layer.pixels[:, :, 3] > 0)
+        except cv2.error as exc:
+            QMessageBox.warning(self, "内容识别填充失败", str(exc))
+            return
+        selected = mask.astype(bool)
+        result = layer.pixels.copy()
+        result[selected, :3] = filled[selected]
+        result[selected, 3] = 255
+        self._push_undo("内容识别填充")
+        layer.pixels = result
         self._redraw()
         self._refresh_layers()
 
     # ═══════ 移动 ═══════
-    def _begin_move(self, pt):
-        if not self.selected:
-            return
-        # 记录所有选中图层的初始位置，支持整组拖动
-        self._move_olds = {id(l): (l.x, l.y) for l in self.selected}
-        self._move_pre_snap = self._snapshot()   # pre-state：拖动前的状态
 
-    def _move_to(self, pt):
+    def _move_leaf_to(self, pt, redraw=True):
         if not self._move_olds:
             return
         start = self.view._start  # CanvasView 上记录的鼠标起点
@@ -7454,18 +7458,10 @@ class ImageEditorWidget(QWidget):
                 ox, oy = self._move_olds[id(l)]
                 l.x = ox + dx
                 l.y = oy + dy
-        self._redraw()
-        self.view.viewport().update()   # 触发 paintEvent 重绘洋红参考线
+        if redraw:
+            self._redraw()
+            self.view.viewport().update()
 
-    def _end_move(self):
-        if self._move_olds:
-            moved = any((l.x, l.y) != self._move_olds[id(l)]
-                        for l in self.selected if id(l) in self._move_olds)
-            if moved:
-                self._push_undo_snapshot("移动/变换图层", self._move_pre_snap)
-        self._move_olds = None
-        self._smart_guides = []          # P5 清除拖动中的洋红参考线
-        self.view.viewport().update()
 
     def _transform_copy(self):
         """PS Ctrl+Alt+T：复制当前图层并立即进入自由变换。"""
@@ -7476,11 +7472,14 @@ class ImageEditorWidget(QWidget):
 
     # ═══════ P4 自由变换（Ctrl+T，PS 风格确认/取消） ═══════
     def _start_free_transform(self):
+        if self._text_editing:
+            self._end_text_edit(save=True)
         if self._ft_active:
             return
         l = self.active
         if l is None or getattr(l, "locked", False) or l.kind == "adjust":
             return
+        self._ft_tree_before = self._snapshot(metadata_only=True)
         self._push_undo("自由变换")
         self._ft_saved = (l, l.x, l.y, l.scale, l.rotation, l.skew_x, l.skew_y)
         self._ft_active = True
@@ -7524,6 +7523,7 @@ class ImageEditorWidget(QWidget):
         if not self._ft_active:
             return
         self._ft_active = False
+        self._ft_tree_before = None
         self._ft_saved = None
         if self._ft_bar:
             self._ft_bar.hide()
@@ -7532,6 +7532,16 @@ class ImageEditorWidget(QWidget):
     def _ft_cancel(self):
         """取消变换：还原进入时的位置/缩放/旋转/斜切。"""
         if not self._ft_active:
+            return
+        if getattr(self, '_ft_tree_before', None) is not None:
+            before = self._ft_tree_before
+            self._ft_tree_before = None
+            self._ft_active = False
+            self._ft_saved = None
+            if self._ft_bar:
+                self._ft_bar.hide()
+            self._restore(before)
+            self.setFocus()
             return
         if self._ft_saved:
             l, x, y, sc, rot, skx, sky = self._ft_saved
@@ -7547,25 +7557,6 @@ class ImageEditorWidget(QWidget):
 
     # ═══════ 文字 / 形状 ═══════
     # ═══════ 文字：画布内联编辑（替代模态弹窗） ═══════
-    def _hit_test_at(self, pt, kinds=None):
-        """自顶向下命中图层（忽略选区，专门用于文字/钢笔等定点交互）。"""
-        lp0 = self._doc_to_local(pt)
-        for layer in reversed(self._ctx_layers()):
-            if not layer.visible:
-                continue
-            if kinds is not None and layer.kind not in kinds:
-                continue
-            lp = layer.canvas_to_layer(lp0.x(), lp0.y())
-            if lp is None:
-                continue
-            lx, ly = int(round(lp[0])), int(round(lp[1]))
-            if 0 <= lx < layer.w and 0 <= ly < layer.h:
-                if layer.kind == "image" and layer.pixels is not None:
-                    if layer.pixels[ly, lx, 3] > 0:
-                        return layer
-                else:
-                    return layer
-        return None
 
     def _start_text_edit(self, layer, is_new, pt=None):
         """进入画布内联文字编辑态（参考视频区字幕输入方式，画布渲染 + IME 直采）。
@@ -7590,6 +7581,7 @@ class ImageEditorWidget(QWidget):
         else:
             # 编辑已有图层：它已经在工程里
             self._text_edit_added = True
+            self._select_layer_only(layer)
         self._text_editing = True
         self._text_edit_layer = layer
         self._text_edit_was_new = is_new
@@ -7656,17 +7648,8 @@ class ImageEditorWidget(QWidget):
             self._refresh_layers()
             self._redraw()
             return
-        # 接受：写入文字并重新计算图层尺寸
+        # Paragraph bounds are explicit geometry; accepting text must not shrink them.
         layer.text = flat
-        f = QFont(layer.font_family, layer.font_size)
-        f.setBold(layer.bold)
-        f.setItalic(layer.italic)
-        fm = QFontMetrics(f)
-        rect = fm.boundingRect(0, 0, int(layer.w), int(layer.h),
-                               int(layer.align) | int(Qt.TextFlag.TextWordWrap),
-                               flat)
-        layer.w = max(10, rect.width() + 20)
-        layer.h = max(10, rect.height() + 20)
         # pre-state 入栈：仅文本确有变化才记录撤销步
         if flat != orig:
             self._push_undo_snapshot("编辑文字", pre)
@@ -7697,114 +7680,8 @@ class ImageEditorWidget(QWidget):
         self._edit_blink = not self._edit_blink
         self._redraw()
 
-    def _build_text_layout(self, disp, box_w):
-        """按当前文字层样式构建 QTextLayout（编辑渲染 / 光标定位共用）。"""
-        layer = self._text_edit_layer
-        fs = max(1, int(layer.font_size * layer.scale))
-        font = QFont(layer.font_family, fs)
-        font.setBold(layer.bold)
-        font.setItalic(layer.italic)
-        layout = QTextLayout(disp, font)
-        opt = QTextOption()
-        opt.setAlignment(Qt.AlignmentFlag(getattr(layer, "align",
-                                                    int(Qt.AlignmentFlag.AlignLeft))))
-        opt.setWrapMode(QTextOption.WrapMode.WordWrap)
-        layout.setTextOption(opt)
-        layout.beginLayout()
-        yy = 0.0
-        while True:
-            line = layout.createLine()
-            if not line.isValid():
-                break
-            line.setLineWidth(max(1.0, box_w - 12.0))
-            line.setPosition(QPointF(0, yy))
-            yy += line.height()
-        layout.endLayout()
-        return layout
 
-    def _draw_text_editor(self, img):
-        """在合成图上叠加编辑态文字 + 闪烁光标 + 蓝色虚线框。"""
-        layer = self._text_edit_layer
-        if layer is None or not self._text_editing:
-            return
-        if not layer.visible:   # 编辑中也可通过眼睛按钮隐藏图层
-            return
-        ox = self._ab_screen(self.active_artboard)[0] if self.active_artboard is not None else 0
-        oy = self._ab_screen(self.active_artboard)[1] if self.active_artboard is not None else 0
-        tlx = ox + layer.x - layer.w * layer.scale / 2.0
-        tly = oy + layer.y - layer.h * layer.scale / 2.0
-        box_w = max(20.0, layer.w * layer.scale)
-        fs = max(1, int(layer.font_size * layer.scale))
-        fm = QFontMetrics(QFont(layer.font_family, fs))
-        line_h = fm.height()
-        # IME 预编辑文本拼入显示（拼音仅屏幕显示，不入 _edit_flat）
-        flat = self._edit_flat
-        if self._ime_preedit:
-            pos = max(0, min(self._ime_compose_start, len(flat)))
-            disp = flat[:pos] + self._ime_preedit + flat[pos:]
-            cursor = pos + len(self._ime_preedit)
-        else:
-            disp = flat
-            cursor = self._edit_cursor
-        layout = self._build_text_layout(disp, box_w)
-        text_h = line_h * max(1, layout.lineCount())
-        draw_h = max(layer.h * layer.scale, text_h + 12)
-        p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        # 半透明深色背景
-        p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(QColor(28, 28, 32, 200))
-        p.drawRoundedRect(QRectF(tlx, tly, box_w, draw_h), 4, 4)
-        # 文字（随图层颜色）
-        p.setPen(QColor(layer.color))
-        layout.draw(p, QPointF(tlx + 6, tly + 6))
-        # 蓝色虚线框
-        pen = QPen(QColor("#3d8ef8"), 1.5)
-        pen.setStyle(Qt.PenStyle.DashLine)
-        p.setPen(pen)
-        p.setBrush(Qt.BrushStyle.NoBrush)
-        p.drawRoundedRect(QRectF(tlx, tly, box_w, draw_h), 4, 4)
-        # 光标定位（cursorToX 在部分 PyQt6 版本返回 (x, pos) 元组，统一取 x）
-        def _cx(ln, pos):
-            r = ln.cursorToX(pos)
-            return r[0] if isinstance(r, tuple) else r
-        caret_x = tlx + 6
-        caret_y = tly + 6
-        caret_h = line_h
-        if layout.lineCount() > 0:
-            for i in range(layout.lineCount()):
-                ln = layout.lineAt(i)
-                if ln.textStart() <= cursor <= ln.textStart() + ln.textLength():
-                    caret_x = tlx + 6 + _cx(ln, cursor)
-                    caret_y = tly + 6 + ln.position().y()
-                    caret_h = ln.height()
-                    break
-            else:
-                last = layout.lineAt(layout.lineCount() - 1)
-                caret_x = tlx + 6 + _cx(last, cursor)
-                caret_y = tly + 6 + last.position().y()
-                caret_h = last.height()
-        if self._edit_blink:
-            p.setPen(QPen(QColor("#00eaff"), 2))
-            p.drawLine(int(caret_x), int(caret_y),
-                       int(caret_x), int(caret_y + caret_h))
-        p.end()
-        # 更新 IME 光标矩形（文档坐标 → 视口坐标）
-        vr = self.view.mapFromScene(QPointF(caret_x, caret_y))
-        self._edit_cursor_rect = QRectF(vr.x(), vr.y(), 2, caret_h)
 
-    def _update_text_cursor_rect(self):
-        """编辑态进入时先算一次光标矩形（供 IME 查询）。"""
-        layer = self._text_edit_layer
-        if layer is None:
-            self._edit_cursor_rect = QRectF(0, 0, 2, 12)
-            return
-        ox = self._ab_screen(self.active_artboard)[0] if self.active_artboard is not None else 0
-        oy = self._ab_screen(self.active_artboard)[1] if self.active_artboard is not None else 0
-        tlx = ox + layer.x - layer.w * layer.scale / 2.0
-        tly = oy + layer.y - layer.h * layer.scale / 2.0
-        vr = self.view.mapFromScene(QPointF(tlx + 6, tly + 6))
-        self._edit_cursor_rect = QRectF(vr.x(), vr.y(), 2, 12)
 
     def inputMethodEvent(self, event):
         """IME 事件：中文/日文/韩文等组合文本输入。
@@ -7968,7 +7845,11 @@ class ImageEditorWidget(QWidget):
             p.setBrush(QBrush(QColor(fc.red(), fc.green(), fc.blue(), 70)))
         else:
             p.setBrush(Qt.BrushStyle.NoBrush)
-        if tool == Tool.SHAPE_RECT:
+        if tool == Tool.SHAPE_LINE:
+            dx,dy = getattr(self,'_line_direction',(1,1))
+            p.drawLine(QPointF(rect.left() if dx>=0 else rect.right(),rect.top() if dy>=0 else rect.bottom()),
+                       QPointF(rect.right() if dx>=0 else rect.left(),rect.bottom() if dy>=0 else rect.top()))
+        elif tool == Tool.SHAPE_RECT:
             p.drawRect(rect)
         else:
             p.drawEllipse(rect)
@@ -7977,6 +7858,12 @@ class ImageEditorWidget(QWidget):
 
     def _commit_shape(self, tool, rect):
         self.view.shape_preview_item.setPixmap(QPixmap())
+        if tool==Tool.SHAPE_LINE and rect is not None:
+            if rect.width()+rect.height()<2:
+                return
+            rect = QRectF(rect)
+            rect.setWidth(max(2.,rect.width()))
+            rect.setHeight(max(2.,rect.height()))
         if rect is None or rect.width() < 2 or rect.height() < 2:
             return
         self._push_undo("绘制形状")
@@ -7990,6 +7877,18 @@ class ImageEditorWidget(QWidget):
         layer = ImageLayer("形状", kind="shape",
                           w=int(rect.width()) + pad * 2, h=int(rect.height()) + pad * 2)
         layer.shape = "rect" if tool == Tool.SHAPE_RECT else "ellipse"
+        if tool==Tool.SHAPE_LINE:
+            layer.shape = 'line'
+            sx,sy = getattr(self,'_line_direction',(1,1))
+            layer.line_start = (0. if sx>=0 else 1.,0. if sy>=0 else 1.)
+            layer.line_end = (1.-layer.line_start[0],1.-layer.line_start[1])
+            if abs(sx)<.001:
+                layer.line_start = (.5,layer.line_start[1])
+                layer.line_end = (.5,layer.line_end[1])
+            if abs(sy)<.001:
+                layer.line_start = (layer.line_start[0],.5)
+                layer.line_end = (layer.line_end[0],.5)
+            layer.line_style,layer.line_cap = self.shape_line_style,self.shape_line_cap
         layer.rect = QRectF(pad, pad, rect.width(), rect.height())
         layer.x = rect.x() + rect.width() / 2
         layer.y = rect.y() + rect.height() / 2
@@ -8025,6 +7924,7 @@ class ImageEditorWidget(QWidget):
                 self._update_color_btn(self._sh_fill_btn, c)
                 if hasattr(self, "_swatch_btn"):
                     self._update_color_btn(self._swatch_btn, c)
+                self._sync_color_ui()
                 self.ai_status.setText("💧 已拾取颜色 {}（已更新填充色块）".format(c.name()))
                 self.ai_status.setVisible(True)
                 QTimer.singleShot(2000, lambda: self.ai_status.setVisible(False))
@@ -8053,23 +7953,35 @@ class ImageEditorWidget(QWidget):
             pass
 
     def _pick_color_dialog(self, holder):
-        c = QColorDialog.getColor(holder[0], self)
+        c = choose_color(holder[0], self)
         if c.isValid():
             holder[0] = c
 
     def _choose_fg(self):
-        c = QColorDialog.getColor(self.fg, self)
+        c = choose_color(self.fg, self, '前景色')
         if c.isValid():
             self.fg = c
-            ImageEditorWidget._update_color_btn(self.fg_btn, c)
+            self._sync_color_ui()
+
+    def _choose_secondary_color(self):
+        color = choose_color(self.bg, self, '背景色 · 备用颜色')
+        if color.isValid():
+            self.bg = color
+            self._sync_color_ui()
+
+    def _sync_color_ui(self):
+        self._update_color_btn(self.fg_btn, self.fg)
+        if hasattr(self, '_color_card'):
+            self._color_card.sync(self)
 
     def _choose_bg_color(self):
-        c = QColorDialog.getColor(self.project.bg_color, self)
+        target = self.active_artboard or self.project
+        c = choose_color(target.bg_color, self, '画布背景色')
         if c.isValid():
-            if c == self.project.bg_color:
+            if c == target.bg_color:
                 return
             self._push_undo("更改背景色")
-            self.project.bg_color = c
+            target.bg_color = c
             self._redraw()
 
     # ── 形状工具选项条（填充/描边 开关 + 粗细 + 颜色）──
@@ -8106,7 +8018,7 @@ class ImageEditorWidget(QWidget):
             self._redraw()
 
     def _choose_shape_fill_color(self):
-        c = QColorDialog.getColor(self.shape_fill_color, self)
+        c = choose_color(self.shape_fill_color, self, '形状填充色')
         if c.isValid():
             self.shape_fill_color = c
             self._update_color_btn(self._sh_fill_btn, c)
@@ -8118,7 +8030,7 @@ class ImageEditorWidget(QWidget):
                 self._redraw()
 
     def _choose_shape_stroke_color(self):
-        c = QColorDialog.getColor(self.shape_stroke_color, self)
+        c = choose_color(self.shape_stroke_color, self, '形状描边色')
         if c.isValid():
             self.shape_stroke_color = c
             self._update_color_btn(self._sh_stroke_btn, c)
@@ -8137,7 +8049,7 @@ class ImageEditorWidget(QWidget):
             self._redraw()
 
     def _choose_shape_grad_from(self):
-        c = QColorDialog.getColor(self.shape_grad_from, self)
+        c = choose_color(self.shape_grad_from, self, '渐变起始色')
         if c.isValid():
             self.shape_grad_from = c
             self._update_color_btn(self._sh_grad_from_btn, c)
@@ -8147,7 +8059,7 @@ class ImageEditorWidget(QWidget):
                 self._redraw()
 
     def _choose_shape_grad_to(self):
-        c = QColorDialog.getColor(self.shape_grad_to, self)
+        c = choose_color(self.shape_grad_to, self, '渐变结束色')
         if c.isValid():
             self.shape_grad_to = c
             self._update_color_btn(self._sh_grad_to_btn, c)
@@ -8179,6 +8091,12 @@ class ImageEditorWidget(QWidget):
         self._update_color_btn(self._sh_stroke_btn, QColor(a.color))
 
     # ═══════ 导出 / 工程 ═══════
+    def _save_delivery_image(self, image, path, fmt, quality=-1, label=""):
+        if not image.save(path, fmt, quality):
+            QMessageBox.warning(self, "导出失败", f"无法保存图片：{path}")
+            return
+        offer_duo_export(self, [path], "图片工作台", "导出完成", label or f"已导出：{path}")
+
     def export_png(self):
         if self.project.artboards:
             ab = self.active_artboard or self.project.artboards[-1]
@@ -8189,8 +8107,7 @@ class ImageEditorWidget(QWidget):
             if not path.lower().endswith(".png"):
                 path += ".png"
             img = self._render_artboard(ab)
-            img.save(path, "PNG")
-            QMessageBox.information(self, "完成", f"已导出画板「{ab.name}」：{path}")
+            self._save_delivery_image(img, path, "PNG", label=f"已导出画板「{ab.name}」：{path}")
             return
         path, _ = QFileDialog.getSaveFileName(self, "导出 PNG", "", "PNG (*.png)")
         if not path:
@@ -8198,8 +8115,7 @@ class ImageEditorWidget(QWidget):
         if not path.lower().endswith(".png"):
             path += ".png"
         img = self._render_composite(for_export=True)
-        img.save(path, "PNG")
-        QMessageBox.information(self, "完成", f"已导出：{path}")
+        self._save_delivery_image(img, path, "PNG")
 
     def export_jpg(self):
         if self.project.artboards:
@@ -8216,8 +8132,7 @@ class ImageEditorWidget(QWidget):
                 fill.fill(Qt.GlobalColor.white)
                 p = QPainter(fill); p.drawImage(0, 0, img); p.end()
                 img = fill
-            img.save(path, "JPG", 95)
-            QMessageBox.information(self, "完成", f"已导出画板「{ab.name}」：{path}")
+            self._save_delivery_image(img, path, "JPG", 95, f"已导出画板「{ab.name}」：{path}")
             return
         path, _ = QFileDialog.getSaveFileName(self, "导出 JPG", "", "JPG (*.jpg)")
         if not path:
@@ -8232,8 +8147,7 @@ class ImageEditorWidget(QWidget):
             p.drawImage(0, 0, img)
             p.end()
             img = fill
-        img.save(path, "JPG", 95)
-        QMessageBox.information(self, "完成", f"已导出：{path}")
+        self._save_delivery_image(img, path, "JPG", 95)
 
     def export_all_artboards(self):
         """批量导出每个画板为独立的 PNG（PS「导出画板」行为）。"""
@@ -8243,105 +8157,16 @@ class ImageEditorWidget(QWidget):
         d = QFileDialog.getExistingDirectory(self, "选择导出文件夹")
         if not d:
             return
+        paths = []
         for ab in self.project.artboards:
             safe = "".join(c if (c.isalnum() or c in "-_ ") else "_" for c in ab.name)
             img = self._render_artboard(ab)
             p = os.path.join(d, f"{safe}.png")
-            img.save(p, "PNG")
-        QMessageBox.information(self, "完成",
-            f"已导出 {len(self.project.artboards)} 个画板到：{d}")
+            if img.save(p, "PNG"):
+                paths.append(p)
+        offer_duo_export(self, paths, "图片工作台", "画板导出结束",
+                         f"已导出 {len(paths)}/{len(self.project.artboards)} 个画板到：{d}")
 
-    def import_psd(self):
-        """PSD 导入：psd-tools 读取图层结构 → 转成 ImageLayer（保留名称/位置/不透明度/可见性/混合模式）。"""
-        try:
-            import importlib
-            psd_tools = importlib.import_module("psd_tools")
-        except ImportError:
-            QMessageBox.warning(self, "缺少依赖",
-                "PSD 导入需要 psd-tools 库。\n请运行：pip install psd-tools\n然后重启应用。")
-            return
-        path, _ = QFileDialog.getOpenFileName(self, "导入 PSD", "", "Photoshop (*.psd *.psb)")
-        if not path:
-            return
-        try:
-            psd = psd_tools.PSDImage.open(path)
-        except Exception as ex:
-            QMessageBox.warning(self, "打开失败", f"无法解析 PSD 文件：\n{ex}")
-            return
-        self._push_undo("导入 PSD")
-        # PSD 混合模式 → 内部 blend 名
-        _psd_blend = {
-            "normal": "normal", "multiply": "multiply", "screen": "screen",
-            "overlay": "overlay", "darken": "darken", "lighten": "lighten",
-            "color dodge": "color_dodge", "color burn": "color_burn",
-            "linear burn": "linear_burn", "linear dodge": "linear_dodge",
-            "hard light": "hard_light", "soft light": "soft_light",
-            "vivid light": "vivid_light", "linear light": "linear_light",
-            "difference": "difference", "exclusion": "exclusion",
-            "hue": "hue", "saturation": "saturation",
-            "color": "color", "luminosity": "luminosity",
-        }
-        imported = 0
-        skipped = 0
-
-        def _walk(node):
-            nonlocal imported, skipped
-            for child in node:
-                if child.is_group():
-                    _walk(child)   # 展平组（组内层保持顺序）
-                    continue
-                try:
-                    pil = child.topil()   # PIL Image (RGBA)
-                    if pil is None:
-                        skipped += 1
-                        continue
-                    if pil.mode != "RGBA":
-                        pil = pil.convert("RGBA")
-                    arr = np.asarray(pil, dtype=np.uint8).copy()
-                    h, w = arr.shape[:2]
-                    if h == 0 or w == 0:
-                        skipped += 1
-                        continue
-                    layer = ImageLayer(child.name or f"PSD图层{imported+1}",
-                                       pixels=arr, w=w, h=h, kind="image")
-                    # PSD 坐标是左上角，内部 x/y 是中心
-                    layer.x = child.left + w / 2.0
-                    layer.y = child.top + h / 2.0
-                    layer.opacity = child.opacity / 255.0
-                    layer.visible = bool(child.visible)
-                    bkey = str(getattr(child, "blend_mode", "normal")).split(".")[-1] \
-                        .lower().replace("_", " ")
-                    layer.blend = _psd_blend.get(bkey, "normal")
-                    self.project.add_layer(layer)
-                    if self.active_artboard is not None:
-                        # 画板模式：移入当前画板并转为画板本地坐标
-                        self.project.layers.remove(layer)
-                        self.active_artboard.layers.append(layer)
-                    imported += 1
-                except Exception:
-                    skipped += 1
-
-        _walk(psd)
-        if imported == 0:
-            QMessageBox.information(self, "提示", "PSD 中没有可导入的像素图层。")
-            self._history.pop(); self._history_idx -= 1
-            self._refresh_history_panel()
-            return
-        # 无画板时：画布调整为 PSD 尺寸（更符合预期）
-        if self.active_artboard is None and not self.project.artboards:
-            self.project.w, self.project.h = psd.width, psd.height
-        if self.project.layers or (self.active_artboard and self.active_artboard.layers):
-            layers = (self.active_artboard.layers if self.active_artboard
-                      else self.project.layers)
-            if layers:
-                self.set_active(layers[-1])
-        self._refresh_layers()
-        self._redraw()
-        self.view.fit_view()
-        msg = f"已导入 {imported} 个图层（{psd.width}×{psd.height}）"
-        if skipped:
-            msg += f"，跳过 {skipped} 个不支持的图层（调整层/智能滤镜等）"
-        QMessageBox.information(self, "PSD 导入完成", msg)
 
     def export_as(self):
         """导出为…：格式下拉(PNG/JPG/WebP) + 质量滑杆。"""
@@ -8413,9 +8238,8 @@ class ImageEditorWidget(QWidget):
             fill.fill(Qt.GlobalColor.white)
             p = QPainter(fill); p.drawImage(0, 0, img); p.end()
             img = fill
-        img.save(path, fmt.upper(), -1 if fmt == "png" else quality)
-        QMessageBox.information(self, "完成", f"已导出（{fmt.upper()}"
-                                + ("" if fmt == "png" else f"，质量 {quality}") + f"）：{path}")
+        self._save_delivery_image(img, path, fmt.upper(), -1 if fmt == "png" else quality,
+                                  f"已导出（{fmt.upper()}）：{path}")
 
     # 信息流常用尺寸预设：(名称, 宽, 高)
     EXPORT_SIZE_PRESETS = [
@@ -8484,7 +8308,7 @@ class ImageEditorWidget(QWidget):
             return
         fmt = fmt_combo.currentText().lower()
         quality = q_spin.value()
-        count = 0
+        paths = []
         for ab in self.project.artboards:
             safe = "".join(c if (c.isalnum() or c in "-_ ") else "_" for c in ab.name)
             base = self._render_artboard(ab)
@@ -8512,43 +8336,46 @@ class ImageEditorWidget(QWidget):
                     p = QPainter(fill); p.drawImage(0, 0, img); p.end()
                     img = fill
                 out_path = os.path.join(d, f"{safe}_{suffix}.{fmt}")
-                img.save(out_path, fmt.upper(), -1 if fmt == "png" else quality)
-                count += 1
-        QMessageBox.information(self, "完成",
-            f"已导出 {count} 张图片（{len(self.project.artboards)} 画板 × {len(sizes)} 尺寸，"
-            f"{fmt.upper()}）到：\n{d}")
+                if img.save(out_path, fmt.upper(), -1 if fmt == "png" else quality):
+                    paths.append(out_path)
+        offer_duo_export(self, paths, "图片工作台", "图片导出结束",
+                         f"已导出 {len(paths)}/{len(self.project.artboards) * len(sizes)} 张图片到：\n{d}")
 
-    def save_project(self):
-        path, _ = QFileDialog.getSaveFileName(self, "保存工程", "", "JSON (*.json)")
-        if not path:
-            return
-        if not path.lower().endswith(".json"):
-            path += ".json"
-        os.makedirs(path + ".assets", exist_ok=True)
-        d = self._snapshot()
-        d["assets"] = []
-        for l in self._all_layers():
-            if l.kind == "image" and l.pixels is not None:
-                ap = path + f".assets/layer_{l.id}.png"
-                qimage_from_numpy(l.pixels).save(ap, "PNG")
-                d["assets"].append(ap)
-                for a in d["artboards"]:
-                    for o in a["layers"]:
-                        if o.get("id") == l.id:
-                            o["asset"] = ap
-                for o in d["layers"]:
-                    if o.get("id") == l.id:
-                        o["asset"] = ap
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(d, f, ensure_ascii=False)
 
-    def open_project(self):
-        path, _ = QFileDialog.getOpenFileName(self, "打开工程", "", "JSON (*.json)")
+    def open_template_batch(self):
+        from ui.image_template_batch import open_template_batch
+        open_template_batch(self)
+
+    def open_project(self, path=None):
         if not path:
-            return
-        with open(path, "r", encoding="utf-8") as f:
-            d = json.load(f)
-        self._rebuild_from_snap(d)
+            path, _ = QFileDialog.getOpenFileName(
+                self, "打开图片工程", "", f"{PIC_FILTER};;旧版图片工程 (*.json)")
+        if not path:
+            return False
+        try:
+            snapshot = self.unpack_project(read_project(path, PIC_SUFFIX))
+            if not {"w", "h", "layers", "transparent", "bg"} <= snapshot.keys():
+                raise ValueError("工程缺少图片画布或图层数据。")
+        except Exception as error:
+            QMessageBox.warning(self, "打开图片工程失败", str(error))
+            return False
+        before = self._snapshot()
+        self.autosave_recovery(force=True)
+        try:
+            self._rebuild_from_snap(snapshot)
+        except Exception as error:
+            self._rebuild_from_snap(before)
+            QMessageBox.warning(self, "打开图片工程失败", str(error))
+            return False
+        self.detach_comp()
+        self._start_recovery_session()
+        self._source_project_path = str(Path(path).resolve())
+        self.set_doc_name(Path(path).stem)
+        self._history = [{'name': '打开工程', 'snapshot': self._snapshot()}]
+        self._history_idx = 0
+        self._mark_recovery_dirty()
+        self._recovery_saved_token = self._recovery_token()
+        return True
 
     # ═══════ 合并图层 / AI 抠图 ═══════
     def _merge_down(self):
@@ -8641,11 +8468,11 @@ class ImageEditorWidget(QWidget):
         self._refresh_layers()
 
     def _add_layer_mask(self, layer):
-        """为图片图层添加白色图层蒙版（全显示）。"""
-        if layer.kind != "image" or layer.pixels is None:
-            QMessageBox.information(self, "提示", "只有图片图层可以添加蒙版。")
+        """为内容或效果图层添加画布空间的白色蒙版。"""
+        if layer is None or layer.locked:
             return
-        cw, ch = self._ctx_size()
+        board = self._active_artboard_of(layer)
+        cw, ch = (board.w, board.h) if board else (self.project.w, self.project.h)
         self._push_undo("添加图层蒙版")
         layer.mask = np.ones((ch, cw), dtype=np.uint8) * 255
         self._redraw()
@@ -8670,10 +8497,33 @@ class ImageEditorWidget(QWidget):
         layer.w = arr.shape[1]
         layer.h = arr.shape[0]
         layer.mask = None
+        layer.x, layer.y = layer.w / 2, layer.h / 2
+        layer.scale, layer.rotation = 1.0, 0.0
+        layer.stretch_x = layer.stretch_y = 1.
+        layer.flip_x = layer.flip_y = False
+        layer.skew_x = layer.skew_y = 0.0
+        layer.perspective_x = layer.perspective_y = 0.0
+        layer.quad = []
+        layer.opacity = 1.0
+        layer.effects = {}
+        layer.shadow = layer.outer_glow = layer.inner_shadow = layer.bevel_emboss = False
+        self._mask_edit = False
         self._redraw()
         self._refresh_layers()
 
+    def _exit_mask_edit(self):
+        self._mask_edit = False
+        self._refresh_layers()
+        self._sync_props()
+
     def _toggle_mask_edit(self, layer):
+        if layer.locked:
+            return
+        if layer is not self.active:
+            board = self._active_artboard_of(layer)
+            if board is not None:
+                self.active_artboard = board
+            self.set_active(layer)
         """进入/退出图层蒙版编辑模式：画笔/橡皮擦改为写入蒙版。"""
         if layer.mask is None:
             QMessageBox.information(self, "提示", "请先添加图层蒙版。")
@@ -8688,6 +8538,7 @@ class ImageEditorWidget(QWidget):
                 "已进入蒙版编辑：用画笔涂白显示、橡皮涂黑隐藏。\n"
                 "再次在图层右键选择「退出蒙版编辑」即可。")
         self._refresh_layers()
+        self._sync_props()
 
     def _rasterize_layer(self, layer):
         """栅格化文字/形状图层为像素图层。"""
@@ -8701,6 +8552,18 @@ class ImageEditorWidget(QWidget):
         layer.pixels = arr
         layer.w = cw
         layer.h = ch
+        layer.x,layer.y = cw/2,ch/2
+        layer.scale,layer.rotation = 1.,0.
+        layer.stretch_x = layer.stretch_y = 1.
+        layer.flip_x = layer.flip_y = False
+        layer.opacity = 1.
+        layer.skew_x = layer.skew_y = layer.perspective_x = layer.perspective_y = 0.
+        layer.quad = []
+        layer.mask = None
+        layer.effects = {}
+        layer.shadow = layer.outer_glow = layer.inner_shadow = layer.bevel_emboss = False
+        layer.children = []
+        layer.svg_source = ''
         layer.text = ""
         layer.shape = "rect"
         layer.stroke_w = 0
@@ -8709,28 +8572,6 @@ class ImageEditorWidget(QWidget):
         self._refresh_layers()
 
     # ═══════ 旋转 ═══════
-    def _rotate_canvas(self, angle_deg, swap=False):
-        """旋转整个画布（所有图层）。swap=True 时 90° 旋转需交换画布宽高。"""
-        import math
-        self._push_undo("旋转画布")
-        cw, ch = self._ctx_size()
-        rad = math.radians(angle_deg)
-        cos = math.cos(rad); sin = math.sin(rad)
-        new_w, new_h = (ch, cw) if swap else (cw, ch)
-        for ly in self._ctx_layers():
-            dx = ly.x - cw / 2.0; dy = ly.y - ch / 2.0
-            ndx = dx * cos - dy * sin
-            ndy = dx * sin + dy * cos
-            ly.x = new_w / 2.0 + ndx
-            ly.y = new_h / 2.0 + ndy
-            ly.rotation = (ly.rotation + angle_deg) % 360.0
-            if swap:
-                ly.w, ly.h = ly.h, ly.w
-        if swap:
-            self._set_canvas_size(new_w, new_h)
-        else:
-            self._redraw()
-        self._refresh_layers()
 
     def _rotate_canvas_angle(self):
         """按任意角度旋转画布（保持画布尺寸，边角可能裁切）。"""
@@ -8845,18 +8686,7 @@ class ImageEditorWidget(QWidget):
         self.set_active(layer)
         self._refresh_layers(); self._redraw()
 
-    def _flip_horizontal(self, layer):
-        """水平翻转图层。"""
-        self._push_undo("水平翻转")
-        layer.scale = -layer.scale
-        self._redraw()
 
-    def _flip_vertical(self, layer):
-        """垂直翻转图层。"""
-        self._push_undo("垂直翻转")
-        layer.scale = -layer.scale
-        layer.rotation = 180 - layer.rotation if layer.rotation else 180
-        self._redraw()
 
     def _merge_visible(self):
         """合并所有可见图层（保留隐藏层）。"""
@@ -9491,17 +9321,25 @@ class ImageEditorWidget(QWidget):
             "pip 输出：\n{}\n{}".format(err0 or "未知错误", pip_snippet, hint).strip())
         return False
     # ═══════ 撤销 / 重做（pre-state 快照） ═══════
-    def _snapshot(self):
+    def _capture_document_snapshot(self):
         return dict(
             w=self.project.w, h=self.project.h,
             bg=(self.project.bg_color.red(), self.project.bg_color.green(),
                 self.project.bg_color.blue()),
             transparent=self.project.transparent,
+            batch_template=copy.deepcopy(getattr(self, '_batch_template', None)),
             h_guides=list(self.project.h_guides),
             v_guides=list(self.project.v_guides),
             show_grid=self.project.show_grid,
             grid_size=self.project.grid_size,
+            grid_subdivisions=self.project.grid_subdivisions,
+            snap_targets=dict(self.project.snap_targets),
             active_id=self.active.id if self.active else None,
+            selected_ids=[layer.id for layer in self.selected],
+            selection=self._snapshot_array(self.selection),
+            sel_alpha=self._snapshot_array(self.sel_alpha),
+            sel_base=self._snapshot_array(self._sel_base),
+            feather=self.feather,
             active_artboard_id=self.active_artboard.id if self.active_artboard else None,
             artboards=[dict(
                 id=ab.id, name=ab.name, x=ab.x, y=ab.y, w=ab.w, h=ab.h,
@@ -9545,32 +9383,65 @@ class ImageEditorWidget(QWidget):
                  skew_x=getattr(l, 'skew_x', 0.0), skew_y=getattr(l, 'skew_y', 0.0),
                  perspective_x=getattr(l, 'perspective_x', 0.0),
                  perspective_y=getattr(l, 'perspective_y', 0.0))
+        if l.svg_source:
+            o['svg_source'] = l.svg_source
+        o['letter_spacing'] = l.letter_spacing
+        o['line_spacing'] = l.line_spacing
+        o['text_box_explicit'] = l.text_box_explicit
+        o['stretch_x'],o['stretch_y'] = l.stretch_x,l.stretch_y
+        o['line_start'],o['line_end'],o['line_style'],o['line_cap'] = l.line_start,l.line_end,l.line_style,l.line_cap
+        o['flip_x'],o['flip_y'],o['mask_linked'] = l.flip_x,l.flip_y,l.mask_linked
+        o['quad'] = copy.deepcopy(l.quad)
+        if l.effects:
+            o['effects'] = copy.deepcopy(l.effects)
+        if l.frames and with_pixels:
+            l.frames[l.frame_index] = l.pixels
+            o['frames'] = [self._snapshot_array(frame) for frame in l.frames]
+            o['frame_durations'] = list(l.frame_durations)
+            o['frame_index'] = l.frame_index
+        if l.kind == 'group':
+            o['children'] = [self._ser_layer(child, with_pixels=with_pixels) for child in l.children]
+            o['collapsed'] = l.collapsed
         if with_pixels and getattr(l, "mask", None) is not None:
-            o["mask"] = l.mask.copy()
+            o["mask"] = self._snapshot_array(l.mask)
         if getattr(l, 'adjust', None):
-            o["adjust"] = dict(l.adjust)
+            o["adjust"] = copy.deepcopy(l.adjust)
         if getattr(l, 'smart', False):
             o["smart"] = True
             if with_pixels and l.smart_source:
-                o["smart_source"] = l.smart_source   # 序列化字典列表（含像素）
-        if l.kind == "image":
+                o["smart_source"] = self._snapshot_nested(l.smart_source)
+        if l.kind in ("image", "svg"):
             if with_pixels and l.pixels is not None:
-                o["pixels"] = l.pixels.copy()
+                o["pixels"] = self._snapshot_array(l.pixels)
             if asset_base:
                 o["asset"] = asset_base + f".assets/layer_{l.id}.png"
         return o
 
     def _rebuild_from_snap(self, d):
         """从快照/工程字典重建完整状态（撤销重做与打开工程共用）。"""
+        self._clear_interaction_preview()
+        self._move_olds = None
+        self.view._handle_drag = None
+        self.view._layer_marquee = None
+        self._metadata_array_cache = {}
+        if hasattr(self, '_history_store'):
+            self._history_store.freeze_pending()
+        self.stop_text_session()
         if hasattr(self, "_compare_before_image"):
             self._reset_ai_compare()
         self.project = ImageProject(d["w"], d["h"])
+        self._batch_template = copy.deepcopy(d.get('batch_template'))
+        self._crop_rect = None
+        self._mask_edit = False
+        self.view.sel_item.setPixmap(QPixmap())
         self.project.transparent = d["transparent"]
         self.project.bg_color = QColor(*d["bg"])
         self.project.h_guides = list(d.get("h_guides", []))
         self.project.v_guides = list(d.get("v_guides", []))
         self.project.show_grid = bool(d.get("show_grid", False))
         self.project.grid_size = int(d.get("grid_size", 60))
+        self.project.grid_subdivisions = int(d.get('grid_subdivisions',1))
+        self.project.snap_targets.update(d.get('snap_targets',{}))
         self.project.artboards = []
         ab_by_id = {}
         for a in d.get("artboards", []):
@@ -9586,11 +9457,12 @@ class ImageEditorWidget(QWidget):
         self.active_artboard = ab_by_id.get(d.get("active_artboard_id"))
         self.active = next((l for l in self._all_layers()
                             if l.id == d.get("active_id")), None)
-        self.selected = [self.active] if self.active else []
+        self.selected = [layer for layer in self._all_layers() if layer.id in d.get('selected_ids', [d.get('active_id')])]
         self._anchor = self.active
-        self.selection = None
-        self.sel_alpha = None
-        self._sel_base = None
+        self.selection = d['selection'].copy() if d.get('selection') is not None else None
+        self.sel_alpha = d['sel_alpha'].copy() if d.get('sel_alpha') is not None else None
+        self._sel_base = d['sel_base'].copy() if d.get('sel_base') is not None else None
+        self.feather = d.get('feather', self.feather)
         if self.active_artboard is not None:
             self.cw.setValue(self.active_artboard.w)
             self.ch.setValue(self.active_artboard.h)
@@ -9606,13 +9478,38 @@ class ImageEditorWidget(QWidget):
         self.view.fit_view()
 
     def _restore(self, snap):
+        transform = QTransform(self.view.transform())
+        center = self.view.mapToScene(self.view.viewport().rect().center())
         self._rebuild_from_snap(snap)
+        self.view.setTransform(transform)
+        self.view.centerOn(center)
+        self._mark_recovery_dirty()
 
     def _deser_layer(self, o):
         l = ImageLayer(o["name"], kind=o["kind"], w=o["w"], h=o["h"])
         l.id = o["id"]; l.opacity = o["opacity"]; l.visible = o["visible"]
+        ImageLayer._counter = max(ImageLayer._counter, l.id)
+        if l.kind == 'group':
+            l.children = [self._deser_layer(child) for child in o.get('children', [])]
+            l.collapsed = bool(o.get('collapsed', True))
         l.blend = o["blend"]; l.x = o["x"]; l.y = o["y"]; l.scale = o["scale"]
         l.rotation = o["rotation"]
+        l.letter_spacing = o.get('letter_spacing',0)
+        l.line_spacing = o.get('line_spacing',100)
+        l.text_box_explicit = bool(o.get('text_box_explicit',False))
+        l.stretch_x,l.stretch_y = o.get('stretch_x',1.),o.get('stretch_y',1.)
+        l.line_start,l.line_end = o.get('line_start',(0.,0.)),o.get('line_end',(1.,1.))
+        l.line_style,l.line_cap = o.get('line_style',1),o.get('line_cap',16)
+        l.flip_x,l.flip_y,l.mask_linked = o.get('flip_x',False),o.get('flip_y',False),o.get('mask_linked',True)
+        l.quad = copy.deepcopy(o.get('quad',[]))
+        if l.scale<0:
+            l.scale = abs(l.scale)
+            l.flip_x,l.flip_y = not l.flip_x,not l.flip_y
+        l.svg_source = o.get('svg_source', '')
+        l.effects = copy.deepcopy(o.get('effects', {}))
+        l.frames = [frame.copy() for frame in o.get('frames', [])]
+        l.frame_durations = list(o.get('frame_durations', []))
+        l.frame_index = int(o.get('frame_index', 0))
         l.clip = o.get("clip", False); l.radius = o.get("radius", 0)
         l.gradient = o.get("gradient", False)
         l.grad_from = o.get("grad_from", "#3d8ef8"); l.grad_to = o.get("grad_to", "#00eaff")
@@ -9648,8 +9545,8 @@ class ImageEditorWidget(QWidget):
         l.smart = o.get("smart", False)
         l.smart_source = o.get("smart_source")
         if o.get("adjust"):
-            l.adjust = dict(o["adjust"])
-        if o["kind"] == "image":
+            l.adjust = copy.deepcopy(o["adjust"])
+        if o["kind"] in ("image", "svg"):
             if "pixels" in o:
                 l.pixels = o["pixels"].copy()
             elif o.get("asset"):
@@ -9671,7 +9568,8 @@ class ImageEditorWidget(QWidget):
             self._commit_property_history()
             pending = None
         if pending is None:
-            self._pending_property_history = (name, self._snapshot(), active_id)
+            self._pending_property_history = (name, self._snapshot(metadata_only=True), active_id)
+            self._mark_recovery_dirty()
         self._property_history_timer.start()
 
     def _commit_property_history(self):
@@ -9694,9 +9592,11 @@ class ImageEditorWidget(QWidget):
         # 截断 redo 分支（新操作后旧 redo 不可达）
         self._history = self._history[:self._history_idx]
         self._history.append({"name": name, "snapshot": snap, "post": None})
+        self._mark_recovery_dirty()
         if len(self._history) > self.max_undo:
             self._history.pop(0)
             self._history_idx -= 1
+        self.trim_history_memory()
         self._refresh_history_panel()
 
     def undo(self):
@@ -9840,8 +9740,10 @@ def _tab_close_icon():
     img = QImage(16, 16, QImage.Format.Format_ARGB32)
     img.fill(Qt.GlobalColor.transparent)
     p = QPainter(img)
-    pen = QPen(QColor(190, 190, 190))
-    pen.setWidth(1)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    pen = QPen(QColor('#d5dae4'))
+    pen.setWidthF(2)
+    pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     p.setPen(pen)
     p.drawLine(4, 4, 12, 12)
     p.drawLine(12, 4, 4, 12)
@@ -9861,18 +9763,6 @@ class ImageEditorContainer(QWidget):
         self._init_ui()
         # 默认开一个空白文档
         self.new_document(1080, 1080, name="未命名")
-        # 兜底：确保全部标签关闭按钮均为 "x" 图标（延迟到事件循环启动后，
-        # 规避个别平台首帧 QPixmap 尚未就绪导致图标为空）
-        QTimer.singleShot(0, self._apply_close_icons)
-
-    def _apply_close_icons(self):
-        tb = self.tab.tabBar()
-        for i in range(self.tab.count()):
-            btn = tb.tabButton(i, QTabBar.ButtonPosition.RightSide)
-            if btn is not None:
-                btn.setIcon(_tab_close_icon())
-                btn.setIconSize(QSize(10, 10))
-                btn.setToolTip("关闭画布")
 
     def _init_ui(self):
         outer = QVBoxLayout(self)
@@ -9916,7 +9806,6 @@ class ImageEditorContainer(QWidget):
         outer.addWidget(self._storyboard_bar)
 
         self.tab = QTabWidget()
-        self.tab.setTabsClosable(True)
         self.tab.setMovable(True)
         self.tab.setDocumentMode(False)
         self.tab.setStyleSheet(
@@ -9925,10 +9814,7 @@ class ImageEditorContainer(QWidget):
             "border:1px solid #2c2c2c;border-bottom:none;margin-right:2px;}"
             "QTabBar::tab:selected{background:#1b1b1e;color:#fff;}"
             "QTabBar::tab:hover{color:#ccc;}"
-            "QTabBar::close-button{background:transparent;}"
-            "QTabBar::close-button:hover{background:#3a3a3e;border-radius:3px;}"
         )
-        self.tab.tabCloseRequested.connect(self._on_close_tab)
         self.tab.tabBar().tabBarDoubleClicked.connect(self._on_tab_rename)
         outer.addWidget(self.tab, 1)
 
@@ -9940,13 +9826,20 @@ class ImageEditorContainer(QWidget):
         doc.doc_name = name
         idx = self.tab.addTab(doc, name)
         self.tab.setCurrentIndex(idx)
-        # 关闭按钮设为自绘 "x" 图标（不依赖系统主题，确保深色下可见）
         tb = self.tab.tabBar()
-        btn = tb.tabButton(idx, QTabBar.ButtonPosition.RightSide)
-        if btn is not None:
-            btn.setIcon(_tab_close_icon())
-            btn.setIconSize(QSize(10, 10))
-            btn.setToolTip("关闭画布")
+        close = QToolButton(tb)
+        close.setIcon(_tab_close_icon())
+        close.setIconSize(QSize(13, 13))
+        close.setFixedSize(19, 19)
+        close.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        close.setToolTip("关闭画布")
+        close.setAccessibleName("关闭画布")
+        close.setStyleSheet(
+            "QToolButton{background:transparent;border:0;border-radius:4px;padding:0;}"
+            "QToolButton:hover{background:#434958;}"
+        )
+        close.clicked.connect(lambda: self._on_close_tab(self.tab.indexOf(doc)))
+        tb.setTabButton(idx, QTabBar.ButtonPosition.RightSide, close)
         # 子文档信号透传到主窗口
         doc.add_layer_to_media_requested.connect(
             lambda p: self.add_layer_to_media_requested.emit(p))
@@ -10009,16 +9902,29 @@ class ImageEditorContainer(QWidget):
 
     def _on_close_tab(self, idx):
         """关闭文档标签；至少保留一个（最后一张改为清空而非销毁）。"""
-        if self.tab.count() <= 1:
-            w = self.tab.widget(0)
-            if w is not None:
-                w.new_project(1080, 1080)
-                self.set_doc_name_of(w, "未命名")
+        if idx < 0 or idx >= self.tab.count():
             return
         w = self.tab.widget(idx)
+        decision = w.close_project_decision()
+        if decision is None or (decision and not w.discard_recovery()):
+            return
+        if self.tab.count() <= 1:
+            w.new_project(1080, 1080)
+            self.set_doc_name_of(w, "未命名")
+            return
         self.tab.removeTab(idx)
-        if w is not None:
-            w.deleteLater()
+        w.deleteLater()
+
+    def prepare_close(self):
+        discards = []
+        for index in range(self.tab.count()):
+            doc = self.tab.widget(index)
+            decision = doc.close_project_decision()
+            if decision is None:
+                return False
+            if decision:
+                discards.append(doc)
+        return all(doc.discard_recovery() for doc in discards)
 
     def _on_tab_rename(self, idx):
         """双击标签重命名画布。"""

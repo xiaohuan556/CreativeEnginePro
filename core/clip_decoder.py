@@ -148,8 +148,9 @@ class ClipDecoder:
             if ahead_frames > 0:
                 self._ensure_forward(target + ahead_frames)
         else:
-            # paused / scrubbing / seek：单次 seek + 预填对称窗口
-            self._seek_to(target)
+            # 拖动预览线时先尽快交付目标帧。预填前后 20 帧会让每次
+            # 随机 seek 都等待大量无用解码，画面明显落后鼠标。
+            self._seek_to(target, prefill=False)
         return self._ring.get(target)
 
     # ── 独立取帧（叠加轨用）：不修改 _head / ring，不干扰主轨连续读状态 ──
@@ -221,18 +222,18 @@ class ClipDecoder:
         self._ring.push(target, (rgb, w, h))
 
     # ── 内部：单次 seek ──
-    def _seek_to(self, target):
+    def _seek_to(self, target, prefill=True):
         # 若目标就在前方不远，直接顺序推进，避免 seek 回退
         if 0 <= target - self._head <= _MAX_SEQ_GAP:
             self._ensure_forward(target)
             return
         # 对称窗口：先跳到 target-FILL_BACK，再顺序读满整个窗口（仅 1 次 seek）
-        start = max(0, target - _FILL_BACK)
+        start = max(0, target - _FILL_BACK) if prefill else target
         ok, frame = self._seek_read(start)
         if ok and frame is not None:
             self._head = start
             self._push(start, frame)
-            end = target + _FILL_AHEAD
+            end = target + _FILL_AHEAD if prefill else target
             if self.total_frames:
                 end = min(end, self.total_frames - 1)
             while self._head < end:

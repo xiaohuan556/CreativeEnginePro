@@ -174,7 +174,7 @@ class DesktopAccountAdminDialog(QDialog):
         super().__init__(parent)
         self.client = client
         self.accounts: list[dict[str, Any]] = []
-        self.setWindowTitle("CreativeEnginePro · 桌面端账号管理")
+        self.setWindowTitle("小欢ovo · 账号管理")
         self.resize(1040, 650)
         self.setMinimumSize(900, 560)
         self.setObjectName("desktopAccountAdmin")

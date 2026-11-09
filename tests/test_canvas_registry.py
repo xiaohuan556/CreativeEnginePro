@@ -9,8 +9,9 @@ from ai.providers.video.seedance_models import (
 
 def test_desktop_creation_menu_excludes_unbundled_voice_clone():
     assert [row[1] for row in CREATION_ITEMS] == [
-        "文本", "脚本", "图片", "视频", "音频",
+        "通用创作 Agent", "文本", "脚本", "图片", "视频", "音频",
         "短片", "口播", "多图导演", "拉片", "镜头",
+        "Pinterest 元素换图", "图片风格转换", "批量图片高清",
     ]
     assert all(row[0] != "voice_clone" for row in CREATION_ITEMS)
 
@@ -23,6 +24,9 @@ def test_manual_links_use_production_whitelist():
     assert not can_connect("storyboard", "video")
     assert not can_connect("audio", "video")
     assert "video_style_transfer" in NODE_CONNECTION_TARGETS["video"]
+    assert can_connect("video", "ai_editor")
+    assert can_connect("ai_editor", "video")
+    assert infer_node_spec("ai_editor_node", {"creative_agent": True}) == "ai_editor"
 
 
 def test_dangling_wire_choices_keep_semantic_relations():
@@ -36,9 +40,10 @@ def test_dangling_wire_choices_keep_semantic_relations():
     }
     video_choices = connection_create_choices("video", "video")
     assert {row["relation"] for row in video_choices} == {
-        "video_source", "content_video",
+        "video_source", "content_video", "agent_source",
     }
-    assert connection_create_choices("audio", "audio") == []
+    assert [row["target"] for row in connection_create_choices("audio", "audio")] == ["ai_editor"]
+    assert any(row["target"] == "ai_editor" for row in text_choices)
 
 
 def test_text_like_generation_choices_select_runnable_media_actions():

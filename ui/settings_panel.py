@@ -8,12 +8,16 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings
+from PyQt6.QtCore import QSize, Qt, pyqtSignal, QSettings
+from PyQt6.QtGui import QPixmap
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QCheckBox,
     QFrame, QScrollArea, QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox,
     QStackedWidget, QFileDialog,
 )
+
+from ui.widgets.workbench_controls import workbench_icon
+from utils.app_paths import resource_root
 
 
 _DEFAULT_BASE = {
@@ -37,41 +41,55 @@ class SettingsPanel(QWidget):
 
     # ── 布局 ──────────────────────────────────────────────
     def _build(self):
-        self.setStyleSheet("background:#202124;color:#d8dbe2;")
+        self.setObjectName("settingsPanel")
+        self.setStyleSheet(_STYLE)
         root = QHBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
         sidebar = QFrame()
-        sidebar.setFixedWidth(176)
-        sidebar.setStyleSheet("QFrame{background:#17181b;border-right:1px solid #303137;}")
+        sidebar.setObjectName("settingsSidebar")
+        sidebar.setFixedWidth(196)
         side = QVBoxLayout(sidebar)
-        side.setContentsMargins(12, 18, 12, 14)
-        side.setSpacing(6)
-        title = _label("设置", "#f2f3f5", 18, True)
-        side.addWidget(title)
-        subtitle = _label("CreativeEnginePro", "#737782", 9)
-        side.addWidget(subtitle)
-        side.addSpacing(14)
+        side.setContentsMargins(14, 21, 14, 16)
+        side.setSpacing(7)
+        brand = QHBoxLayout()
+        brand.setContentsMargins(3, 0, 0, 0)
+        brand.setSpacing(9)
+        mark = _label("", "settingsBrandIcon")
+        mark.setFixedSize(34, 34)
+        mark.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        logo = QPixmap(str(resource_root() / "assets" / "icon.png"))
+        mark.setPixmap(logo.scaled(
+            24, 24, Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation))
+        brand.addWidget(mark)
+        brand.addWidget(_label("设置中心", "settingsBrand"), 1)
+        side.addLayout(brand)
+        side.addSpacing(15)
+        side.addWidget(_label("全局设置", "settingsNavCaption"))
 
         self.stack = QStackedWidget()
         pages = [
-            ("🤖  AI 引擎", self._build_ai_page()),
-            ("⬇  下载与素材", self._build_download_page()),
-            ("⚡  性能与缓存", self._build_performance_page()),
-            ("ℹ  关于与路径", self._build_about_page()),
+            ("AI 引擎", "sparkles", self._build_ai_page()),
+            ("下载与素材", "download", self._build_download_page()),
+            ("性能与缓存", "sliders-horizontal", self._build_performance_page()),
+            ("关于与路径", "folder-open", self._build_about_page()),
         ]
-        for index, (text, page) in enumerate(pages):
+        for index, (text, icon, page) in enumerate(pages):
             button = QPushButton(text)
+            button.setObjectName("settingsNav")
+            button.setIcon(workbench_icon(icon, "#bfb2fa"))
+            button.setIconSize(QSize(17, 17))
             button.setCheckable(True)
+            button.setAutoDefault(False)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setStyleSheet(_NAV_BUTTON)
             button.clicked.connect(lambda checked=False, i=index: self._switch_page(i))
             self._nav_buttons.append(button)
             side.addWidget(button)
             self.stack.addWidget(page)
         side.addStretch()
-        side.addWidget(_label("业务预设请在对应工作台设置", "#676b74", 9))
+        side.addWidget(_label("业务预设请在对应工作台设置", "settingsSidebarHint", wrap=True))
         root.addWidget(sidebar)
 
         content = QWidget()
@@ -81,21 +99,22 @@ class SettingsPanel(QWidget):
         content_layout.addWidget(self.stack, 1)
 
         actions = QFrame()
-        actions.setStyleSheet("QFrame{background:#191a1d;border-top:1px solid #303137;}")
+        actions.setObjectName("settingsActions")
         action_layout = QHBoxLayout(actions)
-        action_layout.setContentsMargins(18, 10, 18, 10)
-        self.status_label = _label("", "#78c58b", 10)
-        action_layout.addWidget(self.status_label)
-        action_layout.addStretch()
+        action_layout.setContentsMargins(23, 12, 23, 12)
+        action_layout.setSpacing(8)
+        self.status_label = _label("", "settingsStatus", wrap=True)
+        action_layout.addWidget(self.status_label, 1)
         reload_btn = QPushButton("重新加载")
-        reload_btn.setStyleSheet(_SECONDARY_BUTTON)
         reload_btn.clicked.connect(self._load_prefs)
         action_layout.addWidget(reload_btn)
         save_btn = QPushButton("保存设置")
-        save_btn.setObjectName("Primary")
-        save_btn.setStyleSheet(_PRIMARY_BUTTON)
+        save_btn.setObjectName("settingsSave")
         save_btn.clicked.connect(self._save_prefs)
         action_layout.addWidget(save_btn)
+        for button in (reload_btn, save_btn):
+            button.setAutoDefault(False)
+            button.setCursor(Qt.CursorShape.PointingHandCursor)
         content_layout.addWidget(actions)
         root.addWidget(content, 1)
         self._switch_page(0)
@@ -106,19 +125,29 @@ class SettingsPanel(QWidget):
             button.setChecked(i == index)
 
     def _scroll_page(self, title: str, subtitle: str):
+        panel = QWidget()
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(0, 0, 0, 0)
+        panel_layout.setSpacing(0)
+        header = QFrame()
+        header.setObjectName("settingsHeader")
+        heading = QVBoxLayout(header)
+        heading.setContentsMargins(24, 21, 24, 15)
+        heading.setSpacing(5)
+        heading.addWidget(_label(title, "settingsPageTitle"))
+        heading.addWidget(_note(subtitle))
+        panel_layout.addWidget(header)
+
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        scroll.setStyleSheet(_SCROLL)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(22, 20, 22, 24)
-        layout.setSpacing(14)
-        layout.addWidget(_label(title, "#f0f1f4", 18, True))
-        hint = _label(subtitle, "#858a94", 10)
-        hint.setWordWrap(True)
-        layout.addWidget(hint)
+        layout.setContentsMargins(24, 12, 24, 20)
+        layout.setSpacing(12)
         scroll.setWidget(page)
-        return scroll, layout
+        panel_layout.addWidget(scroll, 1)
+        return panel, layout
 
     # ── AI ────────────────────────────────────────────────
     def _build_ai_page(self):
@@ -131,7 +160,6 @@ class SettingsPanel(QWidget):
         self.llm_combo.addItem("ModelHub / OpenAI 兼容", "openai")
         self.llm_combo.addItem("DeepSeek 官方", "deepseek")
         self.llm_combo.addItem("自定义兼容接口", "custom_llm")
-        self.llm_combo.setStyleSheet(_COMBO)
         self.llm_combo.currentIndexChanged.connect(self._on_llm_mode_change)
         _form_row(form, "服务商", self.llm_combo)
         self.llm_model = _line("模型名，如 gpt-5.5 / deepseek-chat")
@@ -140,12 +168,11 @@ class SettingsPanel(QWidget):
         _form_row(form, "LLM Key", self.llm_key)
         self.llm_url = _line("留空使用默认地址")
         _form_row(form, "Base URL", self.llm_url)
-        self.llm_hint = _label("", "#737782", 9)
-        self.llm_hint.setWordWrap(True)
+        self.llm_hint = _note("")
         form.addWidget(self.llm_hint)
         layout.addWidget(llm)
 
-        generation = _card("图片与视频生成", "按实际共用关系配置，避免为同一服务重复填写")
+        generation = _card("图片与视频生成")
         form = generation.layout()
         self.modelhub_key = _line("ModelHub sk-…", password=True)
         _form_row(form, "ModelHub / OpenAI Key", self.modelhub_key)
@@ -154,14 +181,13 @@ class SettingsPanel(QWidget):
         _form_row(form, "豆包 Ark Key", self.ark_key)
         form.addWidget(_note("Seedream 与 Seedance 共用这一枚 Key。"))
         self.show_keys = QCheckBox("显示密钥")
-        self.show_keys.setStyleSheet(_CHECK)
         self.show_keys.toggled.connect(self._toggle_keys)
         form.addWidget(self.show_keys)
         layout.addWidget(generation)
 
-        voice_note = _card("配音服务", "音色、TTS 引擎和配音 Key 在剪辑工作台的「配音」面板统一管理。")
-        voice_note.layout().addWidget(_note("这里不重复放置配音参数，避免两边配置不一致。"))
-        layout.addWidget(voice_note)
+        layout.addWidget(_label(
+            "配音服务 · 在剪辑工作台的「配音」面板管理音色、引擎和密钥。",
+            "settingsCallout", wrap=True))
         layout.addStretch()
         return scroll
 
@@ -173,22 +199,19 @@ class SettingsPanel(QWidget):
         form = paths.layout()
         self.download_dir = _line("选择视频和音频的保存目录")
         browse = QPushButton("选择目录")
-        browse.setStyleSheet(_SECONDARY_BUTTON)
         browse.clicked.connect(self._pick_download_dir)
-        _form_row_with_button(form, "下载目录", self.download_dir, browse)
+        _form_row(form, "下载目录", self.download_dir, browse)
         layout.addWidget(paths)
 
         login = _card("登录态与站点兼容", "YouTube、TikTok、抖音等站点可能需要登录 Cookie")
         form = login.layout()
         self.cookies_file = _line("Netscape cookies.txt（可选）")
         cookie_btn = QPushButton("选择文件")
-        cookie_btn.setStyleSheet(_SECONDARY_BUTTON)
         cookie_btn.clicked.connect(self._pick_cookie_file)
-        _form_row_with_button(form, "Cookie 文件", self.cookies_file, cookie_btn)
+        _form_row(form, "Cookie 文件", self.cookies_file, cookie_btn)
         self.browser_status = _note("浏览器检测：尚未检测")
         form.addWidget(self.browser_status)
         detect_btn = QPushButton("重新检测浏览器")
-        detect_btn.setStyleSheet(_SECONDARY_BUTTON)
         detect_btn.clicked.connect(lambda: self._refresh_browser_status(True))
         form.addWidget(detect_btn, alignment=Qt.AlignmentFlag.AlignLeft)
         layout.addWidget(login)
@@ -208,21 +231,18 @@ class SettingsPanel(QWidget):
         self.spin_buffer = QSpinBox()
         self.spin_buffer.setRange(4, 120)
         self.spin_buffer.setSingleStep(2)
-        self.spin_buffer.setStyleSheet(_SPIN)
         _form_row(form, "解码缓冲帧", self.spin_buffer)
         form.addWidget(_note("数值越大播放越稳，但会占用更多内存。推荐 24。"))
         self.spin_thumb = QSpinBox()
         self.spin_thumb.setRange(80, 640)
         self.spin_thumb.setSingleStep(20)
         self.spin_thumb.setSuffix(" px")
-        self.spin_thumb.setStyleSheet(_SPIN)
         _form_row(form, "缩略图宽度", self.spin_thumb)
         layout.addWidget(performance)
 
         cache = _card("缓存管理", "Cache 与 work_temp 的自动清理策略")
         form = cache.layout()
         self.cache_enable = QCheckBox("启用启动时自动清理")
-        self.cache_enable.setStyleSheet(_CHECK)
         self.cache_enable.toggled.connect(self._on_cache_toggle)
         form.addWidget(self.cache_enable)
         self.spin_cache = QDoubleSpinBox()
@@ -230,7 +250,6 @@ class SettingsPanel(QWidget):
         self.spin_cache.setSingleStep(0.5)
         self.spin_cache.setDecimals(1)
         self.spin_cache.setSuffix(" GB")
-        self.spin_cache.setStyleSheet(_SPIN)
         _form_row(form, "占用阈值", self.spin_cache)
         self.cache_readout = _note("当前占用：计算中…")
         form.addWidget(self.cache_readout)
@@ -242,7 +261,7 @@ class SettingsPanel(QWidget):
     def _build_about_page(self):
         scroll, layout = self._scroll_page(
             "关于与路径", "查看配置位置，明确哪些设置应在哪个工作台完成。")
-        about = _card("CreativeEnginePro", "面向批量内容生产的剪辑、AI 生成和自动化工作台")
+        about = _card("小欢ovo", "面向批量内容创作的剪辑、AI 生成和自动化工作台")
         form = about.layout()
         from api_config import ENV_PATH
         from utils.app_paths import install_root, work_root
@@ -311,6 +330,12 @@ class SettingsPanel(QWidget):
         if not checked:
             self.spin_cache.setValue(0.0)
 
+    def _set_status(self, message: str, *, warning: bool = False):
+        self.status_label.setProperty("warning", warning)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
+        self.status_label.setText(message)
+
     def _load_prefs(self):
         from api_config import read_env
         import config
@@ -347,8 +372,7 @@ class SettingsPanel(QWidget):
         self._on_llm_mode_change()
         self._update_cache_readout()
         self._refresh_browser_status()
-        self.status_label.setStyleSheet("color:#78c58b;font-size:10px;")
-        self.status_label.setText("已重新加载当前配置")
+        self._set_status("已加载当前设置")
 
     def _save_prefs(self):
         from api_config import write_env
@@ -361,17 +385,14 @@ class SettingsPanel(QWidget):
         download_dir = self.download_dir.text().strip()
         cookie_file = self.cookies_file.text().strip()
         if mode == "custom_llm" and not url:
-            self.status_label.setStyleSheet("color:#e6a15c;font-size:10px;")
-            self.status_label.setText("自定义 LLM 必须填写 Base URL")
+            self._set_status("自定义 LLM 必须填写 Base URL", warning=True)
             return
         if download_dir and not os.path.isdir(download_dir):
-            self.status_label.setStyleSheet("color:#e6a15c;font-size:10px;")
-            self.status_label.setText("下载目录不存在，请重新选择")
+            self._set_status("下载目录不存在，请重新选择", warning=True)
             self._switch_page(1)
             return
         if cookie_file and not os.path.isfile(cookie_file):
-            self.status_label.setStyleSheet("color:#e6a15c;font-size:10px;")
-            self.status_label.setText("Cookie 文件不存在，请重新选择或清空")
+            self._set_status("Cookie 文件不存在，请重新选择或清空", warning=True)
             self._switch_page(1)
             return
         if mode == "custom_llm":
@@ -440,8 +461,7 @@ class SettingsPanel(QWidget):
             pass
 
         self._update_cache_readout()
-        self.status_label.setStyleSheet("color:#78c58b;font-size:10px;")
-        self.status_label.setText("设置已保存；AI Key 变更后建议重启程序")
+        self._set_status("设置已保存。密钥变更后建议重启程序。")
         self.settings_saved.emit({"download_dir": download_dir, "cookies_file": cookie_file})
 
     def _current_cache_bytes(self):
@@ -463,23 +483,21 @@ class SettingsPanel(QWidget):
 
 
 # ── 组件辅助 ──────────────────────────────────────────────
-def _label(text, color="#d8dbe2", size=11, bold=False):
+def _label(text, name, *, wrap=False):
     widget = QLabel(text)
-    widget.setStyleSheet(
-        f"color:{color};font-size:{size}px;" + ("font-weight:600;" if bold else ""))
+    widget.setTextFormat(Qt.TextFormat.PlainText)
+    widget.setObjectName(name)
+    widget.setWordWrap(wrap)
     return widget
 
 
 def _note(text):
-    widget = _label(text, "#7f8490", 9)
-    widget.setWordWrap(True)
-    return widget
+    return _label(text, "settingsNote", wrap=True)
 
 
 def _line(placeholder="", password=False):
     widget = QLineEdit()
     widget.setPlaceholderText(placeholder)
-    widget.setStyleSheet(_INPUT)
     if password:
         widget.setEchoMode(QLineEdit.EchoMode.Password)
     return widget
@@ -487,80 +505,111 @@ def _line(placeholder="", password=False):
 
 def _card(title, subtitle=""):
     card = QFrame()
-    card.setStyleSheet(_CARD)
+    card.setObjectName("settingsCard")
     layout = QVBoxLayout(card)
-    layout.setContentsMargins(14, 12, 14, 14)
-    layout.setSpacing(9)
-    layout.addWidget(_label(title, "#e9eaed", 12, True))
+    layout.setContentsMargins(15, 13, 15, 14)
+    layout.setSpacing(8)
+    layout.addWidget(_label(title, "settingsCardTitle"))
     if subtitle:
         layout.addWidget(_note(subtitle))
     return card
 
 
-def _form_row(layout, label, widget):
+def _form_row(layout, label, widget, button=None):
     row = QHBoxLayout()
-    row.setSpacing(12)
-    text = _label(label, "#abb0ba", 10)
+    row.setSpacing(10)
+    text = _label(label, "settingsField", wrap=True)
     text.setFixedWidth(138)
+    text.setBuddy(widget)
     row.addWidget(text)
     row.addWidget(widget, 1)
-    layout.addLayout(row)
-
-
-def _form_row_with_button(layout, label, widget, button):
-    row = QHBoxLayout()
-    row.setSpacing(8)
-    text = _label(label, "#abb0ba", 10)
-    text.setFixedWidth(138)
-    row.addWidget(text)
-    row.addWidget(widget, 1)
-    row.addWidget(button)
+    if button is not None:
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        row.addWidget(button)
     layout.addLayout(row)
 
 
 def _path_line(label, path):
-    widget = _label(f"{label}：{Path(path)}", "#9aa0aa", 10)
+    widget = _label(f"{label}：{Path(path)}", "settingsField", wrap=True)
     widget.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-    widget.setWordWrap(True)
     return widget
 
 
-_NAV_BUTTON = (
-    "QPushButton{text-align:left;padding:9px 10px;border:none;border-radius:6px;"
-    "background:transparent;color:#9297a1;font-size:11px;}"
-    "QPushButton:hover{background:#25272c;color:#d8dbe2;}"
-    "QPushButton:checked{background:#27364d;color:#78aef8;font-weight:600;}"
-)
-_CARD = "QFrame{background:#292b30;border:1px solid #383b42;border-radius:9px;}"
-_INPUT = (
-    "QLineEdit{background:#18191c;border:1px solid #3d4048;border-radius:6px;"
-    "color:#e1e3e7;padding:7px 9px;font-size:11px;}"
-    "QLineEdit:focus{border-color:#4d91f7;}"
-)
-_COMBO = (
-    "QComboBox{background:#18191c;border:1px solid #3d4048;border-radius:6px;"
-    "color:#e1e3e7;padding:6px 8px;font-size:11px;}"
-    "QComboBox QAbstractItemView{background:#202124;color:#ddd;selection-background-color:#315d9b;}"
-)
-_SPIN = (
-    "QSpinBox,QDoubleSpinBox{background:#18191c;border:1px solid #3d4048;border-radius:6px;"
-    "color:#e1e3e7;padding:6px 8px;min-width:90px;}"
-)
-_CHECK = (
-    "QCheckBox{color:#c6c9d0;font-size:10px;spacing:7px;}"
-    "QCheckBox::indicator{width:15px;height:15px;background:#18191c;border:1px solid #454952;border-radius:3px;}"
-    "QCheckBox::indicator:checked{background:#3d8ef8;border-color:#3d8ef8;}"
-)
-_PRIMARY_BUTTON = (
-    "QPushButton{background:#3d8ef8;color:white;border:none;border-radius:6px;"
-    "padding:8px 18px;font-weight:600;}QPushButton:hover{background:#559df7;}"
-)
-_SECONDARY_BUTTON = (
-    "QPushButton{background:#2b2d32;color:#c5c8cf;border:1px solid #41444c;"
-    "border-radius:6px;padding:7px 12px;}QPushButton:hover{border-color:#5a94e8;color:white;}"
-)
-_SCROLL = (
-    "QScrollArea{background:#202124;border:none;}"
-    "QScrollBar:vertical{background:#202124;width:7px;}"
-    "QScrollBar::handle:vertical{background:#454850;border-radius:3px;min-height:30px;}"
-)
+_STYLE = """
+    QWidget#settingsPanel { background: #0d111c; }
+    #settingsPanel QWidget { background: transparent; color: #e9edf8; }
+    #settingsPanel QFrame#settingsSidebar { background: #111625; border-right: 1px solid #283149; }
+    #settingsPanel QLabel#settingsBrandIcon { background: #eae9ff; border-radius: 9px; }
+    #settingsPanel QLabel#settingsBrand { color: #f5f5ff; font-size: 17px; font-weight: 700; }
+    #settingsPanel QLabel#settingsNavCaption { color: #a1adc5; padding: 0 8px; font-size: 11px; }
+    #settingsPanel QLabel#settingsSidebarHint {
+        color: #aab5ce; background: #192033; border: 1px solid #2b354d;
+        border-radius: 9px; padding: 9px; font-size: 11px;
+    }
+    #settingsPanel QFrame#settingsHeader { border-bottom: 1px solid #232c40; }
+    #settingsPanel QLabel#settingsPageTitle { color: #f6f7ff; font-size: 26px; font-weight: 700; }
+    #settingsPanel QFrame#settingsCard { background: #151b2a; border: 1px solid #2b354c; border-radius: 12px; }
+    #settingsPanel QLabel#settingsCardTitle { color: #f0efff; font-size: 15px; font-weight: 700; }
+    #settingsPanel QLabel#settingsNote { color: #a0adc5; font-size: 12px; }
+    #settingsPanel QLabel#settingsCallout {
+        background: #191d30; color: #bbc4dc; border: 1px solid #323b55;
+        border-radius: 9px; padding: 10px 13px; font-size: 12px;
+    }
+    #settingsPanel QLabel#settingsField { color: #d1d9ec; font-size: 12px; }
+    #settingsPanel QLineEdit, #settingsPanel QComboBox,
+    #settingsPanel QSpinBox, #settingsPanel QDoubleSpinBox {
+        background: #101625; color: #f0f2ff; border: 1px solid #3b4560;
+        border-radius: 8px; padding: 0 10px; min-height: 32px; font-size: 13px;
+        selection-background-color: #6759a7; selection-color: #fff;
+    }
+    #settingsPanel QLineEdit:focus, #settingsPanel QComboBox:focus,
+    #settingsPanel QSpinBox:focus, #settingsPanel QDoubleSpinBox:focus { border-color: #ab98f8; }
+    #settingsPanel QLineEdit:disabled, #settingsPanel QSpinBox:disabled,
+    #settingsPanel QDoubleSpinBox:disabled { color: #8590a9; border-color: #30384c; }
+    #settingsPanel QSpinBox QLineEdit, #settingsPanel QDoubleSpinBox QLineEdit {
+        background: transparent; border: none; padding: 0; min-height: 0;
+    }
+    #settingsPanel QComboBox { padding-right: 34px; }
+    #settingsPanel QComboBox::drop-down { width: 30px; border: none; }
+    #settingsPanel QComboBox::down-arrow { image: url("__CHEVRON__"); width: 12px; height: 12px; }
+    #settingsPanel QComboBox QAbstractItemView {
+        background: #1a2235; color: #e9edf8; border: 1px solid #495573;
+        selection-background-color: #393057; selection-color: #fff; outline: 0;
+    }
+    #settingsPanel QCheckBox { color: #dce3f6; spacing: 7px; font-size: 12px; }
+    #settingsPanel QScrollArea { border: none; padding: 0; }
+    #settingsPanel QScrollBar:vertical { width: 8px; background: #111625; margin: 0; }
+    #settingsPanel QScrollBar::handle:vertical {
+        background: #414c69; border-radius: 4px; min-height: 28px;
+    }
+    #settingsPanel QScrollBar::add-line:vertical, #settingsPanel QScrollBar::sub-line:vertical { height: 0; }
+    #settingsPanel QScrollBar::add-page:vertical, #settingsPanel QScrollBar::sub-page:vertical {
+        background: transparent;
+    }
+    #settingsPanel QPushButton {
+        background: #20283b; color: #dce3f6; border: 1px solid #414d69;
+        border-radius: 8px; min-height: 34px; padding: 0 12px; font-size: 12px; font-weight: 600;
+    }
+    #settingsPanel QPushButton:hover { background: #2b3551; border-color: #6c7ba3; }
+    #settingsPanel QPushButton:pressed { background: #161e31; }
+    #settingsPanel QPushButton:focus { border-color: #bcadff; }
+    #settingsPanel QPushButton:disabled { color: #8590a9; border-color: #30384c; }
+    #settingsPanel QPushButton#settingsNav {
+        text-align: left; background: transparent; border: 1px solid transparent;
+        padding: 0 10px; min-height: 39px; font-size: 13px;
+    }
+    #settingsPanel QPushButton#settingsNav:hover { background: #20283d; }
+    #settingsPanel QPushButton#settingsNav:checked {
+        color: #f2ebff; background: #2c2547; border-color: #5c4c83;
+    }
+    #settingsPanel QPushButton#settingsNav:focus { border-color: #bcadff; }
+    #settingsPanel QFrame#settingsActions { background: #111625; border-top: 1px solid #293249; }
+    #settingsPanel QLabel#settingsStatus { color: #a3dbbf; font-size: 12px; }
+    #settingsPanel QLabel#settingsStatus[warning="true"] { color: #f3c792; }
+    #settingsPanel QPushButton#settingsSave {
+        background: #b6a6ff; color: #211938; border-color: #c5b8ff; padding: 0 17px; font-weight: 700;
+    }
+    #settingsPanel QPushButton#settingsSave:hover { background: #c8bcff; }
+    #settingsPanel QPushButton#settingsSave:pressed { background: #a294e8; }
+    #settingsPanel QPushButton#settingsSave:focus { border-color: #f2eaff; }
+""".replace("__CHEVRON__", (resource_root() / "assets" / "batch-combo-chevron.svg").as_posix())

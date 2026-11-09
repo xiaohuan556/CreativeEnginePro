@@ -8,6 +8,8 @@ media_library.py — 素材库面板（剪映风格卡片网格）
 - 支持：拖拽加入时间线、双击预览、右键加入/移除、从文件管理器拖入导入
 """
 from __future__ import annotations
+from collections import deque
+import json
 import os
 import re
 import sys
@@ -20,10 +22,11 @@ from PyQt6.QtWidgets import (
     QGridLayout, QScrollArea,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QMimeData, QPoint, QUrl, QThread
-from PyQt6.QtGui import (QIcon, QPixmap, QColor, QDrag, QImage, QFontMetrics,
+from PyQt6.QtGui import (QIcon, QPixmap, QColor, QDrag, QImage, QImageReader, QFontMetrics,
                          QPainter, QFont, QDesktopServices)
 
 from core.edit_engine import EditTimeline, VideoClip, AudioClip
+from ui.widgets.workbench_controls import CUT_ACCENT, workbench_button
 import cv2
 
 try:
@@ -65,7 +68,7 @@ def _is_supported_media(path: str) -> bool:
     return _get_media_type(path) in ("video", "audio", "image")
 
 
-def _make_thumbnail(path: str, media_type: str, size=None) -> QPixmap:
+def _make_thumbnail(path: str, media_type: str, size=None) -> QImage:
     """生成 16:9 缩略图（在后台线程中调用）。size 为 None 时使用 config.THUMB_SIZE。"""
     if size is None:
         W = THUMB_SIZE
@@ -84,18 +87,19 @@ def _make_thumbnail(path: str, media_type: str, size=None) -> QPixmap:
                 h, w, ch = frame_rgb.shape
                 qimg = QImage(frame_rgb.data, w, h, ch * w,
                               QImage.Format.Format_RGB888).copy()
-                return QPixmap.fromImage(qimg).scaled(
+                return qimg.scaled(
                     W, H, Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation
                 )
         elif media_type == "image":
-            return QPixmap(path).scaled(
-                W, H, Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation
-            )
+            reader = QImageReader(path)
+            dimensions = reader.size()
+            if dimensions.isValid():
+                reader.setScaledSize(dimensions.scaled(W, H, Qt.AspectRatioMode.KeepAspectRatio))
+            return reader.read()
     except Exception:
         pass
-    return _make_placeholder(media_type, size)
+    return QImage()
 
 
 def _make_placeholder(media_type: str, size=(THUMB_W, THUMB_H)) -> QPixmap:
@@ -120,16 +124,19 @@ def _get_duration(path: str, media_type: str) -> float:
     优先级：ffprobe（最准）→ ffmpeg -i 解析 stderr（ffmpeg.exe 必然存在）→ cv2 回退。
     项目缺少 ffprobe.exe 时，纯音频用 cv2 会返回 0，因此必须有 ffmpeg 回退。
     """
+    if media_type == "image":
+        return 0.0
+    creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
     # 1) ffprobe
     try:
-        import subprocess, json
         from utils.ffmpeg_utils import get_ffmpeg_path
         ffprobe = get_ffmpeg_path().replace("ffmpeg.exe", "ffprobe.exe")
         if not os.path.exists(ffprobe):
             ffprobe = "ffprobe"
         r = subprocess.run(
             [ffprobe, "-v", "quiet", "-print_format", "json", "-show_format", path],
-            capture_output=True, timeout=15, encoding="utf-8", errors="ignore")
+            capture_output=True, timeout=15, encoding="utf-8", errors="ignore",
+            creationflags=creationflags)
         if r.returncode == 0:
             info = json.loads(r.stdout)
             dur = float(info.get("format", {}).get("duration", 0) or 0)
@@ -139,12 +146,12 @@ def _get_duration(path: str, media_type: str) -> float:
         pass
     # 2) ffmpeg -i 解析 stderr（ffmpeg.exe 必存在）
     try:
-        import subprocess
         from utils.ffmpeg_utils import get_ffmpeg_path
         ffmpeg = get_ffmpeg_path()
         if os.path.exists(ffmpeg):
             r = subprocess.run([ffmpeg, "-i", path], capture_output=True,
-                               timeout=15, encoding="utf-8", errors="ignore")
+                               timeout=15, encoding="utf-8", errors="ignore",
+                               creationflags=creationflags)
             out = (r.stderr or "") + (r.stdout or "")
             m = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", out)
             if m:
@@ -170,20 +177,25 @@ def _get_duration(path: str, media_type: str) -> float:
 
 class MediaItem:
     """素材元数据"""
-    def __init__(self, path: str):
+    def __init__(self, path: str, duration: Optional[float] = None):
         self.path = path
         self.name = os.path.basename(path)
         self.media_type = _get_media_type(path)
-        self._duration: Optional[float] = None
-        self._duration_loaded = False
+        self._duration = duration
         self._thumbnail: Optional[QPixmap] = None
 
     @property
     def duration(self) -> float:
-        if not self._duration_loaded:
+        if self._duration is None:
             self._duration = _get_duration(self.path, self.media_type)
-            self._duration_loaded = True
         return self._duration or 0.0
+
+    @property
+    def cached_duration(self) -> Optional[float]:
+        return self._duration
+
+    def set_duration(self, duration: float):
+        self._duration = duration
 
     @property
     def thumbnail(self) -> Optional[QPixmap]:
@@ -196,18 +208,23 @@ class MediaItem:
 
 # ─── 后台缩略图生成线程 ───
 class _ThumbWorker(QThread):
-    thumb_ready = pyqtSignal(str, QPixmap)
+    thumb_ready = pyqtSignal(object, QImage)
+    duration_ready = pyqtSignal(object, float)
 
-    def __init__(self, path: str, media_type: str, size=(THUMB_W, THUMB_H)):
+    def __init__(self, media: MediaItem, size=(THUMB_W, THUMB_H)):
         super().__init__()
-        self._path = path
-        self._media_type = media_type
+        self._media = media
+        self._probe_duration = media.cached_duration is None
         self._size = size
 
     def run(self):
         try:
-            pix = _make_thumbnail(self._path, self._media_type, self._size)
-            self.thumb_ready.emit(self._path, pix)
+            path, media_type = self._media.path, self._media.media_type
+            if self._probe_duration:
+                self.duration_ready.emit(self._media, _get_duration(path, media_type))
+            image = _make_thumbnail(path, media_type, None if media_type == "image" else self._size)
+            if not image.isNull():
+                self.thumb_ready.emit(self._media, image)
         except Exception:
             pass
 
@@ -229,10 +246,10 @@ class _MediaCard(QFrame):
         self.setObjectName("mediaCard")
         self.setStyleSheet("""
             QFrame#mediaCard {
-                background:#20242b; border:1px solid #2c313a; border-radius:8px;
+                background:#21242d; border:1px solid #343844; border-radius:8px;
             }
             QFrame#mediaCard:hover {
-                border:1px solid #3d8ef8; background:#242a33;
+                border:1px solid #65def1; background:#272c37;
             }
         """)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
@@ -287,11 +304,12 @@ class _MediaCard(QFrame):
         self._name_label.setText(self._media.name)
         lay.addWidget(self._name_label)
 
-        # 时长（懒加载一次）
-        dur = self._media.duration
-        self._dur_badge.setText(f"{dur:.1f}s" if dur > 0 else "")
+        self.set_duration(self._media.cached_duration)
 
     # ── 公开接口 ──
+    def set_duration(self, duration: Optional[float]):
+        self._dur_badge.setText(f"{duration:.1f}s" if duration and duration > 0 else "")
+
     def set_thumbnail(self, pix: QPixmap):
         self._apply_thumb(pix)
 
@@ -383,7 +401,8 @@ class _MediaCard(QFrame):
     def _start_drag(self):
         mime = QMimeData()
         mime.setUrls([QUrl.fromLocalFile(self._media.path)])
-        mime.setText(f"{self._media.path}||{self._media.media_type}||{self._media.duration}")
+        duration = self._media.cached_duration
+        mime.setText(f"{self._media.path}||{self._media.media_type}||{duration if duration is not None else -1}")
         drag = QDrag(self)
         drag.setMimeData(mime)
         try:
@@ -416,6 +435,7 @@ class MediaLibrary(QWidget):
     add_to_timeline_requested = pyqtSignal(str, str, float)
     play_preview_requested = pyqtSignal(str, str)
     file_removed = pyqtSignal(str)
+    duration_available = pyqtSignal()
 
     COL_MIN_W = 110          # 单列最小宽度（决定列数）
     SPACING = 10             # 卡片间距（统一）
@@ -427,6 +447,7 @@ class MediaLibrary(QWidget):
         self._cards: list[_MediaCard] = []
         self._card_map: dict[str, _MediaCard] = {}
         self._workers: list[_ThumbWorker] = []
+        self._pending_thumbnails: deque[MediaItem] = deque()
         self.last_selected_path: str = ""
         self._build_ui()
 
@@ -435,38 +456,27 @@ class MediaLibrary(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # 标题
-        title = QLabel("素材库")
-        title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        title.setFixedHeight(28)
-        title.setStyleSheet(
-            "background:#1a1a1a; color:#aaa; font-size:12px; font-weight:500;"
-            " border-bottom:1px solid #333;")
-        root.addWidget(title)
-
-        # 按钮行
         btn_bar = QWidget()
-        btn_bar.setFixedHeight(34)
-        btn_bar.setStyleSheet("background:#1e1e1e; border-bottom:1px solid #333;")
+        btn_bar.setObjectName("mediaLibraryToolbar")
+        btn_bar.setFixedHeight(40)
+        btn_bar.setStyleSheet("QWidget#mediaLibraryToolbar{background:#1c1e23;border-bottom:1px solid #30323b;}")
         btn_lay = QHBoxLayout(btn_bar)
-        btn_lay.setContentsMargins(6, 4, 6, 4)
-        btn_lay.setSpacing(4)
-        btn_style = """
-            QPushButton { background:#2a2a2a; color:#bbb; border:1px solid #444;
-                border-radius:3px; padding:2px 8px; font-size:11px; }
-            QPushButton:hover { background:#3a3a3a; color:#fff; }
-        """
-        btn_import = QPushButton("📁 导入素材")
-        btn_import.setStyleSheet(btn_style)
+        btn_lay.setContentsMargins(8, 4, 8, 4)
+        btn_lay.setSpacing(6)
+        btn_import = workbench_button("导入素材", "folder-open", "从电脑导入图片、视频或音频",
+                                      accent=CUT_ACCENT, primary=True)
         btn_import.clicked.connect(self._import_files)
         btn_lay.addWidget(btn_import)
         btn_lay.addStretch()
+        self._item_count = QLabel("0 项")
+        self._item_count.setStyleSheet("color:#a8abb8;font-size:11px;")
+        btn_lay.addWidget(self._item_count)
         root.addWidget(btn_bar)
 
         # 卡片网格滚动区
         self._scroll = _MediaScroll()
         self._grid_widget = QWidget()
-        self._grid_widget.setStyleSheet("background:#1e1e1e;")
+        self._grid_widget.setStyleSheet("background:#1c1e23;")
         self._grid = QGridLayout(self._grid_widget)
         self._grid.setContentsMargins(self.SPACING, self.SPACING, self.SPACING, self.SPACING)
         self._grid.setHorizontalSpacing(self.SPACING)
@@ -479,7 +489,7 @@ class MediaLibrary(QWidget):
         hint = QLabel("双击预览 · 拖入或拖出 · 右键管理")
         hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
         hint.setFixedHeight(20)
-        hint.setStyleSheet("color:#555; font-size:10px; border-top:1px solid #2a2a2a;")
+        hint.setStyleSheet("color:#a8abb8;font-size:11px;border-top:1px solid #30323b;")
         root.addWidget(hint)
 
     # ─── 拖入导入（从文件管理器）───
@@ -530,9 +540,12 @@ class MediaLibrary(QWidget):
         for f in files:
             self._add_item(f)
 
-    def add_file(self, path: str) -> bool:
+    def add_file(self, path: str, *, duration: Optional[float] = None) -> bool:
         """加入单个素材；非视频/音频/图片返回 False 且不进入素材库。"""
-        return self._add_item(path)
+        return self._add_item(path, duration=duration)
+
+    def media_item(self, path: str) -> Optional[MediaItem]:
+        return self._item_map.get(self._norm_key(path))
 
     def _norm_key(self, path: str) -> str:
         """归一化路径去重键：绝对路径 + Windows 大小写不敏感"""
@@ -541,7 +554,7 @@ class MediaLibrary(QWidget):
             return os.path.normcase(p)
         return p
 
-    def _add_item(self, path: str) -> bool:
+    def _add_item(self, path: str, *, duration: Optional[float] = None) -> bool:
         if not os.path.isfile(path) or not _is_supported_media(path):
             logging.info("素材库已忽略不支持的文件类型: %s", path)
             return False
@@ -549,7 +562,7 @@ class MediaLibrary(QWidget):
         if key in self._item_map:
             return False
 
-        media = MediaItem(path)
+        media = MediaItem(path, duration=duration)
         self._items.append(media)
         self._item_map[key] = media
 
@@ -565,7 +578,7 @@ class MediaLibrary(QWidget):
         self._cards.append(card)
         self._card_map[key] = card
         self._reflow()
-        self._start_thumb_worker(media, key)
+        self._start_thumb_worker(media)
         return True
 
     def _on_select(self, path: str):
@@ -613,32 +626,41 @@ class MediaLibrary(QWidget):
         self.file_removed.emit(path)
         self._reflow()
 
-    def _start_thumb_worker(self, media: MediaItem, key: str = ""):
-        if media.media_type == "image":
-            try:
-                pix = _make_thumbnail(media.path, media.media_type)
-                media.thumbnail = pix
-                card = self._card_map.get(key or self._norm_key(media.path))
-                if card:
-                    card.set_thumbnail(pix)
-                return
-            except Exception:
-                pass
-        worker = _ThumbWorker(media.path, media.media_type)
-        worker.thumb_ready.connect(self._on_thumb_ready)
-        worker.finished.connect(
-            lambda w=worker: self._workers.remove(w) if w in self._workers else None)
-        self._workers.append(worker)
-        worker.start()
+    def _start_thumb_worker(self, media: MediaItem):
+        self._pending_thumbnails.append(media)
+        self._start_pending_thumbnails()
 
-    def _on_thumb_ready(self, path: str, pix: QPixmap):
-        key = self._norm_key(path)
-        media = self._item_map.get(key)
-        if media:
+    def _start_pending_thumbnails(self):
+        while self._pending_thumbnails and len(self._workers) < 2:
+            media = self._pending_thumbnails.popleft()
+            if self.media_item(media.path) is not media:
+                continue
+            worker = _ThumbWorker(media)
+            worker.duration_ready.connect(self._on_duration_ready)
+            worker.thumb_ready.connect(self._on_thumb_ready)
+            worker.finished.connect(self._on_thumb_finished)
+            self._workers.append(worker)
+            worker.start()
+
+    def _on_thumb_finished(self):
+        worker = self.sender()
+        self._workers.remove(worker)
+        worker.deleteLater()
+        self._start_pending_thumbnails()
+
+    def _on_duration_ready(self, media: MediaItem, duration: float):
+        key = self._norm_key(media.path)
+        if self._item_map.get(key) is media:
+            media.set_duration(duration)
+            self._card_map[key].set_duration(duration)
+            self.duration_available.emit()
+
+    def _on_thumb_ready(self, media: MediaItem, image: QImage):
+        key = self._norm_key(media.path)
+        if self._item_map.get(key) is media:
+            pix = QPixmap.fromImage(image)
             media.thumbnail = pix
-        card = self._card_map.get(key)
-        if card:
-            card.set_thumbnail(pix)
+            self._card_map[key].set_thumbnail(pix)
 
     # ─── 列重排 ───
     COL_MAX_W = 150           # 单列最大宽度（避免宽屏下卡片过大，"不大不小"）
@@ -648,6 +670,7 @@ class MediaLibrary(QWidget):
         return 3
 
     def _reflow(self):
+        self._item_count.setText(f"{len(self._items)} 项")
         if not self._cards:
             return
         cols = self._compute_cols()
@@ -705,6 +728,7 @@ class MediaLibrary(QWidget):
 
     def clear_and_load_paths(self, paths: list):
         # 清空
+        self._pending_thumbnails.clear()
         for c in self._cards:
             self._grid.removeWidget(c)
             c.deleteLater()
@@ -712,6 +736,7 @@ class MediaLibrary(QWidget):
         self._card_map.clear()
         self._items.clear()
         self._item_map.clear()
+        self._item_count.setText("0 项")
         for p in paths:
             if os.path.exists(p):
                 self._add_item(p)

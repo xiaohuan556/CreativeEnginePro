@@ -13,13 +13,13 @@ VSVersionInfo(
   kids=[
     StringFileInfo([
       StringTable('080404B0', [
-        StringStruct('CompanyName', 'CreativeEnginePro'),
-        StringStruct('FileDescription', 'CreativeEnginePro AI 制片桌面端'),
+        StringStruct('CompanyName', '小欢ovo'),
+        StringStruct('FileDescription', '小欢ovo AI 创作工作台'),
         StringStruct('FileVersion', '1.0.0'),
         StringStruct('InternalName', 'CreativeEnginePro'),
         StringStruct('LegalCopyright', 'Copyright (C) 2026'),
         StringStruct('OriginalFilename', 'CreativeEnginePro.exe'),
-        StringStruct('ProductName', 'CreativeEnginePro'),
+        StringStruct('ProductName', '小欢ovo'),
         StringStruct('ProductVersion', '1.0.0')
       ])
     ]),

@@ -19,6 +19,11 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
 from .widgets import CheckMarkBox
+from .widgets.workbench_controls import (
+    CUT_ACCENT, batch_options_scroll, batch_workbench_style, set_workbench_playback, workbench_button,
+    workbench_icon, workbench_section_heading, workbench_tabs_style,
+)
+from .duo_delivery import offer_duo_export
 from PyQt6.QtGui import QColor, QDragEnterEvent, QDropEvent, QPainter, QPen
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtMultimediaWidgets import QVideoWidget
@@ -47,6 +52,7 @@ class MixWorkerThread(QThread):
         self.target_h      = target_h
         self.ffmpeg_path   = ffmpeg_path
         self._is_running   = True
+        self.completed_paths = []
 
     def stop(self):
         self._is_running = False
@@ -88,6 +94,8 @@ class MixWorkerThread(QThread):
                 out_path=out_path, total_duration=self.total_dur,
                 target_w=self.target_w, target_h=self.target_h,
             )
+            if ok:
+                self.completed_paths.append(out_path)
             self.progress_signal.emit(i + 1, total)
             self.log_signal.emit(
                 f"{'完成' if ok else '失败'} [{i+1}/{total}] {name}.mp4")
@@ -198,6 +206,8 @@ class MixHandler:
         self._mix_worker     = None
 
         root_w = QWidget()
+        root_w.setObjectName("batchWorkbench")
+        root_w.setStyleSheet(batch_workbench_style(CUT_ACCENT))
         root_w.setAcceptDrops(True)
         root_w.dragEnterEvent = self._mix_drag_enter
         root_w.dropEvent      = self._mix_drop
@@ -237,18 +247,15 @@ class MixHandler:
         ll.setSpacing(6)
         ll.setContentsMargins(0, 0, 0, 0)
 
-        title = QLabel("素材库")
-        title.setStyleSheet("font-weight:bold; font-size:15px; color:#e0e0e0;")
-        ll.addWidget(title)
+        ll.addWidget(workbench_section_heading("素材库", "folder-open", CUT_ACCENT))
 
         hint = QLabel("拖拽视频到对应标签页  |  可为每条素材设定可用区间")
-        hint.setStyleSheet("color:#555; font-size:11px;")
+        hint.setStyleSheet("color:#a8abb8;font-size:11px;")
         hint.setWordWrap(True)
         ll.addWidget(hint)
 
         # 模式选择
         mode_grp = QGroupBox("混剪模式")
-        mode_grp.setStyleSheet(self._grp_style("#00eaff"))
         mgl = QVBoxLayout(mode_grp)
         mgl.setSpacing(6)
 
@@ -276,11 +283,8 @@ class MixHandler:
         from PyQt6.QtWidgets import QTabWidget
         tabs = QTabWidget()
         tabs.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        tabs.setStyleSheet("""
-            QTabBar::tab { padding:6px 10px; font-size:12px; }
-            QTabBar::tab:selected { color:#00eaff; border-bottom:2px solid #00eaff; }
-            QTabBar::tab:disabled { color:#3a3a3a; }
-        """)
+        tabs.setStyleSheet(workbench_tabs_style(CUT_ACCENT) + "QTabBar::tab:disabled{color:#656b79;}")
+        tabs.tabBar().setUsesScrollButtons(True)
 
         self._mat_tables = {}
         configs = [
@@ -316,14 +320,15 @@ class MixHandler:
 
         # 按钮行
         btn_lay = QHBoxLayout()
-        btn_add = QPushButton("➕ 导入素材")
+        btn_add = workbench_button("导入素材", "folder-open", accent=CUT_ACCENT, primary=True)
         btn_add.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_add.clicked.connect(lambda: self._mix_import_files(role))
         btn_del = QPushButton("删除选中")
+        btn_del.setIcon(workbench_icon("trash-2", "#ffb1b8"))
         btn_del.setObjectName("DangerBtn")
         btn_del.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_del.clicked.connect(lambda: self._mix_delete_mat(role))
-        btn_clr = QPushButton("清空")
+        btn_clr = workbench_button("清空", "x", accent=CUT_ACCENT, quiet=True)
         btn_clr.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_clr.clicked.connect(lambda: self._mix_clear_mat(role))
         btn_lay.addWidget(btn_add)
@@ -334,6 +339,7 @@ class MixHandler:
 
         # 表格
         table = QTableWidget(0, 4)
+        table.setAlternatingRowColors(True)
         table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         table.setHorizontalHeaderLabels(["文件名", "总时长", "可用区间", "可用时长"])
@@ -360,18 +366,16 @@ class MixHandler:
         ml.setSpacing(6)
         ml.setContentsMargins(0, 0, 0, 0)
 
-        title = QLabel("素材预览")
-        title.setStyleSheet("font-weight:bold; font-size:15px; color:#e0e0e0;")
-        ml.addWidget(title)
+        ml.addWidget(workbench_section_heading("素材预览", "eye", CUT_ACCENT))
 
         hint = QLabel("点击素材列表预览  |  空格 播放/暂停  |  ← → 逐帧微调")
-        hint.setStyleSheet("color:#555; font-size:11px;")
+        hint.setStyleSheet("color:#a8abb8;font-size:11px;")
         ml.addWidget(hint)
 
         self.mix_video_widget = QVideoWidget()
         self.mix_video_widget.setMinimumHeight(280)
         self.mix_video_widget.setStyleSheet(
-            "background:#000; border:1px solid #333; border-radius:4px;")
+            "background:#111318;border:1px solid #343946;border-radius:8px;")
         ml.addWidget(self.mix_video_widget, 1)
 
         self.mix_player   = QMediaPlayer()
@@ -389,20 +393,20 @@ class MixHandler:
         # 时间标签
         self.mix_time_label = QLabel("00:00 / 00:00")
         self.mix_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.mix_time_label.setStyleSheet("color:#888; font-size:11px;")
+        self.mix_time_label.setStyleSheet(f"color:{CUT_ACCENT};font-family:Consolas;font-size:12px;")
         ml.addWidget(self.mix_time_label)
 
         # 控制按钮
         ctrl = QHBoxLayout()
-        self.mix_btn_play = QPushButton("▶ 播放")
+        self.mix_btn_play = workbench_button("播放", "play", accent=CUT_ACCENT)
         self.mix_btn_play.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mix_btn_play.clicked.connect(self._mix_toggle_play)
 
-        btn_bwd = QPushButton("◀◀ -1s")
+        btn_bwd = workbench_button("−1 秒", None, "后退一秒", accent=CUT_ACCENT)
         btn_bwd.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_bwd.clicked.connect(lambda: self._mix_step(-1000))
 
-        btn_fwd = QPushButton("+1s ▶▶")
+        btn_fwd = workbench_button("+1 秒", None, "前进一秒", accent=CUT_ACCENT)
         btn_fwd.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         btn_fwd.clicked.connect(lambda: self._mix_step(1000))
 
@@ -414,8 +418,7 @@ class MixHandler:
         # 素材信息
         self.mix_preview_info = QLabel("未选择素材")
         self.mix_preview_info.setStyleSheet(
-            "color:#666; font-size:11px; padding:4px; "
-            "background:#151515; border-radius:3px;")
+            "color:#bdc4d4;font-size:11px;padding:7px;background:#20232b;border-radius:7px;")
         self.mix_preview_info.setWordWrap(True)
         ml.addWidget(self.mix_preview_info)
 
@@ -430,13 +433,14 @@ class MixHandler:
         rl.setSpacing(8)
         rl.setContentsMargins(0, 0, 0, 0)
 
-        title = QLabel("输出配置")
-        title.setStyleSheet("font-weight:bold; font-size:15px; color:#e0e0e0;")
-        rl.addWidget(title)
+        rl.addWidget(workbench_section_heading("输出配置", "sliders-horizontal", CUT_ACCENT))
+        options = QWidget()
+        form = QVBoxLayout(options)
+        form.setContentsMargins(0, 0, 2, 0)
+        form.setSpacing(8)
 
         # -- 片段时长（模式A/B用，总时长自动计算；模式C只显示总时长）--
         seg_grp = QGroupBox("片段时长设置")
-        seg_grp.setStyleSheet(self._grp_style("#00eaff"))
         sgl = QGridLayout(seg_grp)
         sgl.setSpacing(6)
 
@@ -473,24 +477,21 @@ class MixHandler:
         sgl.addWidget(self.spin_total, 1, 3)
 
         self.lbl_seg_hint = QLabel()
-        self.lbl_seg_hint.setStyleSheet("color:#555; font-size:10px;")
+        self.lbl_seg_hint.setStyleSheet("color:#a8abb8;font-size:11px;")
         sgl.addWidget(self.lbl_seg_hint, 2, 0, 1, 4)
 
-        rl.addWidget(seg_grp)
+        form.addWidget(seg_grp)
 
         # -- 输出尺寸（可直接输入）--
         size_grp = QGroupBox("输出尺寸")
-        size_grp.setStyleSheet(self._grp_style("#00eaff"))
         szl = QVBoxLayout(size_grp)
         szl.setSpacing(6)
 
         preset_lay = QHBoxLayout()
         for label, ww, hh in [("9:16",1080,1920),("4:5",1080,1350),
                                ("1:1",1080,1080),("16:9",1920,1080)]:
-            btn = QPushButton(label)
-            btn.setFixedWidth(52)
+            btn = workbench_button(label, None, f"设为 {ww} × {hh}", accent=CUT_ACCENT)
             btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setStyleSheet("padding:4px; font-size:11px;")
             btn.clicked.connect(lambda _, a=ww, b=hh: self._mix_set_size(a, b))
             preset_lay.addWidget(btn)
         preset_lay.addStretch()
@@ -509,29 +510,19 @@ class MixHandler:
         wh_lay.addWidget(self.mix_out_h)
         wh_lay.addStretch()
         szl.addLayout(wh_lay)
-        rl.addWidget(size_grp)
+        form.addWidget(size_grp)
 
         # -- 背景音频 --
         audio_grp = QGroupBox("背景音频（所有视频共用）")
-        audio_grp.setStyleSheet(self._grp_style("#00eaff"))
         agl = QVBoxLayout(audio_grp)
-        self.mix_audio_btn = QPushButton("点击选择音频（mp3 / wav / aac）")
+        self.mix_audio_btn = workbench_button("选择背景音频", "music-2", "支持 MP3、WAV、AAC", accent=CUT_ACCENT)
         self.mix_audio_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.mix_audio_btn.setStyleSheet("""
-            QPushButton {
-                text-align:left; padding-left:10px; height:30px;
-                border:1px dashed #444; border-radius:4px;
-                background:#1e1e1e; color:#888;
-            }
-            QPushButton:hover { border:1px solid #00eaff; color:#00eaff; }
-        """)
         self.mix_audio_btn.clicked.connect(self._mix_select_audio)
         agl.addWidget(self.mix_audio_btn)
-        rl.addWidget(audio_grp)
+        form.addWidget(audio_grp)
 
         # -- 输出设置 --
         out_grp = QGroupBox("输出设置")
-        out_grp.setStyleSheet(self._grp_style("#00eaff"))
         ogl = QGridLayout(out_grp)
         ogl.setSpacing(8)
 
@@ -546,11 +537,10 @@ class MixHandler:
         self.mix_rename = QLineEdit()
         self.mix_rename.setPlaceholderText("留空: mix_{index}_{date}")
         ogl.addWidget(self.mix_rename, 1, 1)
-        rl.addWidget(out_grp)
+        form.addWidget(out_grp)
 
         # -- 素材分析 --
         analysis_grp = QGroupBox("素材分析")
-        analysis_grp.setStyleSheet(self._grp_style("#00eaff"))
         angl = QVBoxLayout(analysis_grp)
         self.mix_analysis_label = QLabel("导入素材后自动分析")
         self.mix_analysis_label.setWordWrap(True)
@@ -558,24 +548,19 @@ class MixHandler:
             "color:#aaa; font-size:11px; padding:4px; "
             "background:#151515; border-radius:3px;")
         angl.addWidget(self.mix_analysis_label)
-        rl.addWidget(analysis_grp)
+        form.addWidget(analysis_grp)
 
         # -- 日志 --
         log_grp = QGroupBox("渲染日志")
-        log_grp.setStyleSheet(
-            "QGroupBox{color:#444;border:1px solid #222;"
-            "border-radius:4px;margin-top:10px;padding-top:8px;}")
         lgl = QVBoxLayout(log_grp)
         self.mix_console = QTextEdit()
         self.mix_console.setReadOnly(True)
         self.mix_console.setMaximumHeight(110)
-        self.mix_console.setStyleSheet(
-            "background:#000; color:#00eaff; border:none; "
-            "font-family:Consolas; font-size:11px;")
+        self.mix_console.setPlaceholderText("渲染进度与消息")
         lgl.addWidget(self.mix_console)
-        rl.addWidget(log_grp)
-
-        rl.addStretch()
+        form.addWidget(log_grp)
+        form.addStretch()
+        rl.addWidget(batch_options_scroll(options), 1)
 
         # 进度条
         self.mix_progress = QProgressBar()
@@ -589,6 +574,7 @@ class MixHandler:
         rl.addWidget(self.cb_mix_open_dir)
 
         self.mix_btn_stop = QPushButton("停止渲染")
+        self.mix_btn_stop.setIcon(workbench_icon("square", "#ffb1b8"))
         self.mix_btn_stop.setObjectName("DangerBtn")
         self.mix_btn_stop.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mix_btn_stop.setEnabled(False)
@@ -596,22 +582,14 @@ class MixHandler:
         rl.addWidget(self.mix_btn_stop)
 
         self.mix_btn_start = QPushButton("开始批量混剪")
+        self.mix_btn_start.setIcon(workbench_icon("clapperboard", "#161b24"))
         self.mix_btn_start.setObjectName("PrimaryBtn")
-        self.mix_btn_start.setFixedHeight(50)
+        self.mix_btn_start.setFixedHeight(38)
         self.mix_btn_start.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.mix_btn_start.clicked.connect(self._mix_start)
         rl.addWidget(self.mix_btn_start)
 
         return w
-
-    # ------------------------------------------------------------------ #
-    #  辅助样式
-    # ------------------------------------------------------------------ #
-    @staticmethod
-    def _grp_style(color):
-        return (f"QGroupBox{{color:{color};font-weight:bold;"
-                f"border:1px solid #333;border-radius:4px;"
-                f"margin-top:10px;padding-top:8px;}}")
 
     # ------------------------------------------------------------------ #
     #  模式切换联动
@@ -863,7 +841,7 @@ class MixHandler:
             if status == QMediaPlayer.MediaStatus.LoadedMedia:
                 self.mix_player.mediaStatusChanged.disconnect(_on_loaded)
                 self.mix_player.pause()
-                self.mix_btn_play.setText("▶ 播放")
+                set_workbench_playback(self.mix_btn_play, False)
                 if seek_ms > 0:
                     QTimer.singleShot(50, lambda: self.mix_player.setPosition(seek_ms))
 
@@ -880,10 +858,10 @@ class MixHandler:
     def _mix_toggle_play(self):
         if self.mix_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.mix_player.pause()
-            self.mix_btn_play.setText("▶ 播放")
+            set_workbench_playback(self.mix_btn_play, False)
         else:
             self.mix_player.play()
-            self.mix_btn_play.setText("⏸ 暂停")
+            set_workbench_playback(self.mix_btn_play, True)
 
     def _mix_step(self, ms: int):
         if self.mix_player.duration() > 0:
@@ -891,7 +869,7 @@ class MixHandler:
                              self.mix_player.position() + ms))
             self.mix_player.setPosition(pos)
             self.mix_player.pause()
-            self.mix_btn_play.setText("▶ 播放")
+            set_workbench_playback(self.mix_btn_play, False)
 
     def _mix_seek(self, ratio: float):
         if self.mix_player.duration() > 0:
@@ -1084,7 +1062,8 @@ class MixHandler:
         self.mix_btn_stop.setEnabled(False)
         self.mix_progress.setVisible(False)
         self._mix_log("全部完成！")
-        QMessageBox.information(self, "完成", "混剪任务全部完成！")
+        paths = getattr(self._mix_worker, 'completed_paths', ())
+        offer_duo_export(self, paths, "视频混剪", "混剪任务结束", f"本次成功导出 {len(paths)} 个视频。")
         if self.cb_mix_open_dir.isChecked() and self._mix_out_dir:
             if os.path.exists(self._mix_out_dir):
                 if sys.platform == 'win32':

@@ -172,10 +172,13 @@ def _cep_global_excepthook(etype, value, tb):
 sys.excepthook = _cep_global_excepthook
 
 # --- 2. 路径兼容处理 (必须最先运行) ---
+startup_dir = os.getcwd()
 if hasattr(sys, '_MEIPASS'):
     base_path = sys._MEIPASS
 else:
-    base_path = os.path.abspath(".")
+    base_path = os.path.dirname(os.path.abspath(__file__))
+    if __name__ == '__main__':
+        os.chdir(base_path)
 
 sys.path.insert(0, base_path)
 sys.path.insert(0, os.path.join(base_path, "core"))
@@ -222,8 +225,11 @@ from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 from PyQt6.QtGui import QFont, QIcon
 
 if __name__ == '__main__':
+    from ui.widgets.selection_style import checkbox_style
+
     _set_windows_app_identity()
     app = QApplication(sys.argv)
+    app.setStyleSheet(checkbox_style())
     # 应用级图标会自动传递给主窗口、弹窗和 Windows 任务栏。
     app.setWindowIcon(QIcon(os.path.join(base_path, "assets", "icon.ico")))
     _update_boot_splash("__CEP_AUTH__")
@@ -260,7 +266,9 @@ if __name__ == '__main__':
         authenticated_user = login_dialog.result.user
 
     app.setFont(QFont("Segoe UI", 9))
-    app.setStyleSheet("QToolTip { color: #ffffff; background-color: #2a2a2a; border: 1px solid #555555; padding: 2px 6px; }")
+    app.setStyleSheet(app.styleSheet() + """
+        QToolTip { color: #ffffff; background-color: #2a2a2a; border: 1px solid #555555; padding: 2px 6px; }
+    """)
 
     # ==========================================
     # 全局异常捕获逻辑（防闪退神器）
@@ -374,4 +382,10 @@ if __name__ == '__main__':
         window.show()
         app.processEvents()
         _complete_boot_splash()
+        from pathlib import Path
+        from core.project_files import PROJECT_SUFFIXES
+        project = next((str(Path(startup_dir, arg)) for arg in sys.argv[1:]
+                        if Path(arg).suffix.lower() in PROJECT_SUFFIXES), None)
+        if project:
+            QTimer.singleShot(0, lambda: window.open_project_file(project))
     sys.exit(app.exec())

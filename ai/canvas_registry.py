@@ -24,6 +24,14 @@ def _spec(node_type, title, kind, group, defaults=None):
 
 
 NODE_SPECS = {
+    "ai_editor": _spec("ai_editor_node", "通用创作 Agent", "agent", "primary", {
+        "editor_action": "执行创作任务", "creative_agent": True,
+        "ratio": "adaptive", "resolution": "1080p", "fps": 30,
+        "image_duration": 0, "target_duration": 0,
+        "ai_edit_mode": "semantic", "ai_edit_revisions": [],
+        "agent_auto_run": True, "references": [],
+        "reference_assets": [],
+    }),
     "storyboard": _spec("storyboard_node", "短片", "storyboard", "more", {
         "style": "电影写实", "automation_mode": "checkpoints",
         "production_scope": "all", "production_ratio": "16:9",
@@ -129,7 +137,24 @@ NODE_SPECS = {
 }
 
 
+LOCAL_TOOL_SPECS = {
+    "pinterest_retheme": ("pinterest_import", "Pinterest 元素换图", {
+        "pinterest_count": 2, "candidate_count": 1, "pinterest_url": "", "pinterest_download_only": False,
+    }),
+    "image_style_transfer": ("image_generate", "图片风格转换", {
+        "image_style_transfer": True, "candidate_count": 1,
+    }),
+    "image_upscale_tool": ("image_upscale", "批量图片高清", {"upscale_scale": 2, "upscale_mode": "ai"}),
+}
+for _key, (_tool, _title, _defaults) in LOCAL_TOOL_SPECS.items():
+    NODE_SPECS[_key] = _spec("ai_editor_node", _title, "agent", "more", {
+        "creative_agent": True, "agent_tool": _tool, "agent_auto_run": True,
+        "editor_action": "执行创作任务", "reference_assets": [], "references": [],
+        "reference_settings": [], **_defaults})
+
+
 CREATION_ITEMS = (
+    ("ai_editor", "通用创作 Agent", "连接素材并安排创作任务", "素材 / 指令 → 自动创作", "creative_agent"),
     ("text", "文本", "写提示词、想法或制作说明", "文字 → 继续创建", "plain_text"),
     ("script", "脚本", "编写可继续拆分镜头的分镜脚本", "故事 → 分镜脚本", "write_script"),
     ("multi_image", "图片", "用文字或参考图生成图片", "文字 / 图片 → 图片", "text_to_image"),
@@ -140,23 +165,27 @@ CREATION_ITEMS = (
     ("multi_director", "多图导演", "直接多图成视频，或先拆镜和运动分镜再成片", "多张图片 → 视频 / 短片", "multi_image_director"),
     ("analysis", "拉片", "分析切镜、运镜、节奏、动作和声音", "视频 → 拉片报告", "break_down_video"),
     ("shot", "镜头", "控制一个镜头的画面、动作、运镜和对白", "镜头设计 → 多种结果", "make_shot"),
+    ("pinterest_retheme", "Pinterest 元素换图", "用原图定版式，从 Pinterest 找主题元素", "原图 + 一句主题指令 → 换图", "pinterest_retheme"),
+    ("image_style_transfer", "图片风格转换", "按预设、文字或参考图转换图片风格", "原图 → 新画风", "image_style_transfer"),
+    ("image_upscale_tool", "批量图片高清", "调用本机超分模型或明确选择传统放大", "图片 → 高清结果", "batch_upscale"),
 )
 
 
 NODE_CONNECTION_TARGETS = {
-    "text": ("script", "multi_image", "video", "audio", "shot", "skill"),
-    "script": ("storyboard", "multi_image", "video", "audio", "shot", "skill"),
-    "copywriting": ("multi_image", "video", "audio"),
-    "multi_image": ("multi_image", "video", "multi_director", "shot", "storyboard"),
-    "image_asset": ("multi_image", "video", "multi_director", "shot", "storyboard"),
+    "ai_editor": ("multi_image", "video", "audio", "script", "shot"),
+    "text": ("script", "multi_image", "video", "audio", "shot", "skill", "ai_editor"),
+    "script": ("storyboard", "multi_image", "video", "audio", "shot", "skill", "ai_editor"),
+    "copywriting": ("multi_image", "video", "audio", "ai_editor"),
+    "multi_image": ("multi_image", "video", "multi_director", "shot", "storyboard", "ai_editor"),
+    "image_asset": ("multi_image", "video", "multi_director", "shot", "storyboard", "ai_editor"),
     "scene_reference": ("multi_image", "video", "multi_director", "shot", "storyboard"),
     "character_reference": ("multi_image", "video", "multi_director", "shot", "storyboard"),
     "element_reference": ("multi_image", "video", "multi_director", "shot", "storyboard"),
-    "video": ("analysis", "video_style_transfer"),
-    "multi_director": ("analysis", "video_style_transfer"),
-    "video_style_transfer": ("analysis", "video_style_transfer"),
-    "long_timeline": ("analysis", "video_style_transfer"),
-    "audio": (),
+    "video": ("analysis", "video_style_transfer", "ai_editor"),
+    "multi_director": ("analysis", "video_style_transfer", "ai_editor"),
+    "video_style_transfer": ("analysis", "video_style_transfer", "ai_editor"),
+    "long_timeline": ("analysis", "video_style_transfer", "ai_editor"),
+    "audio": ("ai_editor",),
     "analysis": ("script", "shot", "skill"),
     "shot": ("multi_image", "video", "audio", "shot"),
     "skill": ("multi_image", "video", "shot"),
@@ -165,6 +194,8 @@ NODE_CONNECTION_TARGETS = {
 
 def infer_node_spec(node_type: str, payload: dict | None = None) -> str:
     payload = payload or {}
+    if node_type == "ai_editor_node":
+        return "ai_editor"
     if node_type == "storyboard_node":
         return "storyboard"
     if node_type == "text_node":
@@ -206,6 +237,8 @@ def infer_node_spec(node_type: str, payload: dict | None = None) -> str:
 
 
 def can_connect(source_key: str, target_key: str) -> bool:
+    if target_key in LOCAL_TOOL_SPECS:
+        return source_key in {"text", "script", "multi_image", "image_asset", "video", "audio", "asset_take", "scene_reference", "character_reference", "element_reference"}
     return bool(target_key and target_key in NODE_CONNECTION_TARGETS.get(source_key, ()))
 
 
@@ -236,6 +269,7 @@ def connection_create_choices(source_key: str, source_kind: str = ""):
             choice("audio", "把文字生成配音", "当前文字作为要朗读的台词", "text_source", beginner_mode="text_to_speech", editor_action="对白配音"),
             choice("shot", "设计一个镜头", "继续设置景别、动作、运镜和对白", "text_source", beginner_mode="make_shot"),
             choice("skill", "使用导演工具", "制作机位、调度或连续性方案", "text_source"),
+            choice("ai_editor", "交给通用创作 Agent", "继续安排图片、视频、配音或剪辑任务", "text_source"),
         ]
     elif source_key == "script":
         rows = [
@@ -245,12 +279,14 @@ def connection_create_choices(source_key: str, source_kind: str = ""):
             choice("audio", "生成脚本对白", "读取台词并生成配音", "text_source", beginner_mode="text_to_speech", editor_action="对白配音"),
             choice("shot", "拆成单个镜头", "带入镜头节点继续精细控制", "text_source", beginner_mode="make_shot"),
             choice("skill", "继续导演设计", "制作调度、机位和连续性方案", "text_source"),
+            choice("ai_editor", "交给通用创作 Agent", "用脚本安排后续创作任务", "text_source"),
         ]
     elif source_key == "copywriting":
         rows = [
             choice("multi_image", "生成口播配图", "使用口播文案生成配套画面", "text_source", beginner_mode="text_to_image", editor_action="文生图"),
             choice("video", "生成口播视频", "把文案作为内容和节奏依据", "text_source", beginner_mode="text_to_video", editor_action="文生视频"),
             choice("audio", "生成口播配音", "把文案直接生成朗读音频", "text_source", beginner_mode="text_to_speech", editor_action="对白配音"),
+            choice("ai_editor", "交给通用创作 Agent", "用口播文案安排后续任务", "text_source"),
         ]
     elif source_key == "skill":
         rows = [
@@ -267,11 +303,25 @@ def connection_create_choices(source_key: str, source_kind: str = ""):
             choice("multi_director", "加入多图导演", "直接排时间轴，或把图片作为人物、场景和元素资产制片", "timeline_image", beginner_mode="multi_image_director"),
             choice("shot", "作为镜头视觉参考", "参考人物、场景和构图", "shot_reference", beginner_mode="make_shot"),
             choice("storyboard", "作为短片分镜草图", "交给自动制片流程参考", "storyboard_reference", beginner_mode="idea_to_movie"),
+            choice("ai_editor", "交给通用创作 Agent", "把当前图片作为创作素材", "agent_source"),
+            choice("pinterest_retheme", "Pinterest 元素换图", "保留此图版式，按指令查找并替换元素", "agent_source"),
+            choice("image_style_transfer", "图片风格转换", "保留构图，换风格或材质", "agent_source"),
+            choice("image_upscale_tool", "批量图片高清", "使用本机超分模型放大图片", "agent_source"),
         ]
-    elif source_key in {"video", "multi_director", "video_style_transfer"}:
+    elif source_key in {"video", "multi_director", "video_style_transfer", "long_timeline"}:
         rows = [
             choice("analysis", "分析这个视频", "分析切镜、运镜、节奏和声音", "video_source", beginner_mode="break_down_video"),
             choice("video_style_transfer", "作为内容视频迁移风格", "保留动作镜头，只改变画风与质感", "content_video"),
+            choice("ai_editor", "交给通用创作 Agent", "继续剪辑或包装当前视频", "agent_source"),
+        ]
+    elif source_key == "audio":
+        rows = [choice("ai_editor", "交给通用创作 Agent", "把当前音频作为创作素材", "agent_source")]
+    elif source_key == "ai_editor":
+        rows = [
+            choice("multi_image", "继续生成图片", "把 Agent 指令带入图片节点", "text_source"),
+            choice("video", "继续生成视频", "把 Agent 指令带入视频节点", "text_source"),
+            choice("audio", "继续生成配音", "把 Agent 指令带入配音节点", "text_source"),
+            choice("script", "继续写脚本", "把 Agent 指令带入脚本节点", "text_source"),
         ]
     elif source_key == "analysis":
         rows = [

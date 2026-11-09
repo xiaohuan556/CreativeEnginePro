@@ -35,6 +35,16 @@ class ReferenceAssetTests(unittest.TestCase):
             "path": "asset://trusted-character", "role": "character"}])
         self.assertEqual("asset://trusted-character", values[0]["path"])
 
+    def test_explicit_zero_weight_priority_and_order_are_preserved(self):
+        values = normalize_reference_assets([
+            {"path": "asset://a", "role": "reference", "priority": 10, "order": 1},
+            {"path": "asset://b", "role": "reference", "priority": 0, "order": 0, "weight": 0},
+        ])
+        self.assertEqual("asset://b", values[0]["path"])
+        self.assertEqual(0, values[0]["weight"])
+        self.assertEqual(0, values[0]["order"])
+        self.assertEqual(values, normalize_reference_assets(values))
+
 
 if __name__ == "__main__":
     unittest.main()

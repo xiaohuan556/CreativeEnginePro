@@ -611,6 +611,7 @@ class PinterestImporter:
         item_ready: Callable[[str, str], None] | None = None,
         min_aspect: float = 0.0,
         min_side: int = 200,
+        candidate_factor: int = 1,
     ) -> dict:
         """
         导入 Pinterest 页面图片。
@@ -630,7 +631,7 @@ class PinterestImporter:
 
         # 如果有比例过滤，多拉一些候选以弥补过滤淘汰
         fetch_factor = max(2, int(desired * 1.5)) if min_aspect > 0 else 1
-        fetch_target = min(desired * fetch_factor, 500)
+        fetch_target = min(desired * max(fetch_factor, candidate_factor), 500)
 
         final_url, candidates = self.collect_candidates(
             page_url, fetch_target, desired, stop_event, progress)

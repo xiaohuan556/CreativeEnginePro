@@ -82,8 +82,6 @@ QLineEdit, QTextEdit, QSpinBox {
 QLineEdit:hover, QTextEdit:hover { background-color: #202024; }
 QLineEdit:focus, QTextEdit:focus, QSpinBox:focus { background-color: #121215; border: 1px solid #3d8ef8; }
 QCheckBox { color: #9a9aa2; spacing: 6px; }
-QCheckBox::indicator { width: 14px; height: 14px; border-radius: 3px; background: #232327; }
-QCheckBox::indicator:checked { background: #3d8ef8; }
 """
 
 

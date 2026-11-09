@@ -1,10 +1,12 @@
 import os
 import tempfile
+from threading import Event
 import unittest
 from unittest.mock import patch
 
 try:
     from PyQt6.QtWidgets import QApplication
+    from PyQt6.QtTest import QSignalSpy
     from ui.media_library import MediaItem, MediaLibrary, _MediaCard
     QT_AVAILABLE = True
 except ModuleNotFoundError:
@@ -77,6 +79,34 @@ class MediaLibraryRevealTests(unittest.TestCase):
             self.assertEqual([image_path], library.get_paths())
             self.assertTrue(all(path not in library.get_paths() for path in rejected))
             library.close()
+
+    def test_video_duration_probe_does_not_block_import(self):
+        with tempfile.TemporaryDirectory() as directory:
+            media_path = os.path.join(directory, "clip.mp4")
+            with open(media_path, "wb"):
+                pass
+            library = MediaLibrary()
+            allow_probe_to_finish = Event()
+
+            def probe(_path, _media_type):
+                self.assertTrue(allow_probe_to_finish.wait(2))
+                return 4.0
+
+            with patch("ui.media_library._get_duration", side_effect=probe), \
+                    patch("ui.media_library._make_thumbnail"):
+                try:
+                    self.assertTrue(library.add_file(media_path))
+                    self.assertEqual("", library._cards[0]._dur_badge.text())
+                    worker = library._workers[0]
+                    finished = QSignalSpy(worker.finished)
+                    allow_probe_to_finish.set()
+                    self.assertTrue(finished.wait(2000) or len(finished) == 1)
+                    self.assertEqual("4.0s", library._cards[0]._dur_badge.text())
+                finally:
+                    allow_probe_to_finish.set()
+                    for worker in list(library._workers):
+                        worker.wait(2000)
+                    library.close()
 
 
 if __name__ == "__main__":

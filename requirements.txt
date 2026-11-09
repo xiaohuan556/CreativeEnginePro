@@ -43,3 +43,5 @@ onnxruntime>=1.18.0
 
 # ── PSD 导入 (图片工作台) ──
 psd-tools>=1.9.30
+rawpy>=0.27.1
+pillow-heif>=1.8.1

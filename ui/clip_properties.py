@@ -15,6 +15,10 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QFont, QWheelEvent, QPainter, QPen, QBrush, QPainterPath
 from .widgets import CheckMarkBox
+from .widgets.workbench_controls import (
+    CUT_ACCENT, workbench_button, workbench_field_style, workbench_icon,
+    workbench_slider_style, workbench_tabs_style,
+)
 
 
 # ── 关键帧菱形按钮 ──
@@ -27,6 +31,7 @@ class DiamondButton(QPushButton):
         self._hover = False
         self.setFixedSize(20, 20)
         self.setToolTip(f"切换 {prop_name} 关键帧")
+        self.setAccessibleName(self.toolTip())
         self.setStyleSheet(
             "QPushButton { background:transparent; border:none; }"
             "QToolTip { background:#2a2a2a; color:#fff; border:1px solid #555; "
@@ -62,9 +67,9 @@ class DiamondButton(QPushButton):
         path.closeSubpath()
 
         if self._active:
-            p.setBrush(QColor("#00eaff"))
+            p.setBrush(QColor(CUT_ACCENT))
             p.setPen(Qt.PenStyle.NoPen)
-        elif self._hover:
+        elif self._hover or self.hasFocus():
             p.setBrush(Qt.BrushStyle.NoBrush)
             p.setPen(QPen(QColor("#8ab4f8"), 1.5))
         else:
@@ -114,49 +119,23 @@ def _pick_color(parent, current: str) -> str:
     return current
 
 
-FORM_LABEL_STYLE = "color:#888; font-size:12px;"
+FORM_LABEL_STYLE = "color:#b5bbcb;font-size:12px;"
 GROUP_STYLE = """
     QGroupBox {
-        color:#888; font-size:11px; border:1px solid #333;
-        border-radius:4px; margin-top:8px; padding-top:4px;
+        color:#ecedf3;font-size:12px;font-weight:600;border:1px solid #383e4b;
+        background:#21242c;border-radius:8px;margin-top:10px;padding-top:6px;
     }
     QGroupBox::title { subcontrol-origin:margin; left:8px; }
 """
-SPINBOX_STYLE = """
-    QSpinBox, QDoubleSpinBox {
-        background:#2a2a2a; color:#ccc; border:1px solid #444;
-        border-radius:3px; padding:2px 4px;
-    }
-"""
-COMBO_STYLE = """
-    QComboBox {
-        background:#2a2a2a; color:#ccc; border:1px solid #444;
-        border-radius:3px; padding:2px 6px;
-    }
-    QComboBox QAbstractItemView { background:#2a2a2a; color:#ccc; selection-background-color:#3d8ef8; }
-"""
-LINE_STYLE = """
-    QLineEdit { background:#2a2a2a; color:#ccc; border:1px solid #444; border-radius:3px; padding:2px 4px; }
-"""
-CHECK_STYLE = "QCheckBox { color:#ccc; font-size:12px; }"
-
-
-SLIDER_STYLE = """
-    QSlider::groove:horizontal {
-        height:4px; background:#333; border-radius:2px;
-    }
-    QSlider::handle:horizontal {
-        width:12px; height:12px; margin:-4px 0;
-        background:#3d8ef8; border-radius:6px;
-    }
-    QSlider::handle:horizontal:hover { background:#5aa0ff; }
-    QSlider::sub-page:horizontal { background:#3d8ef8; border-radius:2px; }
-"""
+SPINBOX_STYLE = COMBO_STYLE = LINE_STYLE = workbench_field_style(CUT_ACCENT)
+CHECK_STYLE = "QCheckBox { color:#d5d9e3;font-size:12px; }"
+SLIDER_STYLE = workbench_slider_style(CUT_ACCENT)
 
 
 class ClipPropertiesPanel(QWidget):
     """属性面板主体，根据选中类型切换显示内容"""
     property_changed = pyqtSignal()  # 任何属性变更后发出
+    interaction_finished = pyqtSignal(str)  # 滑块/数值框本次修改已结束
     seek_requested = pyqtSignal(float)  # 请求跳转到指定时间（秒）
 
     _TAB_PROPERTY = 0
@@ -186,8 +165,12 @@ class ClipPropertiesPanel(QWidget):
         self._pending_sync_attrs: dict = {}  # {attr: value} 待同步的属性
         # 滑块拖拽撤回（press 捕获快照，release 推入栈，避免每个 tick 都存）
         self._slider_drag_snapshot = None
+        self._slider_drag_changed = False
+        self._slider_drag_attr = ""
+        self._last_property_attr = ""
 
-        self.setStyleSheet("background:#1e1e1e;")
+        self.setObjectName("clipProperties")
+        self.setStyleSheet("QWidget#clipProperties{background:#1c1e23;}")
         self.installEventFilter(self)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -195,15 +178,18 @@ class ClipPropertiesPanel(QWidget):
 
         # 标题行
         title_bar = QWidget()
-        title_bar.setStyleSheet("background:#1a1a1a; border-bottom:1px solid #333;")
-        title_bar.setFixedHeight(28)
+        title_bar.setObjectName("clipPropertiesHeader")
+        title_bar.setStyleSheet("QWidget#clipPropertiesHeader{background:#1c1e23;border-bottom:1px solid #30323b;}")
+        title_bar.setFixedHeight(34)
         tl = QHBoxLayout(title_bar)
-        tl.setContentsMargins(8, 0, 4, 0)
-        tl.setSpacing(4)
+        tl.setContentsMargins(10, 0, 8, 0)
+        tl.setSpacing(7)
 
+        title_icon = QLabel()
+        title_icon.setPixmap(workbench_icon("sliders-horizontal", CUT_ACCENT).pixmap(16, 16))
+        tl.addWidget(title_icon)
         self._title = QLabel("属性")
-        self._title.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title.setStyleSheet("color:#aaa; font-size:12px; font-weight:500; background:transparent; border:none;")
+        self._title.setStyleSheet("color:#ecedf3;font-size:13px;font-weight:600;background:transparent;border:none;")
         tl.addWidget(self._title, 1)
         root.addWidget(title_bar)
 
@@ -234,14 +220,14 @@ class ClipPropertiesPanel(QWidget):
         scroll = self._scroll
 
         self._content = QWidget()
-        self._content.setStyleSheet("background:#1e1e1e;")
+        self._content.setStyleSheet("background:#1c1e23;")
         self._content_layout = QVBoxLayout(self._content)
         self._content_layout.setContentsMargins(8, 8, 8, 8)
         self._content_layout.setSpacing(8)
 
         self._placeholder = QLabel("选中时间线上的片段\n查看和编辑属性")
         self._placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._placeholder.setStyleSheet("color:#555; font-size:12px;")
+        self._placeholder.setStyleSheet("color:#a8abb8;font-size:12px;padding:16px 0;")
         self._content_layout.addWidget(self._placeholder)
         self._content_layout.addStretch()
 
@@ -249,15 +235,7 @@ class ClipPropertiesPanel(QWidget):
 
         # ── 顶部一级标签：属性 / 蒙版 / 抠像 / 变速 / 转场 / 配音 ──
         self._tabs = QTabWidget()
-        self._tabs.setStyleSheet("""
-            QTabWidget::pane { border:none; }
-            QTabBar::tab {
-                background:#1e1e1e; color:#888; border:none;
-                padding:6px 14px; font-size:12px;
-            }
-            QTabBar::tab:selected { color:#fff; border-bottom:2px solid #3d8ef8; }
-            QTabBar::tab:hover { color:#ccc; }
-        """)
+        self._tabs.setStyleSheet(workbench_tabs_style(CUT_ACCENT))
         # 属性页 = 字幕同步条 + 滚动内容区
         props_page = QWidget()
         pp = QVBoxLayout(props_page)
@@ -284,7 +262,7 @@ class ClipPropertiesPanel(QWidget):
             category_scroll.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
             content = QWidget()
-            content.setStyleSheet("background:#1e1e1e;")
+            content.setStyleSheet("background:#1c1e23;")
             content_layout = QVBoxLayout(content)
             content_layout.setContentsMargins(8, 8, 8, 8)
             content_layout.setSpacing(8)
@@ -313,6 +291,10 @@ class ClipPropertiesPanel(QWidget):
     def eventFilter(self, obj, event):
         """拦截 Delete/Backspace 键防止误删轨道片段"""
         from PyQt6.QtCore import QEvent
+        if (obj is getattr(self, "_sub_edit", None)
+                and event.type() == QEvent.Type.FocusOut
+                and self._slider_drag_attr == "text"):
+            self._end_slider_interaction()
         if event.type() == QEvent.Type.KeyPress:
             if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
                 # 如果有 QLineEdit / QTextEdit 聚焦，放行
@@ -329,9 +311,11 @@ class ClipPropertiesPanel(QWidget):
         return self._clip
 
     def set_selection(self, clip, track: str):
+        if clip is not self._clip and self._slider_drag_attr == "text":
+            self._end_slider_interaction()
         self._clip = clip
         self._track = track
-        # 配音 tab：仅选中字幕 clip 时显示，并自动切换过去
+        # 选中字幕先显示属性；配音页仍可手动进入。
         self._update_dubbing_tab(clip, track)
         # 切换片段时取消待处理的字幕同步（避免泄漏到新片段）
         self._pending_sync_attrs.clear()
@@ -364,6 +348,8 @@ class ClipPropertiesPanel(QWidget):
             btn.set_active(has_kf)
 
     def clear_selection(self):
+        if self._slider_drag_attr == "text":
+            self._end_slider_interaction()
         self._clip = None
         self._track = ""
         self._sync_bar.setVisible(False)
@@ -372,15 +358,13 @@ class ClipPropertiesPanel(QWidget):
         self._rebuild_ui()
 
     def _update_dubbing_tab(self, clip, track: str):
-        """配音 tab 仅在选中字幕 clip 时出现，并预填字幕文本。"""
+        """配音 tab 仅在选中字幕 clip 时出现，默认打开字幕属性。"""
         is_sub = (track == "subtitle")
         self._tabs.setTabVisible(self._TAB_DUBBING, is_sub)
+        self._tabs.setCurrentIndex(self._TAB_PROPERTY)
         if is_sub:
-            self._tabs.setCurrentIndex(self._TAB_DUBBING)
             if self.dubbing_panel is not None:
                 self.dubbing_panel.set_subtitle(clip)
-        else:
-            self._tabs.setCurrentIndex(self._TAB_PROPERTY)
 
     @staticmethod
     def _get_video_duration(path: str) -> float:
@@ -408,6 +392,7 @@ class ClipPropertiesPanel(QWidget):
 
         # 清空关键帧按钮收集（_make_kf_btn 在下方的构建中重新填充）
         self._kf_buttons.clear()
+        self._tx_sliders = {}
 
         # 保存各标签滚动位置（重建后恢复，避免"吸附顶部"）
         saved_positions = {
@@ -426,7 +411,10 @@ class ClipPropertiesPanel(QWidget):
                         QObject.blockSignals(w, True)
                     except Exception:
                         pass
-                    # 无需手动 w.disconnect()：deleteLater() 销毁时 Qt 会自动清理全部连接。
+                    # 先脱离父对象再延迟销毁，避免快速切换片段时旧面板
+                    # 继续参与布局计算，造成右侧面板越用越卡。
+                    w.hide()
+                    w.setParent(None)
                     w.deleteLater()
 
         clip = self._clip
@@ -514,14 +502,7 @@ class ClipPropertiesPanel(QWidget):
         }
 
         # ── 重置变换按钮 ──
-        reset_btn = QPushButton("⟳  重置变换")
-        reset_btn.setFixedSize(120, 24)
-        reset_btn.setStyleSheet(
-            "QPushButton { background:transparent; color:#888; border:1px solid #333;"
-            "border-radius:4px; padding:1px 6px; font-size:11px; }"
-            "QPushButton:hover { color:#fff; border-color:#ff6b6b; }"
-            "QToolTip { background:#333; color:#fff; border:1px solid #555; }"
-        )
+        reset_btn = workbench_button("重置变换", "redo-2", "恢复默认变换参数", accent=CUT_ACCENT)
         reset_btn.clicked.connect(lambda: self._reset_video_transform(clip))
         self._content_layout.addWidget(reset_btn)
 
@@ -529,7 +510,8 @@ class ClipPropertiesPanel(QWidget):
         grp_op = self._make_group("不透明度")
         form_op = QFormLayout(grp_op)
         form_op.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        op = int((getattr(clip, "opacity", 1.0) or 1.0) * 100)
+        opacity = getattr(clip, "opacity", 1.0)
+        op = int((1.0 if opacity is None else opacity) * 100)
         op_slider, op_lbl, op_row = self._slider_row(0, 100, op, " %", "opacity")
         op_slider.valueChanged.connect(lambda v: self._set(clip, "opacity", v / 100))
         form_op.addRow(self._lbl("不透明度:"), op_row)
@@ -609,11 +591,7 @@ class ClipPropertiesPanel(QWidget):
             lambda value: self._undo_set(clip, "mask_inverted", value))
         mask_bottom.addWidget(mask_invert)
         mask_bottom.addStretch()
-        mask_reset = QPushButton("重置")
-        mask_reset.setFixedSize(52, 23)
-        mask_reset.setStyleSheet(
-            "QPushButton{background:#292929;color:#888;border:1px solid #3c3c3c;border-radius:3px;}"
-            "QPushButton:hover{color:#fff;border-color:#666;}")
+        mask_reset = workbench_button("重置", None, "恢复默认蒙版参数", accent=CUT_ACCENT)
         mask_reset.clicked.connect(lambda: self._reset_video_mask(clip))
         mask_bottom.addWidget(mask_reset)
         mask_layout.addLayout(mask_bottom)
@@ -699,16 +677,14 @@ class ClipPropertiesPanel(QWidget):
         sp_val.editingFinished.connect(
             lambda sld=speed_slider, ed=sp_val: self._speed_edit_to_slider(sld, ed))
 
-        vol_slider = NoWheelSlider(Qt.Orientation.Horizontal)
-        vol_slider.setRange(0, 200)
-        vol_slider.setValue(int(clip.volume * 100))
+        vol_slider, vol_edit, vol_row = self._slider_row(
+            0, 200, int(clip.volume * 100), " %", "volume")
         vol_slider.valueChanged.connect(lambda v: self._set(clip, "volume", v / 100))
-        self._vol_label = QLabel(f"{int(clip.volume*100)}%")
-        self._vol_label.setStyleSheet(FORM_LABEL_STYLE)
-        vol_slider.valueChanged.connect(lambda v: self._vol_label.setText(f"{v}%"))
+        vol_edit.setText(f"{int(clip.volume * 100)}%")
+        vol_slider.valueChanged.connect(lambda v: vol_edit.setText(f"{v}%"))
 
         form.addRow(self._lbl("速度:"), sp_row)
-        form.addRow(self._lbl("音量:"), self._row(vol_slider, self._vol_label))
+        form.addRow(self._lbl("音量:"), vol_row)
         self._category_layouts["speed"].addWidget(grp)
 
         # 转场（淡出到下一段，仅背景轨生效）
@@ -792,7 +768,7 @@ class ClipPropertiesPanel(QWidget):
     def _edit_transition_duration(self, clip, edit, slider):
         """转场时长编辑框（支持小数秒，范围 0.10s ~ 2.00s）"""
         try:
-            v = float(edit.text())
+            v = float(edit.text().strip().removesuffix("s").strip())
         except ValueError:
             edit.blockSignals(True)
             edit.setText(f"{slider.value() / 100:.2f}s")
@@ -807,8 +783,10 @@ class ClipPropertiesPanel(QWidget):
         edit.setText(f"{iv / 100:.2f}s")
         edit.blockSignals(False)
         cur = getattr(clip, "out_transition", None)
-        if cur:
+        if cur and abs(float(cur.get("duration", 0)) - iv / 100) > 0.0001:
+            self._begin_slider_interaction("out_transition")
             self._set(clip, "out_transition", {**cur, "duration": iv / 100})
+            self._end_slider_interaction()
 
     # ─── 音频属性 ───
     def _build_audio_props(self, clip: AudioClip):
@@ -865,8 +843,10 @@ class ClipPropertiesPanel(QWidget):
             "QTextEdit { background:#2a2a2a; color:#fff; border:1px solid #444;"
             "border-radius:3px; font-size:13px; padding:4px; }"
         )
+        self._sub_edit.installEventFilter(self)
         self._sub_edit.textChanged.connect(
-            lambda: self._set(clip, "text", self._sub_edit.toPlainText())
+            lambda: (self._begin_slider_interaction("text"),
+                     self._set(clip, "text", self._sub_edit.toPlainText()))
         )
         vl.addWidget(self._sub_edit)
         self._content_layout.addWidget(grp_text)
@@ -1100,7 +1080,8 @@ class ClipPropertiesPanel(QWidget):
         grp_op = self._make_group("不透明度")
         form_op = QFormLayout(grp_op)
         form_op.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        op = int((getattr(clip, "opacity", 1.0) or 1.0) * 100)
+        opacity = getattr(clip, "opacity", 1.0)
+        op = int((1.0 if opacity is None else opacity) * 100)
         op_slider, op_lbl, op_row = self._slider_row(0, 100, op, " %", "opacity")
         op_slider.valueChanged.connect(lambda v: self._set(clip, "opacity", v / 100))
         form_op.addRow(self._lbl("不透明度:"), op_row)
@@ -1172,6 +1153,11 @@ class ClipPropertiesPanel(QWidget):
         速度变更时同步缩放所有关键帧时间。
         字幕同步：若开启了字幕同步开关，自动同步样式到所有其他字幕块。
         """
+        self._last_property_attr = attr
+        if self._slider_drag_snapshot is not None:
+            self._slider_drag_changed = True
+            if not self._slider_drag_attr:
+                self._slider_drag_attr = attr
         # Group editing is for shared visual/audio properties.  Content and
         # placement in time remain per-clip even while several items are
         # selected, otherwise editing one subtitle sentence would duplicate
@@ -1203,7 +1189,8 @@ class ClipPropertiesPanel(QWidget):
                 old_val = old_values[id(target)]
                 if old_val is None or old_val == value:
                     continue
-                ratio = value / old_val
+                # 关键帧时间以片段播放时间为单位；加速后片段变短。
+                ratio = old_val / value
                 kfs = getattr(target, "keyframes", None) or {}
                 for prop, kf_list in kfs.items():
                     kfs[prop] = [(t * ratio, v) for t, v in kf_list]
@@ -1224,17 +1211,34 @@ class ClipPropertiesPanel(QWidget):
         self.tl._save_history()
         self._set(clip, attr, value)
 
-    def _begin_slider_interaction(self):
+    def _begin_slider_interaction(self, prop_name: str = ""):
         """滑块开始拖拽时：如果还未捕获快照则捕获"""
         if self._slider_drag_snapshot is None:
             self._slider_drag_snapshot = self.tl._snapshot()
+            self._slider_drag_changed = False
+            self._slider_drag_attr = prop_name or ""
+        elif prop_name and not self._slider_drag_attr:
+            self._slider_drag_attr = prop_name
 
     def _end_slider_interaction(self):
         """滑块释放时：将拖拽前快照推入撤回栈"""
         if self._slider_drag_snapshot is not None:
+            # 把字幕样式同步也归入本次手势，避免 debounce 在释放后
+            # 再追加一条历史记录。
+            if self._pending_sync_attrs:
+                self._sync_debounce.stop()
+                self._do_sync_to_all_subs()
+            snapshot = self._slider_drag_snapshot
+            changed = self._slider_drag_changed
+            attr = self._slider_drag_attr
             self._slider_drag_snapshot = None
-            # 推入 undo 栈（截断 redo）—— 使用 _save_history 而非手动操作栈
-            self.tl._save_history()
+            self._slider_drag_changed = False
+            self._slider_drag_attr = ""
+            if changed:
+                # 历史模型保存的是操作前状态；不能保存释放后的当前状态，
+                # 否则撤销效果滑块时看起来没有变化。
+                self.tl._append_history_snapshot(snapshot, "调整效果")
+                self.interaction_finished.emit(attr)
 
     def _do_sync_to_all_subs(self):
         """debounce 后批量同步字幕样式（避免拖拽滑块时逐帧全量遍历）"""
@@ -1243,7 +1247,9 @@ class ClipPropertiesPanel(QWidget):
         clip = self._clip
         pending = self._pending_sync_attrs.copy()
         self._pending_sync_attrs.clear()
-        self.tl._save_history()  # 撤回：捕获同步前的所有字幕状态
+        # 滑块手势已经持有一份完整 pre-state，由释放时统一入栈。
+        if self._slider_drag_snapshot is None:
+            self.tl._save_history()
         for track in self.tl.subtitle_tracks:
             for b in track:
                 if b is not clip:
@@ -1424,18 +1430,15 @@ class ClipPropertiesPanel(QWidget):
         s.setValue(value)
         s.setStyleSheet(SLIDER_STYLE)
         # 滑块撤回：press 捕获快照 / release 推入 undo
-        s.sliderPressed.connect(self._begin_slider_interaction)
+        s.sliderPressed.connect(
+            lambda pn=prop_name: self._begin_slider_interaction(pn))
         s.sliderReleased.connect(self._end_slider_interaction)
 
         # 可编辑数值框
         val_edit = QLineEdit()
         val_edit.setFixedWidth(42)
         val_edit.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        val_edit.setStyleSheet(
-            "QLineEdit { background:#1e1e1e; color:#ccc; border:1px solid #444;"
-            "border-radius:2px; padding:1px 3px; font-size:11px; }"
-            "QLineEdit:focus { border-color:#3d8ef8; }"
-        )
+        val_edit.setStyleSheet(LINE_STYLE)
         val_edit.setText(f"{value}")
         # slider → edit
         s.valueChanged.connect(lambda v, e=val_edit: (
@@ -1444,7 +1447,6 @@ class ClipPropertiesPanel(QWidget):
         val_edit.editingFinished.connect(
             lambda sld=s, ed=val_edit, lo=range_min, hi=range_max:
                 self._edit_to_slider(sld, ed, lo, hi))
-        val_edit.returnPressed.connect(val_edit.editingFinished.emit)
 
         widgets = [s, val_edit]
         if prop_name:
@@ -1479,12 +1481,17 @@ class ClipPropertiesPanel(QWidget):
     def _edit_to_slider(self, slider, edit, lo, hi):
         """编辑框输入 → 滑轨更新"""
         try:
-            v = int(float(edit.text()))
+            raw = edit.text().strip().removesuffix("%").strip()
+            v = int(float(raw))
             v = max(lo, min(hi, v))
+            if v == slider.value():
+                return
+            self._begin_slider_interaction()
             slider.blockSignals(True)
             slider.setValue(v)
             slider.blockSignals(False)
             slider.valueChanged.emit(v)
+            self._end_slider_interaction()
         except ValueError:
             edit.setText(str(slider.value()))
 
@@ -1495,10 +1502,14 @@ class ClipPropertiesPanel(QWidget):
             mult = float(raw)  # 用户输入的是倍速值，如 1.0 / 2.0
             v = int(round(mult * 100))  # 转换为滑块内部值 (10~2000)
             v = max(10, min(2000, v))
+            if v == slider.value():
+                return
+            self._begin_slider_interaction("speed")
             slider.blockSignals(True)
             slider.setValue(v)
             slider.blockSignals(False)
             slider.valueChanged.emit(v)
+            self._end_slider_interaction()
         except ValueError:
             edit.setText(f"{slider.value()/100:.1f}x")
 
