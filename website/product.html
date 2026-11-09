@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#121417">
+  <meta name="description" content="体验小欢pro的多轨剪辑、图层编辑和 AI 制片画布。">
+  <title>产品介绍 · 小欢pro</title>
+  <link rel="icon" href="assets/app-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="site.js" defer></script>
+</head>
+<body id="top">
+  <a class="skip" href="#main">跳到内容</a>
+  <header class="topbar">
+    <div class="shell nav-wrap">
+      <a class="brand header-brand" href="index.html" aria-label="小欢pro 首页">
+        <img src="assets/app-icon.png" width="48" height="48" alt="">
+        <span class="brand-lockup"><span class="brand-name">小欢<span class="brand-badge">pro</span></span><span class="brand-caption" aria-hidden="true">CREATIVE STUDIO</span></span>
+      </a>
+      <nav aria-label="主导航"><a href="index.html">首页</a><a href="product.html" aria-current="page">产品介绍</a><a href="download.html#install">使用指南</a></nav>
+      <a class="button nav-download" href="download.html">下载客户端 <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+  <main id="main">
+    <div class="shell page-intro">
+      <div><p class="eyebrow"><i></i> PRODUCT / THE WORKBENCHES</p><h1>创作工作台<span aria-hidden="true">.</span></h1></div>
+      <p>从一条时间线、一张图层，到一整面 AI 制片画布。选一个工作台，直接试试演示。</p>
+    </div>
+    <section class="shell showcase" aria-label="产品功能与交互演示">
+      <div class="work-tabs" data-tabs aria-label="工作台">
+        <a href="#editing" id="tab-editing">01 <span>剪辑工作台</span></a>
+        <a href="#image" id="tab-image">02 <span>图片工作台</span></a>
+        <a href="#canvas" id="tab-canvas">03 <span>AI 制片画布</span></a>
+      </div>
+
+      <section class="work-panel" id="editing" aria-labelledby="tab-editing">
+        <div class="work-copy"><p class="eyebrow">01 / VIDEO EDITING</p><h2>把节奏<br>放上时间线。</h2><p>在多轨时间线上组织画面、音频和字幕。精剪单条作品，也能为同一批素材组合多个版本。</p><ul><li>多轨剪辑与预览</li><li>字幕编辑与翻译</li><li>批量混剪与导出</li></ul></div>
+        <figure class="demo" data-timeline>
+          <div class="demo-bar"><span><b></b> NIGHT SHIFT / 夜驰</span><span>剪辑样片</span></div>
+          <div class="video-stage">
+            <video controls playsinline preload="none" poster="assets/night-shift.webp" src="assets/night-shift.mp4" aria-label="夜驰汽车剪辑样片"></video>
+            <button type="button" class="video-overlay" data-overlay hidden aria-label="播放样片"><span aria-hidden="true">▶</span><strong>播放剪辑样片</strong></button>
+          </div>
+          <div class="transport" data-video-controls hidden><button type="button" class="play" aria-label="播放演示" data-play>▶</button><output data-time aria-live="off">00:00 / 00:10</output><span data-media-message>1080p</span><button type="button" class="mute" data-mute aria-pressed="false">静音</button></div>
+          <div class="timeline" data-video-controls hidden>
+            <div class="tracks" aria-hidden="true"><div><i>V1</i><span></span></div><div><i>A1</i><span></span></div></div>
+            <input type="range" min="0" max="10" step="any" value="0" aria-label="拖动时间线播放头">
+          </div>
+          <figcaption>《夜驰》· 可播放或拖动时间线查看三个镜头</figcaption>
+        </figure>
+      </section>
+
+      <section class="work-panel" id="image" aria-labelledby="tab-image">
+        <div class="work-copy"><p class="eyebrow">02 / IMAGE DESIGN</p><h2>每一层，<br>都有余地。</h2><p>分开处理主体、文字和背景。先打磨一套版式，再把它应用到一批图片上。</p><ul><li>图层、分组与文字排版</li><li>裁剪、画笔与效果调整</li><li>模板批量出图</li></ul></div>
+        <figure class="demo" data-compare>
+          <div class="demo-bar"><span><b></b> AFTER DARK</span><span>图片工作台实作</span></div>
+          <div class="compare-stage">
+            <div class="compare-original"><img src="assets/after-dark.webp" alt="原始素材，冰蓝光线下的无标香水瓶" width="1536" height="1024"><span class="compare-label">原始素材</span></div>
+            <div class="compare-finished"><img src="assets/after-dark-graded.webp" alt="小欢pro导出的琥珀色香水海报，带 AFTER DARK 标题" width="1536" height="1024"><span class="compare-label">小欢pro导出</span></div>
+            <span class="compare-line" aria-hidden="true"><b>↔</b></span>
+          </div>
+          <div class="compare-controls" hidden>
+            <div class="compare-modes" role="group" aria-label="对比方式"><button type="button" data-view="pair" aria-pressed="true">并排看</button><button type="button" data-view="split" aria-pressed="false">滑动看</button></div>
+            <label class="compare-range" hidden>前后对比<input type="range" min="0" max="100" value="50"></label>
+          </div>
+          <figcaption>同一张素材 · 用照片显影、渐变映射、高光柔光和文字图层制作海报</figcaption>
+        </figure>
+      </section>
+
+      <section class="work-panel" id="canvas" aria-labelledby="tab-canvas">
+        <div class="work-copy"><p class="eyebrow">03 / AI PRODUCTION</p><h2>让灵感<br>连成一条线。</h2><p>把参考素材、提示词和生成结果放在同一张画布上，理清创意，再将可用素材交给后续制作。</p><ul><li>节点式制片画布</li><li>组织参考图与提示词</li><li>图片、视频生成与结果管理</li></ul></div>
+        <figure class="demo" data-node-demo>
+          <div class="demo-bar"><span><b></b> THE VIOLET GATE</span><span>参考图生图</span></div>
+          <div class="node-stage">
+            <svg viewBox="0 0 500 240" preserveAspectRatio="none" aria-hidden="true"><path d="M177 78C218 78 207 119 235 119M177 180C218 180 207 119 235 119"/></svg>
+            <div class="node-inputs">
+              <button type="button" class="node node-reference" data-node="参考图 · 从玻璃环保留扭转轮廓、紫色折射与暖色高光。" aria-pressed="false"><span>01 / INPUT</span><strong>参考图</strong><img src="assets/violet-form.webp" alt="摄影棚中的紫色玻璃环" width="1536" height="1024"></button>
+              <button type="button" class="node node-prompt" data-node="提示词 · 保留紫色玻璃环，把它变成玄武岩峡谷上空的巨型传送门。黄昏逆光，湿石倒影，前景保留一位探险者。" aria-pressed="false"><span>02 / PROMPT</span><strong>提示词</strong><small>玻璃环 → 峡谷传送门<br>黄昏逆光 · 湿石倒影</small></button>
+            </div>
+            <button type="button" class="node node-result" data-node="生成结果 · AI 延续参考图的玻璃轮廓和紫光，把摄影棚里的雕塑变成峡谷传送门。" aria-pressed="true"><span>03 / AI OUTPUT</span><strong>生成结果</strong><img src="assets/violet-gate.webp" alt="黄昏峡谷上空悬浮的紫色玻璃传送门，前景有一位探险者" width="1536" height="1024"></button>
+          </div>
+          <div class="node-notes"><p class="node-readout" aria-live="polite">生成结果 · AI 延续参考图的玻璃轮廓和紫光，把摄影棚里的雕塑变成峡谷传送门。</p><a href="assets/violet-gate.webp" target="_blank" rel="noopener">查看成图 ↗</a></div>
+          <figcaption>AI 生成素材 · 点击节点查看从参考图到生成结果的过程</figcaption>
+        </figure>
+      </section>
+    </section>
+    <section class="shell end-cta" data-reveal aria-labelledby="try-title">
+      <div><p class="eyebrow"><i></i> AVAILABLE FOR WINDOWS</p><h2 id="try-title">在桌面上开始创作。</h2></div>
+      <a class="button primary" href="download.html">前往下载中心 <span aria-hidden="true">↗</span></a>
+    </section>
+  </main>
+  <footer class="site-footer"><div class="shell footer"><a class="brand" href="index.html"><img src="assets/app-icon.png" width="28" height="28" alt=""><span>小欢<span class="brand-pro">pro</span></span></a><span>Windows 桌面创作工作台</span><a href="#top">返回顶部 ↑</a></div></footer>
+</body>
+</html>

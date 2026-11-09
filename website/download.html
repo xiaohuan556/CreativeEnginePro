@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#121417">
+  <meta name="description" content="小欢pro Windows 下载中心和使用指南。">
+  <title>下载与使用 · 小欢pro</title>
+  <link rel="icon" href="assets/app-icon.png">
+  <link rel="stylesheet" href="styles.css">
+  <script src="release.js" defer></script>
+  <script src="site.js" defer></script>
+</head>
+<body id="top">
+  <a class="skip" href="#main">跳到内容</a>
+  <header class="topbar">
+    <div class="shell nav-wrap">
+      <a class="brand header-brand" href="index.html" aria-label="小欢pro 首页">
+        <img src="assets/app-icon.png" width="48" height="48" alt="">
+        <span class="brand-lockup"><span class="brand-name">小欢<span class="brand-badge">pro</span></span><span class="brand-caption" aria-hidden="true">CREATIVE STUDIO</span></span>
+      </a>
+      <nav aria-label="主导航"><a href="index.html">首页</a><a href="product.html">产品介绍</a><a href="#install">使用指南</a></nav>
+      <a class="button nav-download" href="download.html" aria-current="page">下载客户端 <span aria-hidden="true">↗</span></a>
+    </div>
+  </header>
+  <main id="main">
+    <div class="shell page-intro download-intro">
+      <div><p class="eyebrow"><i></i> DOWNLOAD / WINDOWS</p><h1>下载小欢pro<span aria-hidden="true">.</span></h1></div>
+      <p>小欢pro · Windows 桌面创作工作台</p>
+    </div>
+    <section class="shell download-card" aria-labelledby="download-title">
+      <div class="download-info">
+        <div class="os-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M2 2h9v9H2zm11 0h9v9h-9zM2 13h9v9H2zm11 0h9v9h-9z"/></svg></div>
+        <div><h2 id="download-title">Windows 客户端</h2><p>Windows 10 / 11 · 64 位<span data-package-type>安装程序</span> <span data-version hidden></span></p></div>
+      </div>
+      <div class="download-action">
+        <button type="button" class="button primary" disabled data-download-pending>下载 Windows 版</button>
+        <a class="button primary" data-download-link hidden><span data-download-label>下载安装包</span> <span aria-hidden="true">↓</span></a>
+        <p data-download-status>正式安装包待发布</p>
+      </div>
+      <p class="release-notice" data-release-notice hidden></p>
+      <details class="checksum" data-checksum hidden>
+        <summary>查看 SHA-256 校验值</summary>
+        <code data-hash></code>
+      </details>
+    </section>
+
+    <section class="shell section install" id="install" aria-label="使用指南">
+      <div class="section-head" data-setup><div><p class="eyebrow"><i></i> GETTING STARTED</p><h2>三步完成安装。</h2></div><p>安装完成后，可从开始菜单启动软件。</p></div>
+      <ol class="install-steps" data-setup>
+        <li><span class="eyebrow">STEP 01</span><h3>获取安装包</h3><p>使用本页的 Windows 下载入口，保存 <code>.exe</code> 安装程序。</p></li>
+        <li><span class="eyebrow">STEP 02</span><h3>运行安装程序</h3><p>双击下载的文件，按向导完成安装。可在向导中选择创建桌面快捷方式。</p></li>
+        <li><span class="eyebrow">STEP 03</span><h3>打开工作台</h3><p>在开始菜单中打开 CreativeEnginePro。正式版使用管理员开通的账号登录。</p></li>
+      </ol>
+      <div class="section-head" data-standalone hidden><div><p class="eyebrow"><i></i> GETTING STARTED</p><h2>下载后直接运行。</h2></div><p>保存到常用文件夹，下次可以从那里打开。</p></div>
+      <ol class="install-steps" data-standalone hidden>
+        <li><span class="eyebrow">STEP 01</span><h3>下载客户端</h3><p>使用本页的 Windows 下载按钮，保存 <code>.exe</code> 文件。</p></li>
+        <li><span class="eyebrow">STEP 02</span><h3>双击启动</h3><p>在下载目录找到文件，双击打开。这个版本无需安装。</p></li>
+        <li><span class="eyebrow">STEP 03</span><h3>登录工作台</h3><p>使用已开通的账号登录。下载按钮下方会显示这个版本的使用条件。</p></li>
+      </ol>
+    </section>
+    <section class="shell faq" aria-labelledby="faq-title">
+      <div><p class="eyebrow"><i></i> FAQ</p><h2 id="faq-title">常见问题</h2></div>
+      <div class="faq-list">
+        <details><summary>支持哪些系统？</summary><p>此页面提供 Windows 10 和 Windows 11 的 64 位桌面版本。</p></details>
+        <details data-setup><summary>安装需要管理员权限吗？</summary><p>安装程序默认按当前 Windows 用户安装，通常无需管理员权限。</p></details>
+        <details data-standalone hidden><summary>下载后需要安装吗？</summary><p>这个版本是独立运行的 EXE，保存后双击即可打开。</p></details>
+        <details><summary>首次打开时如何登录？</summary><p>拿到管理员开通的账号后，在客户端登录窗口输入账号信息。</p></details>
+      </div>
+    </section>
+  </main>
+  <footer class="site-footer"><div class="shell footer"><a class="brand" href="index.html"><img src="assets/app-icon.png" width="28" height="28" alt=""><span>小欢<span class="brand-pro">pro</span></span></a><span>Windows 桌面创作工作台</span><a href="#top">返回顶部 ↑</a></div></footer>
+</body>
+</html>
